@@ -1,5 +1,7 @@
-from fastapi import FastAPI
 from dotenv import load_dotenv
+load_dotenv()
+
+from fastapi import FastAPI
 
 from app.routes.memory import router as memory_router
 from app.routes.voice import router as voice_router
@@ -20,20 +22,29 @@ from app.routes.avatar_renderer_handoff import router as avatar_renderer_handoff
 from app.routes.avatar_stub_renderer import router as avatar_stub_renderer_router
 from app.routes.avatar_provider import router as avatar_provider_router
 from app.routes.avatar_video import router as avatar_video_router
-load_dotenv()
+from app.routes.realtime import router as realtime_router
+from app.routes.memory_ingestion import router as memory_ingestion_router
+from app.routes.memory_retrieval import router as memory_retrieval_router
+from app.routes.conversation_memory import router as conversation_memory_router
+from app.routes.elevenlabs_voice import router as elevenlabs_voice_router
 
 app = FastAPI(
     title="RememberMeAI Backend",
-    version="0.14.0",
+    version="0.16.0",
 )
 
 app.include_router(memory_router, prefix="/v1/memory", tags=["memory"])
+app.include_router(streaming_memory_router, prefix="/v1/streaming-memory", tags=["streaming-memory"])
+app.include_router(memory_retrieval_router, prefix="/v1/memory-retrieval", tags=["memory-retrieval"])
+app.include_router(memory_ingestion_router, prefix="/v1/memory-ingestion", tags=["memory-ingestion"])
+app.include_router(conversation_memory_router, prefix="/v1/conversation-memory", tags=["conversation-memory"])
+
 app.include_router(voice_router, prefix="/v1/voice", tags=["voice"])
 app.include_router(vector_memory_router, prefix="/v1/vector-memory", tags=["vector-memory"])
 app.include_router(persona_router, prefix="/v1/persona", tags=["persona"])
 app.include_router(system_router, prefix="/v1/system", tags=["system"])
 app.include_router(emotional_reasoning_router, prefix="/v1/emotional-reasoning", tags=["emotional-reasoning"])
-app.include_router(streaming_memory_router, prefix="/v1/streaming-memory", tags=["streaming-memory"])
+
 app.include_router(avatar_training_router, prefix="/v1/avatar-training", tags=["avatar-training"])
 app.include_router(avatar_identity_router, prefix="/v1/avatar-identity", tags=["avatar-identity"])
 app.include_router(avatar_runtime_router, prefix="/v1/avatar-runtime", tags=["avatar-runtime"])
@@ -45,9 +56,12 @@ app.include_router(avatar_generation_job_router, prefix="/v1/avatar-generation-j
 app.include_router(avatar_renderer_handoff_router, prefix="/v1/avatar-renderer-handoff", tags=["avatar-renderer-handoff"])
 app.include_router(avatar_stub_renderer_router, prefix="/v1/avatar-stub-renderer", tags=["avatar-stub-renderer"])
 
+app.include_router(avatar_provider_router)
+app.include_router(avatar_video_router)
+app.include_router(realtime_router)
+app.include_router(elevenlabs_voice_router)
+
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
-app.include_router(avatar_provider_router)
-app.include_router(avatar_video_router)

@@ -37,8 +37,11 @@ class AvatarMediaStorageService:
             "image",
             "video",
             "voice",
+            "audio",
             "reference",
-            "training_sample"
+            "training_sample",
+            "generated_preview",
+            "trained_replica"
         }
 
         self.allowed_content_types = {
@@ -298,9 +301,9 @@ class AvatarMediaStorageService:
                 f"Asset type '{asset_type}' requires video content, got {content_type}."
             )
 
-        if asset_type == "voice" and not content_type.startswith("audio/"):
+        if asset_type in ["voice", "audio"] and not content_type.startswith("audio/"):
             raise RuntimeError(
-                f"Asset type 'voice' requires audio content, got {content_type}."
+                f"Asset type '{asset_type}' requires audio content, got {content_type}."
             )
 
     def _safe_extension(self, filename: Optional[str]) -> str:

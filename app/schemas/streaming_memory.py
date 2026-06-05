@@ -11,3 +11,7 @@ class StreamingMemoryChatRequest(BaseModel):
     memories: List[MemoryItem] = Field(default_factory=list)
     recent_messages: List[str] = Field(default_factory=list)
     emotional_mode: Optional[str] = None
+
+    # Optional backend retrieval hook.
+    profile_id: Optional[str] = None
+    retrieval_limit: int = 5

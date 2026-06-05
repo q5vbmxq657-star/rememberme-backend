@@ -53,19 +53,21 @@ class PGVectorMemoryService:
                             profile_id,
                             title,
                             summary,
+                            original_text,
                             type,
                             emotional_tags,
                             confidence_score,
                             content,
                             embedding
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::vector);
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector);
                         """,
                         (
                             memory.id,
                             memory.profile_id,
                             memory.title,
                             memory.summary,
+                            memory.original_text,
                             memory.type,
                             memory.emotional_tags,
                             float(memory.confidence_score),
@@ -97,6 +99,7 @@ class PGVectorMemoryService:
                         memory_id,
                         title,
                         summary,
+                        original_text,
                         type,
                         emotional_tags,
                         confidence_score,
@@ -124,6 +127,7 @@ class PGVectorMemoryService:
                     id=row["memory_id"],
                     title=row["title"],
                     summary=row["summary"],
+                    original_text=row["original_text"],
                     type=row["type"],
                     emotional_tags=row["emotional_tags"] or [],
                     confidence_score=float(row["confidence_score"]),
@@ -146,6 +150,7 @@ class PGVectorMemoryService:
                         profile_id TEXT NOT NULL,
                         title TEXT NOT NULL,
                         summary TEXT NOT NULL,
+                        original_text TEXT,
                         type TEXT NOT NULL,
                         emotional_tags TEXT[] NOT NULL DEFAULT '{}',
                         confidence_score DOUBLE PRECISION NOT NULL DEFAULT 0,
@@ -154,6 +159,13 @@ class PGVectorMemoryService:
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    ALTER TABLE memory_embeddings
+                    ADD COLUMN IF NOT EXISTS original_text TEXT;
                     """
                 )
 
@@ -190,9 +202,12 @@ class PGVectorMemoryService:
         return response.data[0].embedding
 
     def _memory_text(self, memory: VectorMemoryItem) -> str:
+        original_text = memory.original_text or ""
+
         return "\n".join([
             f"Title: {memory.title}",
             f"Type: {memory.type}",
+            f"Original memory text: {original_text}",
             f"Summary: {memory.summary}",
             f"Emotional tags: {', '.join(memory.emotional_tags)}",
             f"Confidence: {memory.confidence_score}",

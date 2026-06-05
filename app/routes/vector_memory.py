@@ -1,10 +1,13 @@
 import os
+
 from fastapi import APIRouter, HTTPException
+
 from app.schemas.vector_memory import (
     IndexMemoryRequest,
     SearchMemoryRequest,
     SearchMemoryResponse,
 )
+
 from app.services.vector_memory_service import VectorMemoryService
 from app.services.pgvector_memory_service import PGVectorMemoryService
 
@@ -25,6 +28,7 @@ def index_memories(request: IndexMemoryRequest):
     try:
         service = make_service()
         return service.index(request)
+
     except Exception as error:
         raise HTTPException(
             status_code=500,
@@ -37,6 +41,7 @@ def search_memories(request: SearchMemoryRequest):
     try:
         service = make_service()
         return service.search(request)
+
     except Exception as error:
         raise HTTPException(
             status_code=500,

@@ -10,6 +10,7 @@ class VectorMemoryItem(BaseModel):
     type: str
     emotional_tags: List[str] = Field(default_factory=list)
     confidence_score: float = 0.0
+    original_text: Optional[str] = None
 
 
 class IndexMemoryRequest(BaseModel):
@@ -31,6 +32,7 @@ class SearchMemoryResult(BaseModel):
     emotional_tags: List[str]
     confidence_score: float
     similarity_score: float
+    original_text: Optional[str] = None
 
 
 class SearchMemoryResponse(BaseModel):
