@@ -15,3 +15,20 @@ storage/
 
 storage/
 
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Python local artifacts
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local audit/backups
+RemembermeAI_Avatar_Production_Backups/
+*.tar.gz
+*.pages
+RemembermeAI_Avatar_Production_Block_*.txt
