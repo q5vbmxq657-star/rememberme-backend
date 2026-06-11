@@ -26,7 +26,7 @@ def render_avatar_stub(
     except Exception as error:
         raise HTTPException(
             status_code=500,
-            detail=f"Avatar stub rendering failed: {str(error)}"
+            detail=f"Avatar preview rendering failed: {str(error)}"
         )
 
 
@@ -46,7 +46,7 @@ def get_avatar_stub_render_status(
     except Exception as error:
         raise HTTPException(
             status_code=404,
-            detail=f"Avatar stub render status failed: {str(error)}"
+            detail=f"Avatar preview render status failed: {str(error)}"
         )
 
 
@@ -58,5 +58,5 @@ def get_avatar_stub_output(output_asset_id: str):
     except Exception as error:
         raise HTTPException(
             status_code=404,
-            detail=f"Avatar stub output failed: {str(error)}"
+            detail=f"Avatar preview output failed: {str(error)}"
         )

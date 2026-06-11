@@ -4,7 +4,7 @@ from typing import List, Optional
 
 class AvatarRendererHandoffRequest(BaseModel):
     job_id: str
-    renderer_provider: str = "internal_stub_renderer"
+    renderer_provider: str = "internal_preview_renderer"
     expires_in_seconds: int = 900
 
 

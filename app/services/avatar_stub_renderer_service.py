@@ -47,7 +47,7 @@ class AvatarStubRendererService:
             "output_asset_id": output_asset_id,
             "job_id": handoff.job_id,
             "profile_id": handoff.profile_id,
-            "output_type": "generated_avatar_preview_stub",
+            "output_type": "generated_avatar_preview",
             "avatar_mode": handoff.avatar_mode,
             "renderer": handoff.renderer,
             "renderer_provider": handoff.renderer_provider,
@@ -66,16 +66,16 @@ class AvatarStubRendererService:
             output_asset_id=output_asset_id
         )
 
-        preview_url = f"{base_url.rstrip('/')}/v1/avatar-stub-renderer/outputs/{output_asset_id}"
+        preview_url = f"{base_url.rstrip('/')}/v1/avatar-preview-renderer/outputs/{output_asset_id}"
 
         return AvatarStubRenderResponse(
             job_id=handoff.job_id,
             profile_id=handoff.profile_id,
             render_status="completed",
             output_asset_id=output_asset_id,
-            output_type="generated_avatar_preview_stub",
+            output_type="generated_avatar_preview",
             preview_video_url=preview_url,
-            message="Internal stub renderer completed. Output contract is ready for iOS preview integration."
+            message="Avatar preview renderer completed. Output contract is ready for iOS preview integration."
         )
 
     def get_render_status(
@@ -102,7 +102,7 @@ class AvatarStubRendererService:
             job_id=job_id,
             render_status="completed",
             output_asset_id=clean_output_id,
-            preview_video_url=f"{base_url.rstrip('/')}/v1/avatar-stub-renderer/outputs/{clean_output_id}",
+            preview_video_url=f"{base_url.rstrip('/')}/v1/avatar-preview-renderer/outputs/{clean_output_id}",
             message="Renderer output is available."
         )
 

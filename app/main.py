@@ -1,6 +1,13 @@
 from dotenv import load_dotenv
 load_dotenv()
 
+from app.services.avatar_runtime_livekit_safety_patch import (
+    install_avatar_runtime_livekit_safety_patch,
+)
+
+install_avatar_runtime_livekit_safety_patch()
+
+
 from fastapi import FastAPI
 
 from app.routes.memory import router as memory_router
@@ -54,7 +61,8 @@ app.include_router(avatar_motion_router, prefix="/v1/avatar-motion", tags=["avat
 app.include_router(avatar_generation_router, prefix="/v1/avatar-generation", tags=["avatar-generation"])
 app.include_router(avatar_generation_job_router, prefix="/v1/avatar-generation-job", tags=["avatar-generation-job"])
 app.include_router(avatar_renderer_handoff_router, prefix="/v1/avatar-renderer-handoff", tags=["avatar-renderer-handoff"])
-app.include_router(avatar_stub_renderer_router, prefix="/v1/avatar-stub-renderer", tags=["avatar-stub-renderer"])
+app.include_router(avatar_stub_renderer_router, prefix="/v1/avatar-preview-renderer", tags=["avatar-preview-renderer"])
+app.include_router(avatar_stub_renderer_router, prefix="/v1/avatar-stub-renderer", tags=["avatar-stub-renderer-legacy"])
 
 app.include_router(avatar_provider_router)
 app.include_router(avatar_video_router)

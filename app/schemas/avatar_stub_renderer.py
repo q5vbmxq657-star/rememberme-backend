@@ -4,7 +4,7 @@ from typing import Optional
 
 class AvatarStubRenderRequest(BaseModel):
     job_id: str
-    renderer_provider: str = "internal_stub_renderer"
+    renderer_provider: str = "internal_preview_renderer"
 
 
 class AvatarStubRenderResponse(BaseModel):
