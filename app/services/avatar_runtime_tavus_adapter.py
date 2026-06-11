@@ -271,13 +271,18 @@ class AvatarRuntimeTavusAdapter:
                 room_name
             )
 
-            await asyncio.wait_for(
-                room.connect(
-                    self.livekit_url,
-                    bridge_token.token,
-                ),
-                timeout=self.connection_timeout_seconds,
-            )
+            try:
+                await asyncio.wait_for(
+                    room.connect(
+                        self.livekit_url,
+                        bridge_token.token,
+                    ),
+                    timeout=self.connection_timeout_seconds,
+                )
+            except asyncio.TimeoutError as error:
+                raise TavusRuntimeConnectionError(
+                    "Tavus activation timed out while connecting backend bridge to LiveKit room."
+                ) from error
 
             dispatch_id = await self._dispatch_worker(
                 session_id=session_id,
@@ -286,22 +291,38 @@ class AvatarRuntimeTavusAdapter:
                 avatar_identity=avatar_identity,
             )
 
-            await asyncio.wait_for(
-                agent_utils.wait_for_participant(
-                    room=room,
-                    identity=avatar_identity,
-                ),
-                timeout=self.connection_timeout_seconds,
-            )
+            try:
+                await asyncio.wait_for(
+                    agent_utils.wait_for_participant(
+                        room=room,
+                        identity=avatar_identity,
+                    ),
+                    timeout=self.connection_timeout_seconds,
+                )
+            except asyncio.TimeoutError as error:
+                raise TavusRuntimeConnectionError(
+                    "Tavus activation timed out waiting for avatar participant. "
+                    f"Expected identity: {avatar_identity}. "
+                    f"Worker name: {self.worker_name}. "
+                    f"Dispatch id: {dispatch_id or 'none'}."
+                ) from error
 
-            await asyncio.wait_for(
-                agent_utils.wait_for_track_publication(
-                    room=room,
-                    identity=avatar_identity,
-                    kind=rtc.TrackKind.KIND_VIDEO,
-                ),
-                timeout=self.connection_timeout_seconds,
-            )
+            try:
+                await asyncio.wait_for(
+                    agent_utils.wait_for_track_publication(
+                        room=room,
+                        identity=avatar_identity,
+                        kind=rtc.TrackKind.KIND_VIDEO,
+                    ),
+                    timeout=self.connection_timeout_seconds,
+                )
+            except asyncio.TimeoutError as error:
+                raise TavusRuntimeConnectionError(
+                    "Tavus activation timed out waiting for avatar video track. "
+                    f"Expected identity: {avatar_identity}. "
+                    f"Worker name: {self.worker_name}. "
+                    f"Dispatch id: {dispatch_id or 'none'}."
+                ) from error
 
             audio_output = DataStreamAudioOutput(
                 room=room,
