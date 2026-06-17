@@ -90,6 +90,7 @@ class AvatarMediaStorageService:
         title: str,
         file: UploadFile,
         base_url: str,
+        upload_id: Optional[str] = None,
     ) -> AvatarMediaUploadResponse:
         self._validate_profile_id(profile_id)
         self._validate_asset_type(asset_type)
@@ -109,7 +110,10 @@ class AvatarMediaStorageService:
             content_type=normalized_content_type
         )
 
-        asset_id = str(uuid.uuid4())
+        asset_id = self._resolve_asset_id(
+            profile_id=profile_id,
+            upload_id=upload_id,
+        )
         extension = self._safe_extension(file.filename)
         filename = f"{asset_id}{extension}"
 
@@ -305,6 +309,84 @@ class AvatarMediaStorageService:
             raise RuntimeError(
                 f"Asset type '{asset_type}' requires audio content, got {content_type}."
             )
+
+    def _resolve_asset_id(
+        self,
+        *,
+        profile_id: str,
+        upload_id: Optional[str],
+    ) -> str:
+        normalized_upload_id = (
+            upload_id.strip()
+            if upload_id
+            else ""
+        )
+
+        if not normalized_upload_id:
+            return str(uuid.uuid4())
+
+        if len(normalized_upload_id) > 200:
+            raise RuntimeError(
+                "upload_id is too long."
+            )
+
+        return str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                (
+                    "rememberme-avatar-media:"
+                    f"{profile_id}:"
+                    f"{normalized_upload_id}"
+                ),
+            )
+        )
+
+    def delete_asset(
+        self,
+        asset_id: str,
+    ) -> None:
+        metadata = None
+
+        try:
+            metadata = self.get_metadata(
+                asset_id
+            )
+        except Exception:
+            metadata = None
+
+        if metadata is not None:
+            self._delete_file_if_exists(
+                Path(metadata.storage_path)
+            )
+
+            metadata_file = (
+                self.storage_root
+                / metadata.profile_id
+                / "metadata"
+                / f"{asset_id}.json"
+            )
+
+            self._delete_file_if_exists(
+                metadata_file
+            )
+
+            return
+
+        for candidate in self.storage_root.glob(
+            f"*/{asset_id}.*"
+        ):
+            if candidate.is_file():
+                self._delete_file_if_exists(
+                    candidate
+                )
+
+        for candidate in self.storage_root.glob(
+            f"*/metadata/{asset_id}.json"
+        ):
+            if candidate.is_file():
+                self._delete_file_if_exists(
+                    candidate
+                )
 
     def _safe_extension(self, filename: Optional[str]) -> str:
         if not filename or "." not in filename:
