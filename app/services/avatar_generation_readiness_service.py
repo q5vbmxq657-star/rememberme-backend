@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional
 from uuid import UUID
 
+from app.models.avatar_evidence_asset import (
+    AvatarEvidenceAsset,
+)
 from app.models.digital_human_profile import (
     DigitalHumanProfile,
 )
@@ -18,6 +21,9 @@ from app.schemas.avatar_identity_fusion import (
 )
 from app.schemas.avatar_motion import (
     AvatarMotionReadinessRequest,
+)
+from app.services.avatar_evidence_repository import (
+    AvatarEvidenceRepository,
 )
 from app.services.avatar_identity_fusion_service import (
     AvatarIdentityFusionService,
@@ -56,11 +62,11 @@ class AvatarGenerationReadinessService:
     - Consent is loaded from PostgreSQL.
     - Personalized voice readiness is loaded from PostgreSQL.
     - Persisted avatar readiness is loaded from PostgreSQL.
-    - Visual and motion evidence is evaluated by backend services.
+    - Visual and motion readiness is derived exclusively from persistent avatar_evidence_assets.
     - Persona evidence is read from persistent profile metadata.
 
-    The client cannot upgrade consent, voice readiness, avatar status or
-    quality by sending crafted scores.
+    The client cannot upgrade consent, voice readiness, visual readiness,
+    motion readiness, avatar status or quality by sending crafted scores.
     """
 
     def __init__(
@@ -69,6 +75,9 @@ class AvatarGenerationReadinessService:
         repository: Optional[
             DigitalHumanProfileRepository
         ] = None,
+        evidence_repository: Optional[
+            AvatarEvidenceRepository
+        ] = None,
         identity_fusion_service: Optional[
             AvatarIdentityFusionService
         ] = None,
@@ -76,16 +85,26 @@ class AvatarGenerationReadinessService:
             AvatarMotionReadinessService
         ] = None,
     ) -> None:
+        """
+        Create the canonical readiness resolver.
+
+        identity_fusion_service and motion_service remain accepted only for
+        backwards-compatible dependency construction. They are intentionally
+        not used by assess(). Visual readiness is derived exclusively from
+        persistent AvatarEvidenceRepository records.
+        """
+
         self._repository = repository
+        self._evidence_repository = (
+            evidence_repository
+        )
 
         self.identity_fusion_service = (
             identity_fusion_service
-            or AvatarIdentityFusionService()
         )
 
         self.motion_service = (
             motion_service
-            or AvatarMotionReadinessService()
         )
 
     @property
@@ -107,6 +126,24 @@ class AvatarGenerationReadinessService:
 
         return self._repository
 
+    @property
+    def evidence_repository(
+        self,
+    ) -> AvatarEvidenceRepository:
+        """
+        Resolve the persistent visual evidence source lazily.
+
+        This repository is the only authority for identity and motion
+        readiness. Legacy avatar-media services cannot raise visual scores.
+        """
+
+        if self._evidence_repository is None:
+            self._evidence_repository = (
+                AvatarEvidenceRepository()
+            )
+
+        return self._evidence_repository
+
     def assess(
         self,
         request: AvatarGenerationReadinessRequest,
@@ -115,35 +152,48 @@ class AvatarGenerationReadinessService:
             request.profile_id
         )
 
-        identity = self.identity_fusion_service.fuse(
-            AvatarIdentityFusionRequest(
-                profile_id=str(request.profile_id),
-                min_quality_score=0.60,
+        identity_assets = (
+            self.evidence_repository
+            .list_active_assets(
+                request.profile_id,
+                evidence_kind="identity_photo",
             )
         )
 
-        motion = self.motion_service.assess(
-            AvatarMotionReadinessRequest(
-                profile_id=str(request.profile_id),
+        motion_assets = (
+            self.evidence_repository
+            .list_active_assets(
+                request.profile_id,
+                evidence_kind="motion_video",
             )
         )
 
-        identity_score = self._resolve_identity_score(
-            profile=profile,
-            calculated_score=getattr(
-                identity,
-                "identity_stability_score",
-                0.0,
-            ),
+        primary_identity_asset = (
+            self.evidence_repository
+            .resolve_primary(
+                request.profile_id,
+                "identity_photo",
+            )
         )
 
-        motion_score = self._resolve_motion_score(
-            profile=profile,
-            calculated_score=getattr(
-                motion,
-                "talking_portrait_readiness_score",
-                0.0,
-            ),
+        primary_motion_asset = (
+            self.evidence_repository
+            .resolve_primary(
+                request.profile_id,
+                "motion_video",
+            )
+        )
+
+        identity_score = (
+            self._identity_score_from_evidence(
+                identity_assets
+            )
+        )
+
+        motion_score = (
+            self._motion_score_from_evidence(
+                motion_assets
+            )
         )
 
         voice_score = self._resolve_voice_score(
@@ -272,18 +322,20 @@ class AvatarGenerationReadinessService:
             persona_score=persona_score,
             consent_score=consent_score,
             primary_identity_asset_id=(
-                getattr(
-                    identity,
-                    "primary_reference_asset_id",
-                    None,
+                str(
+                    primary_identity_asset.asset_id
                 )
+                if primary_identity_asset
+                is not None
+                else None
             ),
             primary_motion_asset_id=(
-                getattr(
-                    motion,
-                    "recommended_primary_motion_asset_id",
-                    None,
+                str(
+                    primary_motion_asset.asset_id
                 )
+                if primary_motion_asset
+                is not None
+                else None
             ),
             presentation=presentation,
             capabilities=capabilities,
@@ -299,65 +351,126 @@ class AvatarGenerationReadinessService:
             ),
         )
 
-    def _resolve_identity_score(
+    def _identity_score_from_evidence(
         self,
-        *,
-        profile: DigitalHumanProfile,
-        calculated_score: Any,
+        assets: List[AvatarEvidenceAsset],
     ) -> float:
-        score = self._clamp(calculated_score)
+        """
+        Resolve identity readiness solely from eligible persistent evidence.
 
-        if profile.has_runtime_avatar:
-            return max(
-                score,
-                0.88,
+        list_active_assets() already excludes:
+        - archived assets
+        - removed or non-included assets
+        - rejected assets
+        - assets below quality 0.72
+        - assets outside ready/training states
+        """
+
+        scores = [
+            self._identity_asset_score(asset)
+            for asset in assets
+            if (
+                asset.evidence_kind
+                == "identity_photo"
+                and asset.is_active_avatar_evidence
             )
+        ]
 
-        if (
-            profile.avatar_training_status
-            in {
-                "submitted",
-                "training",
-                "processing",
-            }
-            and profile.avatar_replica_id
-        ):
-            return max(
-                score,
-                0.72,
-            )
+        if not scores:
+            return 0.0
 
-        return score
+        return round(
+            max(scores),
+            3,
+        )
 
-    def _resolve_motion_score(
+    def _identity_asset_score(
         self,
-        *,
-        profile: DigitalHumanProfile,
-        calculated_score: Any,
+        asset: AvatarEvidenceAsset,
     ) -> float:
-        score = self._clamp(calculated_score)
-
-        if profile.has_runtime_avatar:
-            return max(
-                score,
-                0.82,
+        score = (
+            self._clamp(
+                asset.quality_score
+            ) * 0.30
+            + self._clamp(
+                asset.identity_consistency_score
+            ) * 0.30
+            + self._clamp(
+                asset.emotional_presence_score
+            ) * 0.10
+            + (
+                0.10
+                if asset.has_face
+                else 0.0
             )
-
-        if (
-            profile.avatar_training_status
-            in {
-                "submitted",
-                "training",
-                "processing",
-            }
-            and profile.avatar_replica_id
-        ):
-            return max(
-                score,
-                0.48,
+            + (
+                0.10
+                if asset.has_frontal_face
+                else 0.0
             )
+            + (
+                0.10
+                if asset.has_clear_lighting
+                else 0.0
+            )
+        )
 
-        return score
+        return self._clamp(score)
+
+    def _motion_score_from_evidence(
+        self,
+        assets: List[AvatarEvidenceAsset],
+    ) -> float:
+        """
+        Resolve motion readiness solely from eligible persistent evidence.
+        """
+
+        scores = [
+            self._motion_asset_score(asset)
+            for asset in assets
+            if (
+                asset.evidence_kind
+                == "motion_video"
+                and asset.is_active_avatar_evidence
+            )
+        ]
+
+        if not scores:
+            return 0.0
+
+        return round(
+            max(scores),
+            3,
+        )
+
+    def _motion_asset_score(
+        self,
+        asset: AvatarEvidenceAsset,
+    ) -> float:
+        score = (
+            self._clamp(
+                asset.motion_quality_score
+            ) * 0.25
+            + self._clamp(
+                asset.expression_range_score
+            ) * 0.20
+            + self._clamp(
+                asset.lip_visibility_score
+            ) * 0.20
+            + self._clamp(
+                asset.head_pose_stability_score
+            ) * 0.15
+            + self._clamp(
+                asset.quality_score
+            ) * 0.10
+            + (
+                0.10
+                if asset.motion_usable
+                else 0.0
+            )
+        )
+
+        return self._clamp(score)
 
     def _resolve_voice_score(
         self,

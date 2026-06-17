@@ -78,6 +78,67 @@ class FakeMotionService:
         )
 
 
+
+class FakeEvidenceRepository:
+    """
+    Explicit in-memory Evidence dependency for isolated readiness tests.
+
+    Production code continues to require the real PostgreSQL-backed
+    AvatarEvidenceRepository. Only unit tests use this deterministic fake.
+    """
+
+    def __init__(
+        self,
+        *,
+        identity_assets=None,
+        motion_assets=None,
+        primary_identity=None,
+        primary_motion=None,
+    ):
+        self.identity_assets = list(
+            identity_assets or []
+        )
+        self.motion_assets = list(
+            motion_assets or []
+        )
+        self.primary_identity = primary_identity
+        self.primary_motion = primary_motion
+
+    def list_active_assets(
+        self,
+        profile_id,
+        *,
+        evidence_kind=None,
+    ):
+        if evidence_kind == "identity_photo":
+            return list(
+                self.identity_assets
+            )
+
+        if evidence_kind == "motion_video":
+            return list(
+                self.motion_assets
+            )
+
+        return (
+            list(self.identity_assets)
+            + list(self.motion_assets)
+        )
+
+    def resolve_primary(
+        self,
+        profile_id,
+        evidence_kind,
+    ):
+        if evidence_kind == "identity_photo":
+            return self.primary_identity
+
+        if evidence_kind == "motion_video":
+            return self.primary_motion
+
+        return None
+
+
 def make_profile(
     *,
     consent_verified: bool,
@@ -131,11 +192,16 @@ def service_for(
     *,
     identity_score=0.0,
     motion_score=0.0,
+    evidence_repository=None,
 ):
     repository = FakeRepository(profile)
 
     service = AvatarGenerationReadinessService(
         repository=repository,
+        evidence_repository=(
+            evidence_repository
+            or FakeEvidenceRepository()
+        ),
         identity_fusion_service=(
             FakeIdentityFusionService(
                 identity_score
@@ -223,7 +289,7 @@ def test_ready_persistent_voice_is_enabled():
     assert repository.updated_quality is not None
 
 
-def test_ready_runtime_avatar_uses_persistent_identity():
+def test_ready_runtime_avatar_cannot_raise_visual_scores():
     profile = make_profile(
         consent_verified=True,
         voice_status="ready",
@@ -251,16 +317,27 @@ def test_ready_runtime_avatar_uses_persistent_identity():
         )
     )
 
-    assert response.identity_score >= 0.88
-    assert response.motion_score >= 0.82
+    assert response.identity_score == 0.0
+    assert response.motion_score == 0.0
+
+    assert (
+        response.primary_identity_asset_id
+        is None
+    )
+
+    assert (
+        response.primary_motion_asset_id
+        is None
+    )
+
     assert response.voice_score == 1.0
     assert response.persona_score == 0.75
+
     assert response.quality_tier == (
-        "signature_live"
+        "premium_presence"
     )
-    assert response.recommended_avatar_mode == (
-        "realtime_replica"
-    )
+
+
 
 
 def test_persona_score_comes_from_server_metadata():
