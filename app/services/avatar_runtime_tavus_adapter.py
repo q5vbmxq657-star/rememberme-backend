@@ -111,12 +111,6 @@ class AvatarRuntimeTavusAdapter:
         self.tavus_api_key = self._clean(
             os.getenv("TAVUS_API_KEY")
         )
-        self.replica_id = self._clean(
-            os.getenv("TAVUS_REPLICA_ID")
-        )
-        self.persona_id = self._clean(
-            os.getenv("TAVUS_PERSONA_ID")
-        )
         self.worker_name = (
             self._clean(
                 os.getenv(
@@ -206,8 +200,6 @@ class AvatarRuntimeTavusAdapter:
                 self.livekit_api_key,
                 self.livekit_api_secret,
                 self.tavus_api_key,
-                self.replica_id,
-                self.persona_id,
                 self.token_service.is_configured,
             )
         )
@@ -218,8 +210,6 @@ class AvatarRuntimeTavusAdapter:
             "LIVEKIT_API_KEY": self.livekit_api_key,
             "LIVEKIT_API_SECRET": self.livekit_api_secret,
             "TAVUS_API_KEY": self.tavus_api_key,
-            "TAVUS_REPLICA_ID": self.replica_id,
-            "TAVUS_PERSONA_ID": self.persona_id,
         }
 
         return [
@@ -234,8 +224,23 @@ class AvatarRuntimeTavusAdapter:
         session_id: str,
         profile_id: UUID,
         display_name: str,
+        replica_id: str,
+        persona_id: str,
     ) -> TavusRemoteSession:
         self._require_configuration()
+
+        clean_replica_id = replica_id.strip()
+        clean_persona_id = persona_id.strip()
+
+        if not clean_replica_id:
+            raise TavusRuntimeConfigurationError(
+                "The digital human profile has no Tavus replica identifier."
+            )
+
+        if not clean_persona_id:
+            raise TavusRuntimeConfigurationError(
+                "The digital human profile has no Tavus persona identifier."
+            )
 
         room_name = (
             self.token_service
@@ -289,6 +294,8 @@ class AvatarRuntimeTavusAdapter:
                 profile_id=profile_id,
                 room_name=room_name,
                 avatar_identity=avatar_identity,
+                replica_id=clean_replica_id,
+                persona_id=clean_persona_id,
             )
 
             try:
@@ -366,7 +373,7 @@ class AvatarRuntimeTavusAdapter:
 
             return TavusRemoteSession(
                 session_id=session_id,
-                provider_avatar_id=self.replica_id,
+                provider_avatar_id=clean_replica_id,
                 descriptor=descriptor,
                 room_name=room_name,
                 avatar_identity=avatar_identity,
@@ -574,6 +581,8 @@ class AvatarRuntimeTavusAdapter:
         profile_id: UUID,
         room_name: str,
         avatar_identity: str,
+        replica_id: str,
+        persona_id: str,
     ) -> Optional[str]:
         client = self._make_api_client()
 
@@ -584,6 +593,8 @@ class AvatarRuntimeTavusAdapter:
                 "session_id": session_id,
                 "profile_id": str(profile_id),
                 "avatar_identity": avatar_identity,
+                "replica_id": replica_id,
+                "persona_id": persona_id,
             },
             separators=(",", ":"),
             sort_keys=True,

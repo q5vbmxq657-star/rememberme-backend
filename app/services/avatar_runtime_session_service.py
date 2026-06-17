@@ -35,6 +35,11 @@ from app.services.avatar_runtime_tavus_adapter import (
     TavusRuntimeConnectionError,
     TavusRuntimeError,
 )
+from app.services.digital_human_profile_repository import (
+    DigitalHumanProfileNotFoundError,
+    DigitalHumanProfileRepository,
+    DigitalHumanProfileRepositoryError,
+)
 
 
 class AvatarRuntimeServiceError(Exception):
@@ -170,6 +175,9 @@ class AvatarRuntimeSessionService:
                 )
             )
         )
+        self.profile_repository = (
+            DigitalHumanProfileRepository()
+        )
 
         self._load_sessions()
         self._remove_expired_sessions()
@@ -179,6 +187,18 @@ class AvatarRuntimeSessionService:
         request: AvatarRuntimeSessionCreateRequest,
     ) -> AvatarRuntimeSessionResponse:
         now = self._utc_now()
+
+        try:
+            digital_human_profile = (
+                self.profile_repository
+                .require(request.profile_id)
+            )
+        except DigitalHumanProfileNotFoundError:
+            digital_human_profile = None
+        except DigitalHumanProfileRepositoryError as error:
+            raise AvatarRuntimeProviderUnavailableError(
+                "Digital human profile storage is unavailable."
+            ) from error
 
         allow_tavus_fallback = (
             request.fallback_enabled
@@ -221,77 +241,115 @@ class AvatarRuntimeSessionService:
                 now=now,
             )
         elif provider == AvatarRuntimeProvider.TAVUS:
-            try:
-                remote = (
-                    await self.tavus_adapter
-                    .start_session(
-                        session_id=session_id,
-                        profile_id=request.profile_id,
-                        display_name=(
-                            request.display_name
-                        ),
-                    )
-                )
-
-                session = AvatarRuntimeSessionResponse(
-                    session_id=session_id,
-                    profile_id=request.profile_id,
-                    provider=(
-                        AvatarRuntimeProvider.TAVUS
-                    ),
-                    transport=(
-                        AvatarRuntimeTransport.LIVEKIT
-                    ),
-                    provider_avatar_id=(
-                        remote.provider_avatar_id
-                    ),
-                    livekit=remote.descriptor,
-                    preview_video_url=None,
-                    created_at=now,
-                    expires_at=remote.descriptor.expires_at,
-                    fallback_providers=(
-                        fallback_providers
-                    ),
-                    metadata={
-                        **remote.metadata,
-                        "provider_resolution":
-                            "verified_remote_provider",
-                    },
-                )
-
-            except TavusRuntimeError as error:
+            if (
+                digital_human_profile is None
+                or not digital_human_profile.has_runtime_avatar
+                or digital_human_profile.avatar_provider != "tavus"
+                or not digital_human_profile.avatar_replica_id
+                or not digital_human_profile.avatar_persona_id
+            ):
                 if allow_local_fallback:
-                    clean_fallbacks = [
-                        candidate
-                        for candidate
-                        in fallback_providers
-                        if candidate
-                        != AvatarRuntimeProvider.LOCAL
-                    ]
-
                     session = self._make_local_session(
                         request=request,
                         session_id=session_id,
-                        fallback_providers=(
-                            clean_fallbacks
-                        ),
+                        fallback_providers=[
+                            candidate
+                            for candidate in fallback_providers
+                            if candidate != AvatarRuntimeProvider.LOCAL
+                        ],
                         diagnostics={
                             **diagnostics,
-                            "remote_activation": (
-                                "Tavus activation failed closed. "
-                                f"{type(error).__name__}: {error}"
+                            "profile_resolution": (
+                                "No production-ready Tavus identity "
+                                "is stored for this profile."
                             ),
                         },
                         now=now,
                     )
                 else:
-                    raise (
-                        AvatarRuntimeProviderUnavailableError(
-                            "Tavus activation failed and "
-                            "local fallback is disabled: "
-                            f"{error}"
+                    raise AvatarRuntimeProviderUnavailableError(
+                        "This profile has no production-ready avatar."
+                    )
+            else:
+                try:
+                    remote = (
+                        await self.tavus_adapter
+                        .start_session(
+                            session_id=session_id,
+                            profile_id=request.profile_id,
+                            display_name=(
+                                request.display_name
+                            ),
+                            replica_id=(
+                                digital_human_profile
+                                .avatar_replica_id
+                            ),
+                            persona_id=(
+                                digital_human_profile
+                                .avatar_persona_id
+                            ),
                         )
-                    ) from error
+                    )
+
+                    session = AvatarRuntimeSessionResponse(
+                            session_id=session_id,
+                            profile_id=request.profile_id,
+                            provider=(
+                                AvatarRuntimeProvider.TAVUS
+                            ),
+                        transport=(
+                            AvatarRuntimeTransport.LIVEKIT
+                        ),
+                        provider_avatar_id=(
+                            remote.provider_avatar_id
+                        ),
+                        livekit=remote.descriptor,
+                        preview_video_url=None,
+                        created_at=now,
+                        expires_at=remote.descriptor.expires_at,
+                        fallback_providers=(
+                            fallback_providers
+                        ),
+                        metadata={
+                            **remote.metadata,
+                            "provider_resolution":
+                                "verified_remote_provider",
+                        },
+                    )
+
+                except TavusRuntimeError as error:
+                    if allow_local_fallback:
+                        clean_fallbacks = [
+                            candidate
+                            for candidate
+                            in fallback_providers
+                            if candidate
+                            != AvatarRuntimeProvider.LOCAL
+                        ]
+
+                        session = self._make_local_session(
+                            request=request,
+                            session_id=session_id,
+                            fallback_providers=(
+                                clean_fallbacks
+                            ),
+                            diagnostics={
+                                **diagnostics,
+                                "remote_activation": (
+                                    "Tavus activation failed closed. "
+                                    f"{type(error).__name__}: {error}"
+                                ),
+                            },
+                            now=now,
+                        )
+                    else:
+                        raise (
+                            AvatarRuntimeProviderUnavailableError(
+                                "Tavus activation failed and "
+                                "local fallback is disabled: "
+                                f"{error}"
+                            )
+                        ) from error
         else:
             raise AvatarRuntimeProviderUnavailableError(
                 f"Provider '{provider.value}' has no "
@@ -305,6 +363,30 @@ class AvatarRuntimeSessionService:
                 )
             )
             self._persist_sessions()
+
+        if (
+            session.provider
+            == AvatarRuntimeProvider.TAVUS
+        ):
+            try:
+                self.profile_repository.mark_runtime_verified(
+                    request.profile_id
+                )
+            except DigitalHumanProfileRepositoryError:
+                await self.tavus_adapter.close_session(
+                    session.session_id
+                )
+
+                with self._lock:
+                    self._sessions.pop(
+                        session.session_id,
+                        None,
+                    )
+                    self._persist_sessions()
+
+                raise AvatarRuntimeProviderUnavailableError(
+                    "The avatar session could not be verified persistently."
+                )
 
         return session
 

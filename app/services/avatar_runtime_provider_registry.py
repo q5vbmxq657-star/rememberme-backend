@@ -68,11 +68,10 @@ class AvatarRuntimeProviderRegistry:
 
     _TAVUS_REQUIRED_KEYS = (
         "TAVUS_API_KEY",
-        "TAVUS_REPLICA_ID",
-        "TAVUS_PERSONA_ID",
         "LIVEKIT_URL",
         "LIVEKIT_API_KEY",
         "LIVEKIT_API_SECRET",
+        "DATABASE_URL",
     )
 
     _BEYOND_PRESENCE_REQUIRED_KEYS = (
@@ -120,8 +119,8 @@ class AvatarRuntimeProviderRegistry:
                 required_keys=self._TAVUS_REQUIRED_KEYS,
                 adapter_available=True,
                 adapter_reason=(
-                    "The production Tavus LiveKit worker and VoiceDNA "
-                    "media bridge are installed."
+                    "The production Tavus LiveKit worker, persistent "
+                    "profile identity and VoiceDNA media bridge are installed."
                 ),
             )
 

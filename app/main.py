@@ -68,7 +68,12 @@ app.include_router(avatar_stub_renderer_router, prefix="/v1/avatar-stub-renderer
 app.include_router(avatar_provider_router)
 app.include_router(avatar_video_router)
 app.include_router(realtime_router)
-app.include_router(elevenlabs_voice_router)
+app.include_router(
+    elevenlabs_voice_router,
+    dependencies=[
+        Depends(require_client_key)
+    ],
+)
 
 
 @app.get("/health")

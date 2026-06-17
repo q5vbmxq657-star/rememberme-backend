@@ -91,6 +91,15 @@ async def entrypoint(
     avatar_identity = str(
         metadata.get("avatar_identity") or ""
     ).strip()
+    profile_id = str(
+        metadata.get("profile_id") or ""
+    ).strip()
+    replica_id = str(
+        metadata.get("replica_id") or ""
+    ).strip()
+    persona_id = str(
+        metadata.get("persona_id") or ""
+    ).strip()
 
     if not session_id:
         raise RuntimeError(
@@ -102,14 +111,23 @@ async def entrypoint(
             "Avatar worker metadata is missing avatar_identity."
         )
 
+    if not profile_id:
+        raise RuntimeError(
+            "Avatar worker metadata is missing profile_id."
+        )
+
+    if not replica_id:
+        raise RuntimeError(
+            "Avatar worker metadata is missing replica_id."
+        )
+
+    if not persona_id:
+        raise RuntimeError(
+            "Avatar worker metadata is missing persona_id."
+        )
+
     tavus_api_key = _required_environment_value(
         "TAVUS_API_KEY"
-    )
-    replica_id = _required_environment_value(
-        "TAVUS_REPLICA_ID"
-    )
-    persona_id = _required_environment_value(
-        "TAVUS_PERSONA_ID"
     )
     livekit_url = _required_environment_value(
         "LIVEKIT_URL"
@@ -199,8 +217,10 @@ async def entrypoint(
         "Tavus avatar worker ready",
         extra={
             "session_id": session_id,
+            "profile_id": profile_id,
             "room_name": ctx.room.name,
             "avatar_identity": avatar_identity,
+            "replica_id": replica_id,
         },
     )
 
