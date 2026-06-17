@@ -19,6 +19,7 @@ from app.schemas.avatar_media import (
     AvatarMediaMetadata,
     AvatarMediaSignRequest,
     AvatarMediaSignResponse,
+    AvatarMediaStorageHealthResponse,
     AvatarMediaUploadResponse,
 )
 from app.services.avatar_evidence_repository import (
@@ -64,7 +65,7 @@ async def upload_avatar_media(
             UUID(profile_id)
         )
 
-        base_url = str(
+        request_base_url = str(
             request.base_url
         ).rstrip("/")
 
@@ -75,7 +76,7 @@ async def upload_avatar_media(
             asset_type=asset_type,
             title=title,
             file=file,
-            base_url=base_url,
+            base_url=request_base_url,
             upload_id=upload_id,
         )
 
@@ -221,13 +222,13 @@ def sign_avatar_media(
             AvatarMediaStorageService()
         )
 
-        base_url = str(
+        request_base_url = str(
             request.base_url
         ).rstrip("/")
 
         return service.sign_download_url(
             asset_id=body.asset_id,
-            base_url=base_url,
+            base_url=request_base_url,
             expires_in_seconds=(
                 body.expires_in_seconds
                 or 900
@@ -242,6 +243,32 @@ def sign_avatar_media(
             detail=(
                 "Avatar media signing failed: "
                 f"{error}"
+            ),
+        ) from error
+
+
+
+@router.get(
+    "/storage/health",
+    response_model=AvatarMediaStorageHealthResponse,
+)
+def get_avatar_media_storage_health(
+) -> AvatarMediaStorageHealthResponse:
+    try:
+        service = (
+            AvatarMediaStorageService()
+        )
+
+        return service.storage_health()
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=(
+                status.HTTP_503_SERVICE_UNAVAILABLE
+            ),
+            detail=(
+                "Avatar media storage is "
+                f"unavailable: {error}"
             ),
         ) from error
 

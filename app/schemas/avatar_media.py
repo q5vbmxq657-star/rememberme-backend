@@ -50,3 +50,22 @@ class AvatarMediaSignResponse(BaseModel):
 class AvatarMediaListResponse(BaseModel):
     profile_id: str
     assets: List[AvatarMediaMetadata] = Field(default_factory=list)
+
+
+class AvatarMediaStorageHealthResponse(BaseModel):
+    status: str
+    environment: str
+    storage_backend: str
+    storage_root: str
+    storage_root_explicit: bool
+    storage_exists: bool
+    storage_is_directory: bool
+    storage_writable: bool
+    public_base_url: Optional[str]
+    public_base_url_configured: bool
+    secure_public_url: bool
+    signing_secret_configured: bool
+    signing_secret_secure: bool
+    production_ready: bool
+    error_message: Optional[str] = None
+
