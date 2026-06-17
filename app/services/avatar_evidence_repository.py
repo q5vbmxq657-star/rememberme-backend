@@ -532,6 +532,37 @@ class AvatarEvidenceRepository:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
+                    SELECT *
+                    FROM avatar_evidence_assets
+                    WHERE asset_id = %s
+                      AND profile_id = %s
+                    FOR UPDATE
+                    """,
+                    (
+                        asset_id,
+                        profile_id,
+                    ),
+                )
+
+                existing_row = cursor.fetchone()
+
+                if existing_row is None:
+                    raise AvatarEvidenceNotFoundError(
+                        "Avatar evidence asset does not "
+                        "belong to this profile."
+                    )
+
+                existing_asset = self._asset_from_row(
+                    existing_row
+                )
+
+                was_primary = (
+                    existing_asset.selection_status
+                    == "primary"
+                )
+
+                cursor.execute(
+                    """
                     UPDATE avatar_evidence_assets
                     SET
                         is_included_in_avatar = FALSE,
@@ -541,7 +572,8 @@ class AvatarEvidenceRepository:
                             WHEN processing_status = 'training'
                             THEN 'ready'
                             ELSE processing_status
-                        END
+                        END,
+                        updated_at = NOW()
                     WHERE asset_id = %s
                       AND profile_id = %s
                     RETURNING *
@@ -554,12 +586,60 @@ class AvatarEvidenceRepository:
 
                 row = cursor.fetchone()
 
+                if was_primary:
+                    cursor.execute(
+                        """
+                        SELECT asset_id
+                        FROM avatar_evidence_assets
+                        WHERE profile_id = %s
+                          AND evidence_kind = %s
+                          AND asset_id <> %s
+                          AND archived_at IS NULL
+                          AND is_included_in_avatar = TRUE
+                          AND quality_score >= 0.72
+                          AND rejection_reason IS NULL
+                          AND processing_status IN (
+                              'ready',
+                              'training'
+                          )
+                        ORDER BY
+                            recommended_for_avatar DESC,
+                            quality_score DESC,
+                            updated_at DESC,
+                            asset_id ASC
+                        LIMIT 1
+                        FOR UPDATE
+                        """,
+                        (
+                            profile_id,
+                            existing_asset.evidence_kind,
+                            asset_id,
+                        ),
+                    )
+
+                    fallback_row = cursor.fetchone()
+
+                    if fallback_row is not None:
+                        cursor.execute(
+                            """
+                            UPDATE avatar_evidence_assets
+                            SET
+                                selection_status = 'primary',
+                                updated_at = NOW()
+                            WHERE asset_id = %s
+                              AND profile_id = %s
+                            """,
+                            (
+                                fallback_row["asset_id"],
+                                profile_id,
+                            ),
+                        )
+
             connection.commit()
 
         if row is None:
-            raise AvatarEvidenceNotFoundError(
-                "Avatar evidence asset does not "
-                "belong to this profile."
+            raise AvatarEvidenceRepositoryError(
+                "Could not remove avatar evidence."
             )
 
         return self._asset_from_row(row)
@@ -612,14 +692,45 @@ class AvatarEvidenceRepository:
         profile_id: UUID,
         evidence_kind: str,
     ) -> Optional[AvatarEvidenceAsset]:
-        assets = self.list_active_assets(
-            profile_id,
-            evidence_kind=evidence_kind,
-        )
+        with psycopg.connect(
+            self.database_url,
+            connect_timeout=10,
+            row_factory=dict_row,
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM avatar_evidence_assets
+                    WHERE profile_id = %s
+                      AND evidence_kind = %s
+                      AND archived_at IS NULL
+                      AND is_included_in_avatar = TRUE
+                      AND selection_status = 'primary'
+                      AND quality_score >= 0.72
+                      AND rejection_reason IS NULL
+                      AND processing_status IN (
+                          'ready',
+                          'training'
+                      )
+                    ORDER BY
+                        recommended_for_avatar DESC,
+                        quality_score DESC,
+                        updated_at DESC,
+                        asset_id ASC
+                    LIMIT 1
+                    """,
+                    (
+                        profile_id,
+                        evidence_kind,
+                    ),
+                )
+
+                row = cursor.fetchone()
 
         return (
-            assets[0]
-            if assets
+            self._asset_from_row(row)
+            if row is not None
             else None
         )
 
