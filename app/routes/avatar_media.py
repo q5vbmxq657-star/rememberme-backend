@@ -38,8 +38,7 @@ from app.services.avatar_media_storage_service import (
 
 
 router = APIRouter()
-
-
+public_router = APIRouter()
 @router.post(
     "/upload",
     response_model=AvatarMediaUploadResponse,
@@ -343,7 +342,7 @@ def list_avatar_media(
         ) from error
 
 
-@router.get(
+@public_router.get(
     "/assets/{asset_id}"
 )
 def download_avatar_media(

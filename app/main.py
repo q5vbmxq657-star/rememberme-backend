@@ -20,7 +20,10 @@ from app.routes.streaming_memory import router as streaming_memory_router
 from app.routes.avatar_training import router as avatar_training_router
 from app.routes.avatar_identity import router as avatar_identity_router
 from app.routes.avatar_runtime import router as avatar_runtime_router
-from app.routes.avatar_media import router as avatar_media_router
+from app.routes.avatar_media import (
+    public_router as avatar_media_public_router,
+    router as avatar_media_router,
+)
 from app.routes.avatar_evidence import router as avatar_evidence_router
 from app.routes.avatar_identity_fusion import router as avatar_identity_fusion_router
 from app.routes.avatar_motion import router as avatar_motion_router
@@ -58,6 +61,12 @@ app.include_router(avatar_training_router, prefix="/v1/avatar-training", tags=["
 app.include_router(avatar_identity_router, prefix="/v1/avatar-identity", tags=["avatar-identity"], dependencies=[Depends(require_client_key)])
 app.include_router(avatar_runtime_router, prefix="/v1/avatar-runtime", tags=["avatar-runtime"], dependencies=[Depends(require_client_key)])
 app.include_router(avatar_media_router, prefix="/v1/avatar-media", tags=["avatar-media"], dependencies=[Depends(require_client_key)])
+
+app.include_router(
+    avatar_media_public_router,
+    prefix="/v1/avatar-media",
+    tags=["avatar-media-public"],
+)
 app.include_router(avatar_evidence_router, prefix="/v1/avatar-evidence", tags=["avatar-evidence"], dependencies=[Depends(require_client_key)])
 app.include_router(avatar_identity_fusion_router, prefix="/v1/avatar-identity-fusion", tags=["avatar-identity-fusion"], dependencies=[Depends(require_client_key)])
 app.include_router(avatar_motion_router, prefix="/v1/avatar-motion", tags=["avatar-motion"], dependencies=[Depends(require_client_key)])
