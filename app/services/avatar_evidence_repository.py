@@ -54,6 +54,39 @@ class AvatarEvidenceRepository:
                 "DATABASE_URL is missing."
             )
 
+    def _ensure_digital_human_profile(
+        self,
+        cursor,
+        profile_id: UUID,
+    ) -> None:
+        """
+        Ensure the parent digital_human_profiles row exists before writing
+        avatar_evidence_assets.
+
+        Real-device Train Avatar uploads can legally arrive before the
+        broader avatar/profile synchronization has persisted its server-side
+        row. The evidence table has a strict FK to digital_human_profiles, so
+        the repository must make this parent record idempotently available
+        inside the same persistence path.
+        """
+        cursor.execute(
+            """
+            INSERT INTO digital_human_profiles (
+                profile_id
+            )
+            VALUES (
+                %s
+            )
+            ON CONFLICT (
+                profile_id
+            )
+            DO NOTHING;
+            """,
+            (
+                profile_id,
+            ),
+        )
+
     def upsert_uploaded_asset(
         self,
         *,
@@ -133,6 +166,12 @@ class AvatarEvidenceRepository:
             row_factory=dict_row,
         ) as connection:
             with connection.cursor() as cursor:
+
+                self._ensure_digital_human_profile(
+                    cursor,
+                    profile_id,
+                )
+
                 cursor.execute(
                     """
                     INSERT INTO avatar_evidence_assets (
