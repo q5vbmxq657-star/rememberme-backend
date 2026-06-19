@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import tempfile
@@ -953,10 +954,28 @@ class AvatarMediaStorageService:
                 )
             )
 
+        is_private_development_host = False
+
+        try:
+            host_address = ipaddress.ip_address(
+                hostname
+            )
+            is_private_development_host = (
+                not self.is_production
+                and (
+                    host_address.is_private
+                    or host_address.is_loopback
+                    or host_address.is_link_local
+                )
+            )
+        except ValueError:
+            is_private_development_host = False
+
         if (
             scheme == "http"
             and hostname
             not in local_hosts
+            and not is_private_development_host
         ):
             raise (
                 AvatarMediaStorageConfigurationError(
