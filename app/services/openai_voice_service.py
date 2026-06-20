@@ -16,18 +16,54 @@ class OpenAIVoiceService:
         self.tts_model = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
 
     async def transcribe(self, file):
-        with tempfile.NamedTemporaryFile(delete=True, suffix=".m4a") as temp:
-            content = await file.read()
+        original_filename = getattr(file, "filename", "") or "recording.m4a"
+        raw_suffix = os.path.splitext(original_filename)[1].lower().strip()
+        rememberme_stt_suffix = raw_suffix if raw_suffix in {
+            ".wav",
+            ".m4a",
+            ".mp3",
+            ".mp4",
+            ".mpeg",
+            ".mpga",
+            ".webm",
+            ".ogg",
+            ".oga",
+            ".flac"
+        } else ".m4a"
+
+        content = await file.read()
+
+        if not content:
+            return {
+                "text": "",
+                "diagnostic": {
+                    "filename": original_filename,
+                    "suffix": rememberme_stt_suffix,
+                    "bytes": 0,
+                    "reason": "empty_upload"
+                }
+            }
+
+        with tempfile.NamedTemporaryFile(delete=True, suffix=rememberme_stt_suffix) as temp:
             temp.write(content)
             temp.flush()
 
             with open(temp.name, "rb") as audio_file:
                 transcript = self.client.audio.transcriptions.create(
                     model=self.transcribe_model,
-                    file=audio_file
+                    file=audio_file,
+                    language="de"
                 )
 
-        return {"text": transcript.text}
+        return {
+            "text": transcript.text,
+            "diagnostic": {
+                "filename": original_filename,
+                "suffix": rememberme_stt_suffix,
+                "bytes": len(content),
+                "model": self.transcribe_model
+            }
+        }
 
     def synthesize(self, text: str):
         if not text.strip():
