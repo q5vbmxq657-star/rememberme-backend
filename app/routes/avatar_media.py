@@ -135,6 +135,7 @@ async def upload_avatar_media(
                 "has_face": analysis.has_face,
                 "has_frontal_face": analysis.has_frontal_face,
                 "has_clear_lighting": analysis.has_clear_lighting,
+                "emotional_presence_score": 0.0,
                 "identity_consistency_score": 0.0,
                 "quality_score": analysis.quality_score,
                 "recommended_for_avatar": analysis.recommended_for_avatar,
