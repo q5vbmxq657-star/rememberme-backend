@@ -6,6 +6,7 @@ import shutil
 import sys
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,6 +22,10 @@ REPOSITORY_PATH = Path(
 
 RAILWAY_CONFIG_PATH = Path(
     "railway.toml"
+)
+
+PREDEPLOY_PATH = Path(
+    "scripts/run_predeploy.py"
 )
 
 PROCFILE_PATH = Path(
@@ -689,7 +694,25 @@ def test_audit_authority_boundary_uses_canonical_version():
     )
 
 
-def test_railway_runs_canonical_migrations_before_service_deploy():
+def load_predeploy_module():
+    module_name = "stay_predeploy_test"
+    specification = importlib.util.spec_from_file_location(
+        module_name,
+        PREDEPLOY_PATH,
+    )
+
+    assert specification is not None
+    assert specification.loader is not None
+
+    module = importlib.util.module_from_spec(
+        specification
+    )
+    sys.modules[module_name] = module
+    specification.loader.exec_module(module)
+    return module
+
+
+def test_railway_runs_role_owned_predeploy_before_service_deploy():
     configuration = tomllib.loads(
         RAILWAY_CONFIG_PATH.read_text(
             encoding="utf-8"
@@ -700,7 +723,7 @@ def test_railway_runs_canonical_migrations_before_service_deploy():
         "preDeployCommand"
     ] == (
         "python "
-        "scripts/run_database_migrations.py"
+        "scripts/run_predeploy.py"
     )
 
     procfile = PROCFILE_PATH.read_text(
@@ -708,3 +731,47 @@ def test_railway_runs_canonical_migrations_before_service_deploy():
     )
 
     assert "run_database_migrations.py" not in procfile
+
+
+def test_web_predeploy_runs_canonical_migrations(monkeypatch):
+    module = load_predeploy_module()
+    calls: list[tuple[list[str], bool]] = []
+
+    monkeypatch.setenv("STAY_SERVICE_ROLE", "web")
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda command, check: (
+            calls.append((command, check))
+            or SimpleNamespace(returncode=0)
+        ),
+    )
+
+    assert module.main() == 0
+    assert calls == [
+        (
+            [
+                sys.executable,
+                "scripts/run_database_migrations.py",
+            ],
+            False,
+        )
+    ]
+
+
+def test_avatar_worker_predeploy_has_no_database_side_effect(monkeypatch):
+    module = load_predeploy_module()
+
+    monkeypatch.setenv(
+        "STAY_SERVICE_ROLE",
+        "avatar-worker",
+    )
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Avatar worker must not run migrations."
+        ),
+    )
+
+    assert module.main() == 0
