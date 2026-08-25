@@ -32,3 +32,13 @@ RemembermeAI_Avatar_Production_Backups/
 *.tar.gz
 *.pages
 RemembermeAI_Avatar_Production_Block_*.txt
+
+.venv_local/
+.venv312/
+backend-python39-venv/
+ios_voice_test.mp3
+test-elevenlabs.mp3
+elevenlabs_test.mp3
+george_test.mp3
+logs/
+tmp/

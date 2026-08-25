@@ -13,5 +13,5 @@ def extract_persona(request: PersonaExtractionRequest):
     except Exception as error:
         raise HTTPException(
             status_code=500,
-            detail=f"Persona extraction failed: {str(error)}"
-        )
+            detail="We could not update the avatar right now. Please try again."
+        ) from error

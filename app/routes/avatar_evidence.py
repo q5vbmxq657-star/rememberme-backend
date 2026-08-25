@@ -4,9 +4,16 @@ from uuid import UUID
 
 from fastapi import (
     APIRouter,
+    Depends,
     HTTPException,
     Query,
     status,
+)
+
+from app.security.profile_authorization import require_profile_access
+from app.security.user_auth import (
+    AuthenticatedSessionPrincipal,
+    require_authenticated_principal,
 )
 
 from app.schemas.avatar_evidence import (
@@ -41,7 +48,14 @@ def list_avatar_evidence(
     include_archived: bool = Query(
         default=False
     ),
+    principal: AuthenticatedSessionPrincipal = Depends(
+        require_authenticated_principal
+    ),
 ) -> AvatarEvidenceListResponse:
+    require_profile_access(
+        principal=principal,
+        profile_id=profile_id,
+    )
     try:
         repository = AvatarEvidenceRepository()
 
@@ -100,8 +114,7 @@ def list_avatar_evidence(
                 status.HTTP_503_SERVICE_UNAVAILABLE
             ),
             detail=(
-                "Avatar evidence persistence is "
-                f"unavailable: {error}"
+                "Avatar sources are temporarily unavailable."
             ),
         ) from error
 
@@ -112,18 +125,23 @@ def list_avatar_evidence(
 )
 def get_avatar_evidence(
     asset_id: UUID,
+    principal: AuthenticatedSessionPrincipal = Depends(
+        require_authenticated_principal
+    ),
 ) -> AvatarEvidenceAssetResponse:
     try:
         repository = AvatarEvidenceRepository()
-
-        return _response(
-            repository.require(asset_id)
+        asset = repository.require(asset_id)
+        require_profile_access(
+            principal=principal,
+            profile_id=asset.profile_id,
         )
+        return _response(asset)
 
     except AvatarEvidenceNotFoundError as error:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(error),
+            detail="This avatar source no longer exists.",
         ) from error
 
     except AvatarEvidenceRepositoryError as error:
@@ -132,8 +150,7 @@ def get_avatar_evidence(
                 status.HTTP_503_SERVICE_UNAVAILABLE
             ),
             detail=(
-                "Avatar evidence persistence is "
-                f"unavailable: {error}"
+                "Avatar sources are temporarily unavailable."
             ),
         ) from error
 
@@ -145,7 +162,14 @@ def get_avatar_evidence(
 def select_avatar_evidence(
     asset_id: UUID,
     request: AvatarEvidenceSelectionRequest,
+    principal: AuthenticatedSessionPrincipal = Depends(
+        require_authenticated_principal
+    ),
 ) -> AvatarEvidenceMutationResponse:
+    require_profile_access(
+        principal=principal,
+        profile_id=request.profile_id,
+    )
     try:
         repository = AvatarEvidenceRepository()
 
@@ -163,13 +187,13 @@ def select_avatar_evidence(
     except AvatarEvidenceNotFoundError as error:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(error),
+            detail="This avatar source no longer exists.",
         ) from error
 
     except AvatarEvidenceConflictError as error:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=str(error),
+            detail="This avatar source conflicts with the current selection.",
         ) from error
 
     except AvatarEvidenceRepositoryError as error:
@@ -178,8 +202,7 @@ def select_avatar_evidence(
                 status.HTTP_503_SERVICE_UNAVAILABLE
             ),
             detail=(
-                "Avatar evidence persistence is "
-                f"unavailable: {error}"
+                "Avatar sources are temporarily unavailable."
             ),
         ) from error
 
@@ -191,7 +214,14 @@ def select_avatar_evidence(
 def remove_avatar_evidence_selection(
     asset_id: UUID,
     profile_id: UUID = Query(...),
+    principal: AuthenticatedSessionPrincipal = Depends(
+        require_authenticated_principal
+    ),
 ) -> AvatarEvidenceMutationResponse:
+    require_profile_access(
+        principal=principal,
+        profile_id=profile_id,
+    )
     try:
         repository = AvatarEvidenceRepository()
 
@@ -208,7 +238,7 @@ def remove_avatar_evidence_selection(
     except AvatarEvidenceNotFoundError as error:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(error),
+            detail="This avatar source no longer exists.",
         ) from error
 
     except AvatarEvidenceRepositoryError as error:
@@ -217,8 +247,7 @@ def remove_avatar_evidence_selection(
                 status.HTTP_503_SERVICE_UNAVAILABLE
             ),
             detail=(
-                "Avatar evidence persistence is "
-                f"unavailable: {error}"
+                "Avatar sources are temporarily unavailable."
             ),
         ) from error
 
@@ -230,7 +259,14 @@ def remove_avatar_evidence_selection(
 def archive_avatar_evidence(
     asset_id: UUID,
     profile_id: UUID = Query(...),
+    principal: AuthenticatedSessionPrincipal = Depends(
+        require_authenticated_principal
+    ),
 ) -> AvatarEvidenceMutationResponse:
+    require_profile_access(
+        principal=principal,
+        profile_id=profile_id,
+    )
     try:
         repository = AvatarEvidenceRepository()
 
@@ -247,7 +283,7 @@ def archive_avatar_evidence(
     except AvatarEvidenceNotFoundError as error:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(error),
+            detail="This avatar source no longer exists.",
         ) from error
 
     except AvatarEvidenceRepositoryError as error:
@@ -256,7 +292,6 @@ def archive_avatar_evidence(
                 status.HTTP_503_SERVICE_UNAVAILABLE
             ),
             detail=(
-                "Avatar evidence persistence is "
-                f"unavailable: {error}"
+                "Avatar sources are temporarily unavailable."
             ),
         ) from error

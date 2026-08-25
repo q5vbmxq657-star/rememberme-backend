@@ -1,4 +1,6 @@
-from fastapi import APIRouter
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.schemas.avatar_provider import (
     AvatarProviderSubmitRequest,
@@ -6,6 +8,15 @@ from app.schemas.avatar_provider import (
     AvatarProviderStatusResponse,
 )
 from app.services.avatar_provider_service import avatar_provider_service
+from app.services.digital_human_profile_repository import (
+    DigitalHumanProfileNotFoundError,
+    DigitalHumanProfileRepositoryError,
+)
+from app.security.profile_authorization import require_profile_access
+from app.security.user_auth import (
+    AuthenticatedSessionPrincipal,
+    require_authenticated_principal,
+)
 
 router = APIRouter(prefix="/v1/avatar-provider", tags=["avatar-provider"])
 
@@ -13,7 +24,14 @@ router = APIRouter(prefix="/v1/avatar-provider", tags=["avatar-provider"])
 @router.post("/submit", response_model=AvatarProviderSubmitResponse)
 async def submit_avatar_provider_job(
     request: AvatarProviderSubmitRequest,
+    principal: AuthenticatedSessionPrincipal = Depends(
+        require_authenticated_principal
+    ),
 ) -> AvatarProviderSubmitResponse:
+    require_profile_access(
+        principal=principal,
+        profile_id=request.profile_id,
+    )
     state = await avatar_provider_service.submit(
         provider=request.provider,
         profile_id=request.profile_id,
@@ -33,7 +51,40 @@ async def submit_avatar_provider_job(
 @router.get("/status/{external_job_id}", response_model=AvatarProviderStatusResponse)
 async def get_avatar_provider_job_status(
     external_job_id: str,
+    profile_id: UUID = Query(...),
+    principal: AuthenticatedSessionPrincipal = Depends(
+        require_authenticated_principal
+    ),
 ) -> AvatarProviderStatusResponse:
+    require_profile_access(
+        principal=principal,
+        profile_id=profile_id,
+    )
+
+    try:
+        job_profile_id = (
+            avatar_provider_service
+            .require_training_job_profile_id(
+                external_job_id
+            )
+        )
+    except DigitalHumanProfileNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Provider job was not found.",
+        ) from error
+    except DigitalHumanProfileRepositoryError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Provider job persistence is unavailable.",
+        ) from error
+
+    if job_profile_id != profile_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Provider job was not found.",
+        )
+
     state = await avatar_provider_service.status(external_job_id)
 
     return AvatarProviderStatusResponse(

@@ -1,20 +1,26 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import hmac
 import ipaddress
 import json
+import io
 import os
+import socket
 import tempfile
 import time
 import uuid
+import httpx
 
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin
 
 from fastapi import UploadFile
+from starlette.datastructures import Headers
 
 from app.schemas.avatar_media import (
     AvatarMediaListResponse,
@@ -44,6 +50,7 @@ class AvatarMediaStorageService:
         signing_secret: Optional[str] = None,
         public_base_url: Optional[str] = None,
         environment: Optional[str] = None,
+        volume_mount_path: Optional[Path | str] = None,
     ) -> None:
         self.environment = (
             environment
@@ -64,6 +71,22 @@ class AvatarMediaStorageService:
         self.storage_root = Path(
             configured_storage_root
         ).expanduser().resolve()
+
+        configured_volume_mount_path = (
+            str(volume_mount_path)
+            if volume_mount_path is not None
+            else os.getenv(
+                "RAILWAY_VOLUME_MOUNT_PATH",
+                "",
+            )
+        ).strip()
+        self.volume_mount_path = (
+            Path(configured_volume_mount_path)
+            .expanduser()
+            .resolve()
+            if configured_volume_mount_path
+            else None
+        )
 
         self.storage_root_is_explicit = (
             storage_root is not None
@@ -228,12 +251,17 @@ class AvatarMediaStorageService:
             profile_dir
             / filename
         )
+        temporary_file_path = (
+            profile_dir
+            / f".{asset_id}.{uuid.uuid4().hex}.upload"
+        )
 
         size_bytes = 0
+        created_new_file = False
 
         try:
-            with file_path.open(
-                "wb"
+            with temporary_file_path.open(
+                "xb"
             ) as output:
                 while True:
                     chunk = await file.read(
@@ -259,6 +287,14 @@ class AvatarMediaStorageService:
                     output.write(
                         chunk
                     )
+
+                output.flush()
+                os.fsync(output.fileno())
+
+            created_new_file = self._commit_uploaded_file(
+                temporary_file_path=temporary_file_path,
+                final_file_path=file_path,
+            )
 
             metadata = AvatarMediaMetadata(
                 asset_id=asset_id,
@@ -289,20 +325,31 @@ class AvatarMediaStorageService:
 
         except Exception:
             self._delete_file_if_exists(
-                file_path
+                temporary_file_path
             )
 
-            metadata_file = (
-                profile_dir
-                / "metadata"
-                / f"{asset_id}.json"
-            )
+            if created_new_file:
+                self._delete_file_if_exists(
+                    file_path
+                )
 
-            self._delete_file_if_exists(
-                metadata_file
-            )
+            if created_new_file:
+                metadata_file = (
+                    profile_dir
+                    / "metadata"
+                    / f"{asset_id}.json"
+                )
+
+                self._delete_file_if_exists(
+                    metadata_file
+                )
 
             raise
+
+        finally:
+            self._delete_file_if_exists(
+                temporary_file_path
+            )
 
         expires = 900
 
@@ -326,13 +373,455 @@ class AvatarMediaStorageService:
             size_bytes=size_bytes,
             signed_url=signed_url,
             expires_in_seconds=expires,
+            was_existing=(
+                not created_new_file
+            ),
         )
+
+    async def ingest_remote_generated_preview(
+        self,
+        *,
+        profile_id: str,
+        title: str,
+        source_url: str,
+        base_url: Optional[str] = None,
+        upload_id: Optional[str] = None,
+    ) -> tuple[
+        AvatarMediaUploadResponse,
+        str,
+    ]:
+        normalized_source_url = (
+            source_url.strip()
+        )
+
+        if not normalized_source_url:
+            raise RuntimeError(
+                "Generated preview source URL "
+                "is required."
+            )
+
+        maximum_redirects = 3
+        current_url = (
+            normalized_source_url
+        )
+
+        temporary_file = (
+            tempfile.SpooledTemporaryFile(
+                max_size=(
+                    min(
+                        self.max_file_size_bytes,
+                        8 * 1024 * 1024,
+                    )
+                ),
+                mode="w+b",
+            )
+        )
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    60.0,
+                    connect=10.0,
+                ),
+                follow_redirects=False,
+            ) as client:
+                for redirect_index in range(
+                    maximum_redirects + 1
+                ):
+                    await (
+                        self
+                        ._validate_remote_media_url(
+                            current_url
+                        )
+                    )
+
+                    async with client.stream(
+                        "GET",
+                        current_url,
+                        headers={
+                            "Accept":
+                                "video/mp4,"
+                                "application/octet-stream",
+                        },
+                    ) as response:
+                        if (
+                            response.status_code
+                            in {
+                                301,
+                                302,
+                                303,
+                                307,
+                                308,
+                            }
+                        ):
+                            if (
+                                redirect_index
+                                >= maximum_redirects
+                            ):
+                                raise RuntimeError(
+                                    "Generated preview "
+                                    "download exceeded "
+                                    "the redirect limit."
+                                )
+
+                            location = (
+                                response.headers.get(
+                                    "location",
+                                    "",
+                                ).strip()
+                            )
+
+                            if not location:
+                                raise RuntimeError(
+                                    "Generated preview "
+                                    "redirect has no "
+                                    "Location header."
+                                )
+
+                            current_url = urljoin(
+                                current_url,
+                                location,
+                            )
+
+                            continue
+
+                        if (
+                            response.status_code
+                            < 200
+                            or
+                            response.status_code
+                            >= 300
+                        ):
+                            raise RuntimeError(
+                                "Generated preview "
+                                "download failed with "
+                                f"HTTP status "
+                                f"{response.status_code}."
+                            )
+
+                        content_length = (
+                            response.headers.get(
+                                "content-length"
+                            )
+                        )
+
+                        if content_length:
+                            try:
+                                declared_size = int(
+                                    content_length
+                                )
+                            except ValueError as error:
+                                raise RuntimeError(
+                                    "Generated preview "
+                                    "has an invalid "
+                                    "Content-Length."
+                                ) from error
+
+                            if (
+                                declared_size < 1
+                                or
+                                declared_size
+                                > self
+                                .max_file_size_bytes
+                            ):
+                                raise RuntimeError(
+                                    "Generated preview "
+                                    "declared size is "
+                                    "outside the allowed "
+                                    "range."
+                                )
+
+                        raw_content_type = (
+                            response.headers.get(
+                                "content-type",
+                                "",
+                            )
+                            .split(
+                                ";",
+                                1,
+                            )[0]
+                            .strip()
+                            .lower()
+                        )
+
+                        if raw_content_type not in {
+                            "video/mp4",
+                            "application/octet-stream",
+                        }:
+                            raise RuntimeError(
+                                "Generated preview "
+                                "must use video/mp4 "
+                                "content."
+                            )
+
+                        digest = hashlib.sha256()
+                        size_bytes = 0
+                        signature_prefix = bytearray()
+
+                        async for chunk in (
+                            response.aiter_bytes(
+                                chunk_size=(
+                                    1024 * 1024
+                                )
+                            )
+                        ):
+                            if not chunk:
+                                continue
+
+                            size_bytes += len(
+                                chunk
+                            )
+
+                            if (
+                                size_bytes
+                                > self
+                                .max_file_size_bytes
+                            ):
+                                raise RuntimeError(
+                                    "Generated preview "
+                                    "exceeds maximum "
+                                    "file size."
+                                )
+
+                            if (
+                                len(
+                                    signature_prefix
+                                )
+                                < 16
+                            ):
+                                remaining = (
+                                    16
+                                    - len(
+                                        signature_prefix
+                                    )
+                                )
+
+                                signature_prefix.extend(
+                                    chunk[:remaining]
+                                )
+
+                            digest.update(
+                                chunk
+                            )
+
+                            temporary_file.write(
+                                chunk
+                            )
+
+                        if size_bytes < 12:
+                            raise RuntimeError(
+                                "Generated preview "
+                                "video is empty or "
+                                "truncated."
+                            )
+
+                        self._validate_mp4_signature(
+                            bytes(
+                                signature_prefix
+                            )
+                        )
+
+                        temporary_file.seek(
+                            0
+                        )
+
+                        filename = (
+                            str(
+                                upload_id
+                                or uuid.uuid4()
+                            )
+                            + ".mp4"
+                        )
+
+                        upload_file = UploadFile(
+                            file=temporary_file,
+                            filename=filename,
+                            headers=Headers(
+                                {
+                                    "content-type":
+                                        "video/mp4",
+                                }
+                            ),
+                        )
+
+                        upload_response = (
+                            await self.upload(
+                                profile_id=profile_id,
+                                asset_type=(
+                                    "generated_preview"
+                                ),
+                                title=title,
+                                file=upload_file,
+                                base_url=base_url,
+                                upload_id=upload_id,
+                            )
+                        )
+
+                        return (
+                            upload_response,
+                            digest.hexdigest(),
+                        )
+
+                raise RuntimeError(
+                    "Generated preview download "
+                    "did not produce media."
+                )
+        finally:
+            temporary_file.close()
+
+    async def _validate_remote_media_url(
+        self,
+        source_url: str,
+    ) -> None:
+        parsed = urlsplit(
+            source_url
+        )
+
+        if parsed.scheme.lower() != "https":
+            raise RuntimeError(
+                "Generated preview source "
+                "must use HTTPS."
+            )
+
+        if (
+            not parsed.hostname
+            or
+            parsed.username is not None
+            or
+            parsed.password is not None
+        ):
+            raise RuntimeError(
+                "Generated preview source URL "
+                "is invalid."
+            )
+
+        hostname = (
+            parsed.hostname
+            .strip()
+            .rstrip(".")
+            .lower()
+        )
+
+        if not hostname:
+            raise RuntimeError(
+                "Generated preview source host "
+                "is missing."
+            )
+
+        try:
+            port = (
+                parsed.port
+                if parsed.port is not None
+                else 443
+            )
+        except ValueError as error:
+            raise RuntimeError(
+                "Generated preview source port "
+                "is invalid."
+            ) from error
+
+        try:
+            address_info = await asyncio.to_thread(
+                socket.getaddrinfo,
+                hostname,
+                port,
+                type=socket.SOCK_STREAM,
+            )
+        except socket.gaierror as error:
+            raise RuntimeError(
+                "Generated preview source host "
+                "could not be resolved."
+            ) from error
+
+        addresses = {
+            item[4][0]
+            for item in address_info
+            if item
+            and len(item) >= 5
+            and item[4]
+        }
+
+        if not addresses:
+            raise RuntimeError(
+                "Generated preview source host "
+                "resolved to no addresses."
+            )
+
+        for raw_address in addresses:
+            try:
+                address = ipaddress.ip_address(
+                    raw_address
+                )
+            except ValueError as error:
+                raise RuntimeError(
+                    "Generated preview source "
+                    "resolved to an invalid "
+                    "address."
+                ) from error
+
+            if not address.is_global:
+                raise RuntimeError(
+                    "Generated preview source "
+                    "resolved to a non-public "
+                    "network address."
+                )
+
+    @staticmethod
+    def _validate_mp4_signature(
+        prefix: bytes,
+    ) -> None:
+        if (
+            len(prefix) < 12
+            or
+            prefix[4:8] != b"ftyp"
+        ):
+            raise RuntimeError(
+                "Generated preview does not "
+                "contain a valid MP4 signature."
+            )
 
     def sign_download_url(
         self,
         asset_id: str,
         base_url: Optional[str] = None,
         expires_in_seconds: int = 900,
+    ) -> AvatarMediaSignResponse:
+        return self._sign_download_url(
+            asset_id=asset_id,
+            base_url=base_url,
+            expires_in_seconds=expires_in_seconds,
+            maximum_lifetime_seconds=3600,
+        )
+
+    def sign_provider_training_url(
+        self,
+        *,
+        asset_id: str,
+        profile_id: str,
+        base_url: Optional[str] = None,
+    ) -> AvatarMediaSignResponse:
+        """Create a provider-only lease long enough for asynchronous ingestion."""
+        metadata = self.get_metadata(asset_id)
+
+        if metadata.profile_id != profile_id:
+            raise RuntimeError(
+                "Training media does not belong to the requested profile."
+            )
+
+        return self._sign_download_url(
+            asset_id=asset_id,
+            base_url=base_url,
+            expires_in_seconds=24 * 60 * 60,
+            maximum_lifetime_seconds=24 * 60 * 60,
+        )
+
+    def _sign_download_url(
+        self,
+        *,
+        asset_id: str,
+        base_url: Optional[str],
+        expires_in_seconds: int,
+        maximum_lifetime_seconds: int,
     ) -> AvatarMediaSignResponse:
         metadata = self.get_metadata(
             asset_id
@@ -348,7 +837,7 @@ class AvatarMediaStorageService:
             60,
             min(
                 expires_in_seconds,
-                3600,
+                maximum_lifetime_seconds,
             ),
         )
 
@@ -366,7 +855,7 @@ class AvatarMediaStorageService:
 
         signed_url = (
             f"{resolved_base_url}"
-            f"/v1/avatar-media/assets/"
+            f"/v1/avatar-media/public/assets/"
             f"{asset_id}"
             f"?expires={expires_at}"
             f"&signature={signature}"
@@ -465,10 +954,8 @@ class AvatarMediaStorageService:
                 )
                 == asset_id
             ):
-                return (
-                    AvatarMediaMetadata(
-                        **data
-                    )
+                return self._metadata_from_payload(
+                    data
                 )
 
         raise RuntimeError(
@@ -504,8 +991,8 @@ class AvatarMediaStorageService:
                     encoding="utf-8",
                 ) as input_file:
                     assets.append(
-                        AvatarMediaMetadata(
-                            **json.load(
+                        self._metadata_from_payload(
+                            json.load(
                                 input_file
                             )
                         )
@@ -600,6 +1087,7 @@ class AvatarMediaStorageService:
                 public_url_configured,
                 secure_public_url,
                 signing_secret_secure,
+                self.persistent_volume_configured,
             )
         )
 
@@ -630,6 +1118,14 @@ class AvatarMediaStorageService:
                     is_directory
                 ),
                 storage_writable=writable,
+                volume_mount_path=(
+                    str(self.volume_mount_path)
+                    if self.volume_mount_path
+                    else None
+                ),
+                persistent_volume_configured=(
+                    self.persistent_volume_configured
+                ),
                 public_base_url=(
                     self.public_base_url
                 ),
@@ -655,6 +1151,164 @@ class AvatarMediaStorageService:
                 ),
             )
         )
+
+    def delete_profile_assets(
+        self,
+        *,
+        profile_id: str,
+    ) -> list[str]:
+        """
+        Delete all private media and metadata that are
+        durably bound to one profile.
+
+        The operation is idempotent. Every asset deletion
+        still passes through delete_profile_asset so the
+        same profile and storage-root guards remain active.
+        """
+
+        self._validate_profile_id(
+            profile_id
+        )
+
+        response = self.list_profile_assets(
+            profile_id
+        )
+
+        asset_ids = [
+            metadata.asset_id
+            for metadata in response.assets
+        ]
+
+        for asset_id in asset_ids:
+            deleted = self.delete_profile_asset(
+                profile_id=profile_id,
+                asset_id=asset_id,
+            )
+
+            if not deleted:
+                raise RuntimeError(
+                    "Profile-bound media deletion "
+                    f"failed for asset {asset_id}."
+                )
+
+        profile_directory = (
+            self.storage_root
+            / profile_id
+        ).expanduser().resolve()
+
+        if not self._is_within_storage_root(
+            profile_directory
+        ):
+            raise RuntimeError(
+                "Refusing to inspect profile directory "
+                "outside storage root."
+            )
+
+        if profile_directory.exists():
+            remaining_files = [
+                path
+                for path in profile_directory.rglob("*")
+                if path.is_file()
+            ]
+
+            if remaining_files:
+                raise RuntimeError(
+                    "Profile storage still contains "
+                    "untracked private files."
+                )
+
+            for directory in sorted(
+                (
+                    path
+                    for path in profile_directory.rglob("*")
+                    if path.is_dir()
+                ),
+                key=lambda value: len(
+                    value.parts
+                ),
+                reverse=True,
+            ):
+                directory.rmdir()
+
+            profile_directory.rmdir()
+
+        return asset_ids
+
+    def delete_profile_asset(
+        self,
+        *,
+        profile_id: str,
+        asset_id: str,
+    ) -> bool:
+        """
+        Delete one private media object only when its
+        persisted metadata binds it to the supplied
+        profile.
+
+        Missing metadata fails closed because profile
+        ownership cannot be established safely.
+        """
+
+        self._validate_profile_id(
+            profile_id
+        )
+
+        self._validate_asset_id(
+            asset_id
+        )
+
+        try:
+            metadata = self.get_metadata(
+                asset_id
+            )
+        except RuntimeError:
+            return False
+
+        if metadata.profile_id != profile_id:
+            return False
+
+        storage_path = Path(
+            metadata.storage_path
+        ).expanduser().resolve()
+
+        if not self._is_within_storage_root(
+            storage_path
+        ):
+            raise RuntimeError(
+                "Refusing to delete media "
+                "outside storage root."
+            )
+
+        metadata_file = (
+            self.storage_root
+            / profile_id
+            / "metadata"
+            / f"{asset_id}.json"
+        )
+
+        resolved_metadata_file = (
+            metadata_file
+            .expanduser()
+            .resolve()
+        )
+
+        if not self._is_within_storage_root(
+            resolved_metadata_file
+        ):
+            raise RuntimeError(
+                "Refusing to delete metadata "
+                "outside storage root."
+            )
+
+        self._delete_file_if_exists(
+            storage_path
+        )
+
+        self._delete_file_if_exists(
+            resolved_metadata_file
+        )
+
+        return True
 
     def delete_asset(
         self,
@@ -757,7 +1411,9 @@ class AvatarMediaStorageService:
                 encoding="utf-8",
             ) as output:
                 json.dump(
-                    metadata.model_dump(),
+                    self._metadata_payload(
+                        metadata
+                    ),
                     output,
                     indent=2,
                 )
@@ -774,6 +1430,99 @@ class AvatarMediaStorageService:
             self._delete_file_if_exists(
                 temporary_file
             )
+
+    @property
+    def persistent_volume_configured(self) -> bool:
+        if not self.is_production:
+            return True
+        if self.volume_mount_path is None:
+            return False
+        try:
+            self.storage_root.relative_to(
+                self.volume_mount_path
+            )
+        except ValueError:
+            return False
+        return True
+
+    def _commit_uploaded_file(
+        self,
+        *,
+        temporary_file_path: Path,
+        final_file_path: Path,
+    ) -> bool:
+        try:
+            os.link(
+                temporary_file_path,
+                final_file_path,
+            )
+            return True
+        except FileExistsError:
+            if (
+                self._file_sha256(temporary_file_path)
+                != self._file_sha256(final_file_path)
+            ):
+                raise RuntimeError(
+                    "upload_id is already bound to different media."
+                )
+            return False
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _metadata_from_payload(
+        self,
+        payload: dict,
+    ) -> AvatarMediaMetadata:
+        metadata = AvatarMediaMetadata(
+            **payload
+        )
+        canonical_path = (
+            self.storage_root
+            / metadata.profile_id
+            / metadata.filename
+        ).resolve()
+
+        if not self._is_within_storage_root(
+            canonical_path
+        ):
+            raise RuntimeError(
+                "Stored media metadata resolves outside the storage root."
+            )
+
+        return metadata.model_copy(
+            update={
+                "storage_path": str(
+                    canonical_path
+                )
+            }
+        )
+
+    def _metadata_payload(
+        self,
+        metadata: AvatarMediaMetadata,
+    ) -> dict:
+        canonical = self._metadata_from_payload(
+            metadata.model_dump()
+        )
+        storage_path = Path(
+            canonical.storage_path
+        ).relative_to(
+            self.storage_root
+        )
+        payload = canonical.model_dump()
+        payload["storage_path"] = (
+            storage_path.as_posix()
+        )
+        return payload
 
     def _signature(
         self,
@@ -847,6 +1596,15 @@ class AvatarMediaStorageService:
                     "Production must configure "
                     "AVATAR_MEDIA_STORAGE_ROOT."
                 )
+            )
+
+        if (
+            self.is_production
+            and not self.persistent_volume_configured
+        ):
+            raise AvatarMediaStorageConfigurationError(
+                "Production media storage must be located under "
+                "RAILWAY_VOLUME_MOUNT_PATH."
             )
 
         if (

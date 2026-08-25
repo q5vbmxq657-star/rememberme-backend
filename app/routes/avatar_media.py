@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Optional
 from uuid import UUID
 
 from fastapi import (
     APIRouter,
+    Depends,
     File,
     Form,
     HTTPException,
@@ -13,6 +15,12 @@ from fastapi import (
     status,
 )
 from fastapi.responses import FileResponse
+
+from app.security.profile_authorization import require_profile_access
+from app.security.user_auth import (
+    AuthenticatedSessionPrincipal,
+    require_authenticated_principal,
+)
 
 from app.schemas.avatar_media import (
     AvatarMediaListResponse,
@@ -25,8 +33,9 @@ from app.schemas.avatar_media import (
 from app.services.avatar_evidence_repository import (
     AvatarEvidenceRepositoryError,
 )
-from app.services.avatar_face_analysis_service import (
-    AvatarFaceAnalysisService,
+from app.services.avatar_media_analysis_service import (
+    AvatarMediaAnalysisError,
+    AvatarMediaAnalysisService,
 )
 from app.services.avatar_media_evidence_bridge_service import (
     AvatarMediaEvidenceBridgeError,
@@ -52,16 +61,25 @@ async def upload_avatar_media(
         default=None
     ),
     file: UploadFile = File(...),
+    principal: AuthenticatedSessionPrincipal = Depends(
+        require_authenticated_principal
+    ),
 ) -> AvatarMediaUploadResponse:
     storage_service = (
         AvatarMediaStorageService()
     )
 
     uploaded_asset_id: Optional[str] = None
+    uploaded_asset_was_existing = False
 
     try:
         normalized_profile_id = str(
             UUID(profile_id)
+        )
+
+        require_profile_access(
+            principal=principal,
+            profile_id=normalized_profile_id,
         )
 
         request_base_url = str(
@@ -82,6 +100,9 @@ async def upload_avatar_media(
         uploaded_asset_id = (
             response.asset_id
         )
+        uploaded_asset_was_existing = (
+            response.was_existing
+        )
 
         metadata = (
             storage_service.get_metadata(
@@ -99,46 +120,29 @@ async def upload_avatar_media(
             .lower()
         )
 
+        analysis = await asyncio.to_thread(
+            AvatarMediaAnalysisService().analyze,
+            storage_path=metadata.storage_path,
+            asset_type=normalized_asset_type,
+            content_type=response.content_type,
+        )
+
         if normalized_asset_type in {
             "image",
             "reference",
         }:
-            face_service = (
-                AvatarFaceAnalysisService()
-            )
-
-            face_analysis = (
-                face_service.analyze(
-                    content_type=(
-                        response.content_type
-                    ),
-                    size_bytes=(
-                        response.size_bytes
-                    ),
-                )
-            )
-
-            response.face_analysis = (
-                face_analysis
-            )
-
-            analysis = (
-                bridge
-                .analysis_from_face_result(
-                    face_analysis
-                )
-            )
+            response.face_analysis = {
+                "has_face": analysis.has_face,
+                "has_frontal_face": analysis.has_frontal_face,
+                "has_clear_lighting": analysis.has_clear_lighting,
+                "identity_consistency_score": 0.0,
+                "quality_score": analysis.quality_score,
+                "recommended_for_avatar": analysis.recommended_for_avatar,
+                "analysis_version": analysis.analysis_version,
+                "analysis_metadata": analysis.analysis_metadata,
+            }
         else:
             response.face_analysis = None
-
-            analysis = (
-                bridge
-                .safe_registration_analysis(
-                    asset_type=(
-                        normalized_asset_type
-                    )
-                )
-            )
 
         bridge.persist_uploaded_media(
             metadata=metadata,
@@ -148,7 +152,7 @@ async def upload_avatar_media(
         return response
 
     except ValueError as error:
-        if uploaded_asset_id:
+        if uploaded_asset_id and not uploaded_asset_was_existing:
             storage_service.delete_asset(
                 uploaded_asset_id
             )
@@ -163,7 +167,7 @@ async def upload_avatar_media(
         ) from error
 
     except AvatarMediaEvidenceBridgeError as error:
-        if uploaded_asset_id:
+        if uploaded_asset_id and not uploaded_asset_was_existing:
             storage_service.delete_asset(
                 uploaded_asset_id
             )
@@ -172,11 +176,24 @@ async def upload_avatar_media(
             status_code=(
                 status.HTTP_422_UNPROCESSABLE_ENTITY
             ),
-            detail=str(error),
+            detail="This media could not be used for the selected profile.",
+        ) from error
+
+    except AvatarMediaAnalysisError as error:
+        if uploaded_asset_id and not uploaded_asset_was_existing:
+            storage_service.delete_asset(
+                uploaded_asset_id
+            )
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=error.user_message,
         ) from error
 
     except AvatarEvidenceRepositoryError as error:
-        if uploaded_asset_id:
+        if uploaded_asset_id and not uploaded_asset_was_existing:
             storage_service.delete_asset(
                 uploaded_asset_id
             )
@@ -186,13 +203,16 @@ async def upload_avatar_media(
                 status.HTTP_503_SERVICE_UNAVAILABLE
             ),
             detail=(
-                "Avatar evidence persistence "
-                f"failed: {error}"
+                "We could not securely save this avatar source. "
+                "Please try again."
             ),
         ) from error
 
+    except HTTPException:
+        raise
+
     except Exception as error:
-        if uploaded_asset_id:
+        if uploaded_asset_id and not uploaded_asset_was_existing:
             storage_service.delete_asset(
                 uploaded_asset_id
             )
@@ -202,8 +222,8 @@ async def upload_avatar_media(
                 status.HTTP_500_INTERNAL_SERVER_ERROR
             ),
             detail=(
-                "Avatar media upload failed: "
-                f"{error}"
+                "We could not securely upload this avatar source. "
+                "Please try again."
             ),
         ) from error
 
@@ -215,6 +235,9 @@ async def upload_avatar_media(
 def sign_avatar_media(
     request: Request,
     body: AvatarMediaSignRequest,
+    principal: AuthenticatedSessionPrincipal = Depends(
+        require_authenticated_principal
+    ),
 ) -> AvatarMediaSignResponse:
     try:
         service = (
@@ -225,6 +248,14 @@ def sign_avatar_media(
             request.base_url
         ).rstrip("/")
 
+        metadata = service.get_metadata(
+            body.asset_id
+        )
+        require_profile_access(
+            principal=principal,
+            profile_id=metadata.profile_id,
+        )
+
         return service.sign_download_url(
             asset_id=body.asset_id,
             base_url=request_base_url,
@@ -234,14 +265,17 @@ def sign_avatar_media(
             ),
         )
 
+    except HTTPException:
+        raise
+
     except Exception as error:
         raise HTTPException(
             status_code=(
                 status.HTTP_500_INTERNAL_SERVER_ERROR
             ),
             detail=(
-                "Avatar media signing failed: "
-                f"{error}"
+                "We could not prepare this avatar source. "
+                "Please try again."
             ),
         ) from error
 
@@ -266,8 +300,7 @@ def get_avatar_media_storage_health(
                 status.HTTP_503_SERVICE_UNAVAILABLE
             ),
             detail=(
-                "Avatar media storage is "
-                f"unavailable: {error}"
+                "Avatar media storage is temporarily unavailable."
             ),
         ) from error
 
@@ -278,15 +311,26 @@ def get_avatar_media_storage_health(
 )
 def get_avatar_media_metadata(
     asset_id: str,
+    principal: AuthenticatedSessionPrincipal = Depends(
+        require_authenticated_principal
+    ),
 ) -> AvatarMediaMetadata:
     try:
         service = (
             AvatarMediaStorageService()
         )
 
-        return service.get_metadata(
+        metadata = service.get_metadata(
             asset_id
         )
+        require_profile_access(
+            principal=principal,
+            profile_id=metadata.profile_id,
+        )
+        return metadata
+
+    except HTTPException:
+        raise
 
     except Exception as error:
         raise HTTPException(
@@ -294,8 +338,7 @@ def get_avatar_media_metadata(
                 status.HTTP_404_NOT_FOUND
             ),
             detail=(
-                "Avatar media metadata failed: "
-                f"{error}"
+                "This avatar source no longer exists."
             ),
         ) from error
 
@@ -306,10 +349,18 @@ def get_avatar_media_metadata(
 )
 def list_avatar_media(
     profile_id: str,
+    principal: AuthenticatedSessionPrincipal = Depends(
+        require_authenticated_principal
+    ),
 ) -> AvatarMediaListResponse:
     try:
         normalized_profile_id = str(
             UUID(profile_id)
+        )
+
+        require_profile_access(
+            principal=principal,
+            profile_id=normalized_profile_id,
         )
 
         service = (
@@ -330,20 +381,22 @@ def list_avatar_media(
             ),
         ) from error
 
+    except HTTPException:
+        raise
+
     except Exception as error:
         raise HTTPException(
             status_code=(
                 status.HTTP_500_INTERNAL_SERVER_ERROR
             ),
             detail=(
-                "Avatar media listing failed: "
-                f"{error}"
+                "Avatar sources are temporarily unavailable."
             ),
         ) from error
 
 
 @public_router.get(
-    "/assets/{asset_id}"
+    "/public/assets/{asset_id}"
 )
 def download_avatar_media(
     asset_id: str,
@@ -378,7 +431,6 @@ def download_avatar_media(
                 status.HTTP_403_FORBIDDEN
             ),
             detail=(
-                "Avatar media download denied: "
-                f"{error}"
+                "This avatar source is no longer available."
             ),
         ) from error

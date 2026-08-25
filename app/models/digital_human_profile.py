@@ -36,10 +36,22 @@ class DigitalHumanProfile:
     last_error_code: Optional[str]
     last_error_message: Optional[str]
 
+    identity_verification_status: str = "not_evaluated"
+    current_identity_verification_receipt_id: Optional[UUID] = None
+    identity_verified_at: Optional[datetime] = None
+
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+    @property
+    def has_verified_identity(self) -> bool:
+        return (
+            self.identity_verification_status == "verified"
+            and self.current_identity_verification_receipt_id is not None
+            and self.identity_verified_at is not None
+        )
 
     @property
     def has_runtime_avatar(self) -> bool:

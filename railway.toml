@@ -1,0 +1,3 @@
+[deploy]
+preDeployCommand = "python scripts/run_database_migrations.py"
+startCommand = "python scripts/start_service.py"

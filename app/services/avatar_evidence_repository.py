@@ -312,6 +312,50 @@ class AvatarEvidenceRepository:
 
         return self._asset_from_row(row)
 
+    def delete_generated_preview_asset(
+        self,
+        *,
+        profile_id: UUID,
+        asset_id: UUID,
+    ) -> bool:
+        """
+        Delete a generated-preview Evidence record
+        only when it belongs to the supplied profile.
+
+        The operation is deliberately narrow and
+        idempotent. It cannot delete another evidence
+        kind or a cross-profile asset.
+        """
+
+        with psycopg.connect(
+            self.database_url,
+            connect_timeout=10,
+            row_factory=dict_row,
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    DELETE FROM avatar_evidence_assets
+                    WHERE asset_id = %s
+                      AND profile_id = %s
+                      AND asset_type =
+                          'generated_preview'
+                      AND evidence_kind =
+                          'generated_preview'
+                    RETURNING asset_id
+                    """,
+                    (
+                        asset_id,
+                        profile_id,
+                    ),
+                )
+
+                row = cursor.fetchone()
+
+            connection.commit()
+
+        return row is not None
+
     def get(
         self,
         asset_id: UUID,

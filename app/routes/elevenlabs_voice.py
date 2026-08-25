@@ -5,6 +5,7 @@ from uuid import UUID
 
 from fastapi import (
     APIRouter,
+    Depends,
     File,
     Form,
     HTTPException,
@@ -22,6 +23,11 @@ from app.services.elevenlabs_voice_service import (
     ElevenLabsVoiceService,
     ElevenLabsVoiceValidationError,
     VoiceCloneSample,
+)
+from app.security.profile_authorization import require_profile_access
+from app.security.user_auth import (
+    AuthenticatedSessionPrincipal,
+    require_authenticated_principal,
 )
 
 
@@ -56,7 +62,7 @@ async def list_voices():
     except ElevenLabsVoiceError as error:
         raise HTTPException(
             status_code=503,
-            detail=str(error),
+            detail="Voices are temporarily unavailable.",
         ) from error
 
 
@@ -71,7 +77,14 @@ async def clone_profile_voice(
     idempotency_key: str = Form(...),
     remove_background_noise: bool = Form(False),
     files: List[UploadFile] = File(...),
+    principal: AuthenticatedSessionPrincipal = Depends(
+        require_authenticated_principal
+    ),
 ):
+    require_profile_access(
+        principal=principal,
+        profile_id=profile_id,
+    )
     uploads: List[
         VoiceCloneSample
     ] = []
@@ -126,19 +139,19 @@ async def clone_profile_voice(
     except ElevenLabsVoiceValidationError as error:
         raise HTTPException(
             status_code=422,
-            detail=str(error),
+            detail="This recording cannot be used for voice training.",
         ) from error
 
     except ElevenLabsVoiceConflictError as error:
         raise HTTPException(
             status_code=409,
-            detail=str(error),
+            detail="Voice training is already in progress for this profile.",
         ) from error
 
     except ElevenLabsVoiceProviderError as error:
         raise HTTPException(
             status_code=503,
-            detail=str(error),
+            detail="Voice training is temporarily unavailable. Please try again.",
         ) from error
 
     finally:
@@ -151,7 +164,14 @@ async def clone_profile_voice(
 )
 async def profile_voice_status(
     profile_id: UUID,
+    principal: AuthenticatedSessionPrincipal = Depends(
+        require_authenticated_principal
+    ),
 ):
+    require_profile_access(
+        principal=principal,
+        profile_id=profile_id,
+    )
     service = ElevenLabsVoiceService()
 
     return service.status_for_profile(
@@ -162,11 +182,18 @@ async def profile_voice_status(
 @router.post("/tts")
 async def synthesize_profile_voice(
     request: ProfileVoiceTTSRequest,
+    principal: AuthenticatedSessionPrincipal = Depends(
+        require_authenticated_principal
+    ),
 ):
+    require_profile_access(
+        principal=principal,
+        profile_id=request.profile_id,
+    )
     try:
         service = ElevenLabsVoiceService()
 
-        audio_stream = (
+        synthesis = (
             await service
             .synthesize_for_profile(
                 profile_id=(
@@ -177,7 +204,7 @@ async def synthesize_profile_voice(
         )
 
         return StreamingResponse(
-            audio_stream,
+            synthesis.audio_stream,
             media_type="audio/mpeg",
             headers={
                 "Cache-Control": "no-store",
@@ -185,19 +212,22 @@ async def synthesize_profile_voice(
                     "inline; "
                     "filename=rememberme-voice.mp3"
                 ),
+                "X-STAY-Voice-Mode": (
+                    synthesis.voice_mode
+                ),
             },
         )
 
     except ElevenLabsVoiceValidationError as error:
         raise HTTPException(
             status_code=422,
-            detail=str(error),
+            detail="This voice request is not valid for the selected profile.",
         ) from error
 
     except ElevenLabsVoiceProviderError as error:
         raise HTTPException(
             status_code=503,
-            detail=str(error),
+            detail="Voice playback is temporarily unavailable. Please try again.",
         ) from error
 
 
@@ -207,7 +237,14 @@ async def synthesize_profile_voice(
 )
 async def delete_profile_voice(
     profile_id: UUID,
+    principal: AuthenticatedSessionPrincipal = Depends(
+        require_authenticated_principal
+    ),
 ) -> Response:
+    require_profile_access(
+        principal=principal,
+        profile_id=profile_id,
+    )
     try:
         service = ElevenLabsVoiceService()
 
@@ -222,5 +259,5 @@ async def delete_profile_voice(
     except ElevenLabsVoiceError as error:
         raise HTTPException(
             status_code=503,
-            detail=str(error),
+            detail="We could not remove this voice right now. Please try again.",
         ) from error

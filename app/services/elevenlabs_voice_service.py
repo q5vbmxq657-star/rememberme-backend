@@ -33,7 +33,9 @@ class ElevenLabsVoiceValidationError(
 class ElevenLabsVoiceProviderError(
     ElevenLabsVoiceError
 ):
-    pass
+    def __init__(self, message: str, *, status_code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class ElevenLabsVoiceConflictError(
@@ -56,6 +58,12 @@ class VoiceCloneResult:
     voice_id: str
     status: str
     requires_verification: bool
+
+
+@dataclass(frozen=True)
+class VoiceSynthesisResult:
+    audio_stream: BytesIO
+    voice_mode: str
 
 
 class ElevenLabsVoiceService:
@@ -259,6 +267,38 @@ class ElevenLabsVoiceService:
 
         resolved_job_id = job["job_id"]
 
+        if not bool(job.get("was_created", False)):
+            if (
+                UUID(str(job["profile_id"])) != profile_id
+                or job["training_type"] != "voice"
+                or job["provider"] != "elevenlabs"
+            ):
+                raise ElevenLabsVoiceConflictError(
+                    "The idempotency key belongs to another training contract."
+                )
+
+            existing_voice_id = str(
+                job.get("provider_job_id") or ""
+            ).strip()
+            existing_status = str(
+                job.get("status") or "created"
+            ).strip()
+
+            if existing_voice_id:
+                return VoiceCloneResult(
+                    job_id=resolved_job_id,
+                    profile_id=profile_id,
+                    voice_id=existing_voice_id,
+                    status=existing_status,
+                    requires_verification=(
+                        existing_status == "verification_required"
+                    ),
+                )
+
+            raise ElevenLabsVoiceConflictError(
+                "The same voice training request is already being submitted."
+            )
+
         self.repository.set_voice_training(
             profile_id,
             provider="elevenlabs",
@@ -333,7 +373,7 @@ class ElevenLabsVoiceService:
             )
 
             profile_status = (
-                "training"
+                "verification_required"
                 if requires_verification
                 else "ready"
             )
@@ -370,7 +410,7 @@ class ElevenLabsVoiceService:
             )
 
         except Exception as error:
-            error_message = str(error)[:1000]
+            error_message = "Voice training failed before completion."
 
             try:
                 self.repository.update_training_job(
@@ -406,18 +446,36 @@ class ElevenLabsVoiceService:
         *,
         profile_id: UUID,
         text: str,
-    ) -> BytesIO:
+    ) -> VoiceSynthesisResult:
         profile = self.repository.get(
             profile_id
         )
 
-        voice_id = self._resolve_voice_id(
-            profile
-        )
+        personalized_voice_id = self._personalized_voice_id(profile)
 
-        return await self.synthesize(
-            text=text,
-            voice_id=voice_id,
+        if personalized_voice_id:
+            try:
+                return VoiceSynthesisResult(
+                    audio_stream=await self.synthesize(
+                        text=text,
+                        voice_id=personalized_voice_id,
+                    ),
+                    voice_mode="personalized",
+                )
+            except ElevenLabsVoiceProviderError as error:
+                if error.status_code in {400, 404, 410}:
+                    self._mark_personalized_voice_unavailable(
+                        profile_id=profile_id,
+                        profile=profile,
+                        error=error,
+                    )
+
+        return VoiceSynthesisResult(
+            audio_stream=await self.synthesize(
+                text=text,
+                voice_id=self.default_voice_id,
+            ),
+            voice_mode="warm_default",
         )
 
     async def synthesize(
@@ -562,12 +620,12 @@ class ElevenLabsVoiceService:
             ),
         }
 
-    def _resolve_voice_id(
+    def _personalized_voice_id(
         self,
         profile: Optional[
             DigitalHumanProfile
         ],
-    ) -> str:
+    ) -> Optional[str]:
         if (
             profile is not None
             and profile.has_personalized_voice
@@ -577,7 +635,31 @@ class ElevenLabsVoiceService:
         ):
             return profile.voice_id
 
-        return self.default_voice_id
+        return None
+
+    def _mark_personalized_voice_unavailable(
+        self,
+        *,
+        profile_id: UUID,
+        profile: Optional[DigitalHumanProfile],
+        error: ElevenLabsVoiceProviderError,
+    ) -> None:
+        if profile is None:
+            return
+
+        try:
+            self.repository.set_voice_training(
+                profile_id,
+                provider="elevenlabs",
+                status="failed",
+                provider_job_id=profile.voice_training_job_id,
+                error_code=type(error).__name__,
+                error_message="The personalized voice is unavailable at the provider.",
+            )
+        except DigitalHumanProfileRepositoryError:
+            # Generic synthesis remains truthful even when status persistence
+            # is temporarily unavailable.
+            pass
 
     def _validate_samples(
         self,
@@ -688,12 +770,8 @@ class ElevenLabsVoiceService:
         if response.status_code < 400:
             return
 
-        detail = (
-            response.text
-            or "Unknown provider error."
-        )[:1000]
-
         raise ElevenLabsVoiceProviderError(
             f"{operation} failed "
-            f"({response.status_code}): {detail}"
+            f"with provider status {response.status_code}.",
+            status_code=response.status_code,
         )

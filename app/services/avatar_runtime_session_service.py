@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import threading
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from datetime import datetime, timezone
 from time import perf_counter
 from typing import Dict, Optional
 from uuid import uuid4
@@ -85,7 +83,7 @@ class StoredRuntimeSession:
 
 class AvatarRuntimeSessionService:
     """
-    Provider-neutral avatar runtime gateway.
+    Canonical Tavus/LiveKit avatar runtime gateway.
 
     A LiveKit descriptor is returned only after the configured Tavus worker,
     Tavus participant and Tavus video track have been verified.
@@ -100,13 +98,6 @@ class AvatarRuntimeSessionService:
         os.getenv(
             "AVATAR_RUNTIME_MAX_AUDIO_BYTES",
             str(25 * 1024 * 1024),
-        )
-    )
-
-    session_ttl_seconds = int(
-        os.getenv(
-            "AVATAR_RUNTIME_SESSION_TTL_SECONDS",
-            str(12 * 60 * 60),
         )
     )
 
@@ -136,26 +127,6 @@ class AvatarRuntimeSessionService:
             return cls._instance
 
     def __init__(self) -> None:
-        storage_root = Path(
-            os.getenv(
-                "AVATAR_RUNTIME_STORAGE_ROOT",
-                str(
-                    Path.home()
-                    / ".remembermeai"
-                    / "avatar-runtime"
-                ),
-            )
-        ).expanduser()
-
-        storage_root.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        self.storage_root = storage_root
-        self.session_store_path = (
-            storage_root / "sessions.json"
-        )
         self._lock = threading.RLock()
         self._sessions: Dict[
             str,
@@ -179,9 +150,6 @@ class AvatarRuntimeSessionService:
             DigitalHumanProfileRepository()
         )
 
-        self._load_sessions()
-        self._remove_expired_sessions()
-
     async def create_session(
         self,
         request: AvatarRuntimeSessionCreateRequest,
@@ -200,28 +168,9 @@ class AvatarRuntimeSessionService:
                 "Digital human profile storage is unavailable."
             ) from error
 
-        allow_tavus_fallback = (
-            request.fallback_enabled
-            and request.allow_tavus_fallback
-        )
-        allow_local_fallback = (
-            request.fallback_enabled
-            and request.allow_local_fallback
-        )
-
         try:
-            (
-                provider,
-                fallback_providers,
-                diagnostics,
-            ) = self.provider_registry.select_provider(
-                request.preferred_providers,
-                allow_tavus_fallback=(
-                    allow_tavus_fallback
-                ),
-                allow_local_fallback=(
-                    allow_local_fallback
-                ),
+            _, diagnostics = (
+                self.provider_registry.require_provider()
             )
         except RuntimeError as error:
             raise AvatarRuntimeProviderUnavailableError(
@@ -230,131 +179,56 @@ class AvatarRuntimeSessionService:
 
         session_id = f"avatar_{uuid4().hex}"
 
-        if provider == AvatarRuntimeProvider.LOCAL:
-            session = self._make_local_session(
-                request=request,
-                session_id=session_id,
-                fallback_providers=(
-                    fallback_providers
-                ),
-                diagnostics=diagnostics,
-                now=now,
-            )
-        elif provider == AvatarRuntimeProvider.TAVUS:
-            if (
-                digital_human_profile is None
-                or not digital_human_profile.has_runtime_avatar
-                or digital_human_profile.avatar_provider != "tavus"
-                or not digital_human_profile.avatar_replica_id
-                or not digital_human_profile.avatar_persona_id
-            ):
-                if allow_local_fallback:
-                    session = self._make_local_session(
-                        request=request,
-                        session_id=session_id,
-                        fallback_providers=[
-                            candidate
-                            for candidate in fallback_providers
-                            if candidate != AvatarRuntimeProvider.LOCAL
-                        ],
-                        diagnostics={
-                            **diagnostics,
-                            "profile_resolution": (
-                                "No production-ready Tavus identity "
-                                "is stored for this profile."
-                            ),
-                        },
-                        now=now,
-                    )
-                else:
-                    raise AvatarRuntimeProviderUnavailableError(
-                        "This profile has no production-ready avatar."
-                    )
-            else:
-                try:
-                    remote = (
-                        await self.tavus_adapter
-                        .start_session(
-                            session_id=session_id,
-                            profile_id=request.profile_id,
-                            display_name=(
-                                request.display_name
-                            ),
-                            replica_id=(
-                                digital_human_profile
-                                .avatar_replica_id
-                            ),
-                            persona_id=(
-                                digital_human_profile
-                                .avatar_persona_id
-                            ),
-                        )
-                    )
-
-                    session = AvatarRuntimeSessionResponse(
-                            session_id=session_id,
-                            profile_id=request.profile_id,
-                            provider=(
-                                AvatarRuntimeProvider.TAVUS
-                            ),
-                        transport=(
-                            AvatarRuntimeTransport.LIVEKIT
-                        ),
-                        provider_avatar_id=(
-                            remote.provider_avatar_id
-                        ),
-                        livekit=remote.descriptor,
-                        preview_video_url=None,
-                        created_at=now,
-                        expires_at=remote.descriptor.expires_at,
-                        fallback_providers=(
-                            fallback_providers
-                        ),
-                        metadata={
-                            **remote.metadata,
-                            "provider_resolution":
-                                "verified_remote_provider",
-                        },
-                    )
-
-                except TavusRuntimeError as error:
-                    if allow_local_fallback:
-                        clean_fallbacks = [
-                            candidate
-                            for candidate
-                            in fallback_providers
-                            if candidate
-                            != AvatarRuntimeProvider.LOCAL
-                        ]
-
-                        session = self._make_local_session(
-                            request=request,
-                            session_id=session_id,
-                            fallback_providers=(
-                                clean_fallbacks
-                            ),
-                            diagnostics={
-                                **diagnostics,
-                                "remote_activation": (
-                                    "Tavus activation failed closed. "
-                                    f"{type(error).__name__}: {error}"
-                                ),
-                            },
-                            now=now,
-                        )
-                    else:
-                        raise (
-                            AvatarRuntimeProviderUnavailableError(
-                                "Tavus activation failed and "
-                                "local fallback is disabled: "
-                                f"{error}"
-                            )
-                        ) from error
-        else:
+        if (
+            digital_human_profile is None
+            or not digital_human_profile.has_runtime_avatar
+            or digital_human_profile.avatar_provider != "tavus"
+            or not digital_human_profile.avatar_replica_id
+        ):
             raise AvatarRuntimeProviderUnavailableError(
-                f"Provider '{provider.value}' has no "
-                "active production adapter."
+                "This profile has no production-ready Tavus face."
             )
+
+        try:
+            remote = (
+                await self.tavus_adapter
+                .start_session(
+                    session_id=session_id,
+                    profile_id=request.profile_id,
+                    display_name=request.display_name,
+                    face_id=(
+                        digital_human_profile
+                        .avatar_replica_id
+                    ),
+                    pal_id=(
+                        digital_human_profile
+                        .avatar_persona_id
+                    ),
+                )
+            )
+
+            session = AvatarRuntimeSessionResponse(
+                session_id=session_id,
+                profile_id=request.profile_id,
+                provider=AvatarRuntimeProvider.TAVUS,
+                transport=AvatarRuntimeTransport.LIVEKIT,
+                provider_avatar_id=remote.provider_avatar_id,
+                livekit=remote.descriptor,
+                created_at=now,
+                expires_at=remote.descriptor.expires_at,
+                metadata={
+                    **diagnostics,
+                    **remote.metadata,
+                    "provider_resolution":
+                        "verified_remote_provider",
+                },
+            )
+
+        except TavusRuntimeError as error:
+            raise AvatarRuntimeProviderUnavailableError(
+                "Tavus activation failed: "
+                f"{error}"
+            ) from error
 
         with self._lock:
             self._sessions[session_id] = (
@@ -362,31 +236,25 @@ class AvatarRuntimeSessionService:
                     session=session
                 )
             )
-            self._persist_sessions()
 
-        if (
-            session.provider
-            == AvatarRuntimeProvider.TAVUS
-        ):
-            try:
-                self.profile_repository.mark_runtime_verified(
-                    request.profile_id
-                )
-            except DigitalHumanProfileRepositoryError:
-                await self.tavus_adapter.close_session(
-                    session.session_id
+        try:
+            self.profile_repository.mark_runtime_verified(
+                request.profile_id
+            )
+        except DigitalHumanProfileRepositoryError:
+            await self.tavus_adapter.close_session(
+                session.session_id
+            )
+
+            with self._lock:
+                self._sessions.pop(
+                    session.session_id,
+                    None,
                 )
 
-                with self._lock:
-                    self._sessions.pop(
-                        session.session_id,
-                        None,
-                    )
-                    self._persist_sessions()
-
-                raise AvatarRuntimeProviderUnavailableError(
-                    "The avatar session could not be verified persistently."
-                )
+            raise AvatarRuntimeProviderUnavailableError(
+                "The avatar session could not be verified persistently."
+            )
 
         return session
 
@@ -418,31 +286,6 @@ class AvatarRuntimeSessionService:
         audio_data = await self._read_and_validate_audio(
             audio
         )
-
-        if session.provider == AvatarRuntimeProvider.LOCAL:
-            latency_ms = int(
-                (
-                    perf_counter()
-                    - started_at
-                )
-                * 1000
-            )
-
-            return AvatarRuntimeSpeechResponse(
-                request_id=metadata.request_id,
-                session_id=session.session_id,
-                resolved_provider=(
-                    AvatarRuntimeProvider.LOCAL
-                ),
-                transport=(
-                    AvatarRuntimeTransport.LOCAL_AVATAR
-                ),
-                livekit=None,
-                video_url=None,
-                fallback_used=True,
-                latency_ms=latency_ms,
-                created_at=self._utc_now(),
-            )
 
         if session.provider == AvatarRuntimeProvider.TAVUS:
             try:
@@ -477,8 +320,6 @@ class AvatarRuntimeSessionService:
                     AvatarRuntimeTransport.LIVEKIT
                 ),
                 livekit=session.livekit,
-                video_url=None,
-                fallback_used=False,
                 latency_ms=latency_ms,
                 created_at=self._utc_now(),
             )
@@ -522,7 +363,6 @@ class AvatarRuntimeSessionService:
                     interrupted_at=interrupted_at,
                 )
             )
-            self._persist_sessions()
 
         return AvatarRuntimeOperationResponse(
             session_id=session_id,
@@ -564,7 +404,6 @@ class AvatarRuntimeSessionService:
                 clean_session_id,
                 None,
             )
-            self._persist_sessions()
 
         return AvatarRuntimeOperationResponse(
             session_id=clean_session_id,
@@ -603,59 +442,6 @@ class AvatarRuntimeSessionService:
             for provider_name, readiness
             in snapshot.items()
         }
-
-    def _make_local_session(
-        self,
-        *,
-        request: AvatarRuntimeSessionCreateRequest,
-        session_id: str,
-        fallback_providers: list[
-            AvatarRuntimeProvider
-        ],
-        diagnostics: Dict[str, str],
-        now: datetime,
-    ) -> AvatarRuntimeSessionResponse:
-        clean_fallbacks = [
-            provider
-            for provider in fallback_providers
-            if provider != AvatarRuntimeProvider.LOCAL
-        ]
-
-        metadata = {
-            "runtime_version": "3",
-            "session_mode": "provider_neutral",
-            "audio_ownership":
-                "ios_voice_dna_pipeline",
-            "provider_resolution":
-                "local_fallback",
-            "remote_session_verified": "false",
-        }
-
-        for provider_name, message in diagnostics.items():
-            metadata[
-                f"provider_{provider_name}"
-            ] = message[:500]
-
-        return AvatarRuntimeSessionResponse(
-            session_id=session_id,
-            profile_id=request.profile_id,
-            provider=AvatarRuntimeProvider.LOCAL,
-            transport=(
-                AvatarRuntimeTransport.LOCAL_AVATAR
-            ),
-            provider_avatar_id=None,
-            livekit=None,
-            preview_video_url=None,
-            created_at=now,
-            expires_at=(
-                now
-                + timedelta(
-                    seconds=self.session_ttl_seconds
-                )
-            ),
-            fallback_providers=clean_fallbacks,
-            metadata=metadata,
-        )
 
     async def _read_and_validate_audio(
         self,
@@ -762,8 +548,6 @@ class AvatarRuntimeSessionService:
                     None,
                 )
 
-            self._persist_sessions()
-
         for session in expired_sessions:
             if (
                 session.provider
@@ -778,120 +562,6 @@ class AvatarRuntimeSessionService:
                     )
                 except RuntimeError:
                     pass
-
-    def _load_sessions(self) -> None:
-        if not self.session_store_path.exists():
-            self._sessions = {}
-            return
-
-        try:
-            raw_data = json.loads(
-                self.session_store_path.read_text(
-                    encoding="utf-8"
-                )
-            )
-
-            loaded: Dict[
-                str,
-                StoredRuntimeSession,
-            ] = {}
-
-            for item in raw_data.get(
-                "sessions",
-                [],
-            ):
-                session = (
-                    AvatarRuntimeSessionResponse
-                    .model_validate(
-                        item["session"]
-                    )
-                )
-
-                if (
-                    session.provider
-                    != AvatarRuntimeProvider.LOCAL
-                ):
-                    continue
-
-                interrupted_at_raw = item.get(
-                    "interrupted_at"
-                )
-                interrupted_at = (
-                    datetime.fromisoformat(
-                        interrupted_at_raw
-                    )
-                    if interrupted_at_raw
-                    else None
-                )
-
-                loaded[session.session_id] = (
-                    StoredRuntimeSession(
-                        session=session,
-                        interrupted_at=interrupted_at,
-                    )
-                )
-
-            self._sessions = loaded
-
-        except Exception:
-            corrupted_path = (
-                self.session_store_path
-                .with_suffix(
-                    ".corrupted-"
-                    f"{uuid4().hex}.json"
-                )
-            )
-
-            try:
-                self.session_store_path.replace(
-                    corrupted_path
-                )
-            except OSError:
-                pass
-
-            self._sessions = {}
-
-    def _persist_sessions(self) -> None:
-        payload = {
-            "version": 3,
-            "sessions": [
-                {
-                    "session": (
-                        stored.session
-                        .model_dump(
-                            mode="json"
-                        )
-                    ),
-                    "interrupted_at": (
-                        stored.interrupted_at
-                        .isoformat()
-                        if stored.interrupted_at
-                        else None
-                    ),
-                }
-                for stored
-                in self._sessions.values()
-            ],
-        }
-
-        temporary_path = (
-            self.session_store_path
-            .with_suffix(".tmp")
-        )
-
-        temporary_path.write_text(
-            json.dumps(
-                payload,
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            ),
-            encoding="utf-8",
-        )
-
-        temporary_path.replace(
-            self.session_store_path
-        )
 
     @staticmethod
     def _utc_now() -> datetime:

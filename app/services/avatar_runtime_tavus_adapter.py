@@ -13,9 +13,11 @@ from uuid import UUID
 import av
 from livekit import api, rtc
 from livekit.agents import utils as agent_utils
-from livekit.agents.voice.avatar import DataStreamAudioOutput
 
 from app.schemas.avatar_runtime import AvatarLiveKitSessionDescriptor
+from app.services.avatar_runtime_audio_output import (
+    RememberMeDataStreamAudioOutput,
+)
 from app.services.avatar_runtime_livekit_token_service import (
     AvatarRuntimeLiveKitTokenService,
 )
@@ -55,7 +57,7 @@ class TavusRuntimeHandle:
     avatar_identity: str
     dispatch_id: Optional[str]
     room: rtc.Room
-    audio_output: DataStreamAudioOutput
+    audio_output: RememberMeDataStreamAudioOutput
     audio_lock: asyncio.Lock = field(
         default_factory=asyncio.Lock
     )
@@ -224,22 +226,21 @@ class AvatarRuntimeTavusAdapter:
         session_id: str,
         profile_id: UUID,
         display_name: str,
-        replica_id: str,
-        persona_id: str,
+        face_id: str,
+        pal_id: Optional[str] = None,
     ) -> TavusRemoteSession:
         self._require_configuration()
 
-        clean_replica_id = replica_id.strip()
-        clean_persona_id = persona_id.strip()
+        clean_face_id = face_id.strip()
+        clean_pal_id = (
+            pal_id.strip()
+            if pal_id
+            else None
+        )
 
-        if not clean_replica_id:
+        if not clean_face_id:
             raise TavusRuntimeConfigurationError(
-                "The digital human profile has no Tavus replica identifier."
-            )
-
-        if not clean_persona_id:
-            raise TavusRuntimeConfigurationError(
-                "The digital human profile has no Tavus persona identifier."
+                "The digital human profile has no Tavus face identifier."
             )
 
         room_name = (
@@ -294,8 +295,8 @@ class AvatarRuntimeTavusAdapter:
                 profile_id=profile_id,
                 room_name=room_name,
                 avatar_identity=avatar_identity,
-                replica_id=clean_replica_id,
-                persona_id=clean_persona_id,
+                face_id=clean_face_id,
+                pal_id=clean_pal_id,
             )
 
             try:
@@ -331,7 +332,7 @@ class AvatarRuntimeTavusAdapter:
                     f"Dispatch id: {dispatch_id or 'none'}."
                 ) from error
 
-            audio_output = DataStreamAudioOutput(
+            audio_output = RememberMeDataStreamAudioOutput(
                 room=room,
                 destination_identity=avatar_identity,
                 sample_rate=self.output_sample_rate,
@@ -373,7 +374,7 @@ class AvatarRuntimeTavusAdapter:
 
             return TavusRemoteSession(
                 session_id=session_id,
-                provider_avatar_id=clean_replica_id,
+                provider_avatar_id=clean_face_id,
                 descriptor=descriptor,
                 room_name=room_name,
                 avatar_identity=avatar_identity,
@@ -581,8 +582,8 @@ class AvatarRuntimeTavusAdapter:
         profile_id: UUID,
         room_name: str,
         avatar_identity: str,
-        replica_id: str,
-        persona_id: str,
+        face_id: str,
+        pal_id: Optional[str],
     ) -> Optional[str]:
         client = self._make_api_client()
 
@@ -593,8 +594,12 @@ class AvatarRuntimeTavusAdapter:
                 "session_id": session_id,
                 "profile_id": str(profile_id),
                 "avatar_identity": avatar_identity,
-                "replica_id": replica_id,
-                "persona_id": persona_id,
+                "face_id": face_id,
+                **(
+                    {"pal_id": pal_id}
+                    if pal_id
+                    else {}
+                ),
             },
             separators=(",", ":"),
             sort_keys=True,
@@ -657,7 +662,7 @@ class AvatarRuntimeTavusAdapter:
 
     async def _await_output_interrupt(
         self,
-        audio_output: DataStreamAudioOutput,
+        audio_output: RememberMeDataStreamAudioOutput,
     ) -> None:
         method = getattr(
             audio_output,
@@ -688,7 +693,7 @@ class AvatarRuntimeTavusAdapter:
 
     async def _prepare_output_for_disconnect(
         self,
-        audio_output: DataStreamAudioOutput,
+        audio_output: RememberMeDataStreamAudioOutput,
     ) -> None:
         method = getattr(
             audio_output,

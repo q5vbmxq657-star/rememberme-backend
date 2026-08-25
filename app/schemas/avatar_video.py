@@ -1,7 +1,9 @@
 from pydantic import BaseModel
 from typing import Optional
+from uuid import UUID
 
 class TavusVideoCreateRequest(BaseModel):
+    profile_id: UUID
     replica_id: str
     script: str
 

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from app.services.avatar_runtime_livekit_safety_patch import (
-    install_avatar_runtime_livekit_safety_patch,
+from app.services.avatar_runtime_audio_output import (
+    install_tavus_worker_audio_output,
 )
 
-install_avatar_runtime_livekit_safety_patch()
+install_tavus_worker_audio_output()
 
 
 import json
@@ -94,11 +94,11 @@ async def entrypoint(
     profile_id = str(
         metadata.get("profile_id") or ""
     ).strip()
-    replica_id = str(
-        metadata.get("replica_id") or ""
+    face_id = str(
+        metadata.get("face_id") or ""
     ).strip()
-    persona_id = str(
-        metadata.get("persona_id") or ""
+    pal_id = str(
+        metadata.get("pal_id") or ""
     ).strip()
 
     if not session_id:
@@ -116,14 +116,9 @@ async def entrypoint(
             "Avatar worker metadata is missing profile_id."
         )
 
-    if not replica_id:
+    if not face_id:
         raise RuntimeError(
-            "Avatar worker metadata is missing replica_id."
-        )
-
-    if not persona_id:
-        raise RuntimeError(
-            "Avatar worker metadata is missing persona_id."
+            "Avatar worker metadata is missing face_id."
         )
 
     tavus_api_key = _required_environment_value(
@@ -144,8 +139,8 @@ async def entrypoint(
     agent_session = AgentSession()
 
     avatar_session = tavus.AvatarSession(
-        replica_id=replica_id,
-        persona_id=persona_id,
+        face_id=face_id,
+        pal_id=pal_id or None,
         api_key=tavus_api_key,
         avatar_participant_identity=(
             avatar_identity
@@ -220,7 +215,8 @@ async def entrypoint(
             "profile_id": profile_id,
             "room_name": ctx.room.name,
             "avatar_identity": avatar_identity,
-            "replica_id": replica_id,
+            "face_id": face_id,
+            "pal_id": pal_id or None,
         },
     )
 

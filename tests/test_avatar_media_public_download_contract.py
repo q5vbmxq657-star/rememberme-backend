@@ -8,7 +8,7 @@ from app.routes.avatar_media import (
 
 
 DOWNLOAD_PATH = (
-    "/assets/{asset_id}"
+    "/public/assets/{asset_id}"
 )
 
 
@@ -53,7 +53,7 @@ def test_public_download_is_in_openapi():
 
     path = (
         "/v1/avatar-media/"
-        "assets/{asset_id}"
+        "public/assets/{asset_id}"
     )
 
     assert path in schema["paths"]

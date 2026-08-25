@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from app.services.avatar_media_storage_service import (
     AvatarMediaStorageService,
 )
@@ -71,3 +73,53 @@ def test_different_profiles_do_not_share_id(
     )
 
     assert first != second
+
+
+def test_atomic_commit_reuses_identical_media(
+    tmp_path: Path,
+    monkeypatch,
+):
+    storage = service(tmp_path, monkeypatch)
+    final = tmp_path / "final.bin"
+    first = tmp_path / "first.upload"
+    second = tmp_path / "second.upload"
+    first.write_bytes(b"same-media")
+    second.write_bytes(b"same-media")
+
+    assert storage._commit_uploaded_file(
+        temporary_file_path=first,
+        final_file_path=final,
+    ) is True
+    assert storage._commit_uploaded_file(
+        temporary_file_path=second,
+        final_file_path=final,
+    ) is False
+    assert final.read_bytes() == b"same-media"
+
+
+def test_atomic_commit_rejects_upload_id_collision(
+    tmp_path: Path,
+    monkeypatch,
+):
+    storage = service(tmp_path, monkeypatch)
+    final = tmp_path / "final.bin"
+    first = tmp_path / "first.upload"
+    collision = tmp_path / "collision.upload"
+    first.write_bytes(b"first-media")
+    collision.write_bytes(b"different-media")
+
+    assert storage._commit_uploaded_file(
+        temporary_file_path=first,
+        final_file_path=final,
+    ) is True
+
+    with pytest.raises(
+        RuntimeError,
+        match="different media",
+    ):
+        storage._commit_uploaded_file(
+            temporary_file_path=collision,
+            final_file_path=final,
+        )
+
+    assert final.read_bytes() == b"first-media"

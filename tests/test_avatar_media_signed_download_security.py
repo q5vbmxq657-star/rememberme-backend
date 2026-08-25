@@ -12,7 +12,7 @@ def test_public_router_contains_only_signed_download():
     }
 
     assert paths == {
-        "/assets/{asset_id}"
+        "/public/assets/{asset_id}"
     }
 
 
@@ -21,7 +21,7 @@ def test_signed_download_requires_expiry_and_signature():
         route
         for route in public_router.routes
         if route.path
-        == "/assets/{asset_id}"
+        == "/public/assets/{asset_id}"
     ]
 
     assert len(download_routes) == 1

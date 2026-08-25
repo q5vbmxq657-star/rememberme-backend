@@ -1,6 +1,5 @@
 import os
 import tempfile
-from io import BytesIO
 from openai import OpenAI
 
 
@@ -13,7 +12,6 @@ class OpenAIVoiceService:
 
         self.client = OpenAI(api_key=api_key)
         self.transcribe_model = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
-        self.tts_model = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
 
     async def transcribe(self, file):
         original_filename = getattr(file, "filename", "") or "recording.m4a"
@@ -64,15 +62,3 @@ class OpenAIVoiceService:
                 "model": self.transcribe_model
             }
         }
-
-    def synthesize(self, text: str):
-        if not text.strip():
-            raise RuntimeError("Text is empty.")
-
-        response = self.client.audio.speech.create(
-            model=self.tts_model,
-            voice="coral",
-            input=text
-        )
-
-        return BytesIO(response.content)

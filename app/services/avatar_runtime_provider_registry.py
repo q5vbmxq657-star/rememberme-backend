@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from app.schemas.avatar_runtime import AvatarRuntimeProvider
 
@@ -20,24 +20,10 @@ def _clean_environment_value(
     key: str,
 ) -> Optional[str]:
     value = os.getenv(key)
-
     if value is None:
         return None
-
     cleaned = value.strip()
     return cleaned or None
-
-
-def _environment_flag(
-    key: str,
-    default: bool = False,
-) -> bool:
-    raw_value = _clean_environment_value(key)
-
-    if raw_value is None:
-        return default
-
-    return raw_value.lower() in _TRUE_VALUES
 
 
 @dataclass(frozen=True)
@@ -59,14 +45,9 @@ class AvatarProviderReadiness:
 
 
 class AvatarRuntimeProviderRegistry:
-    """
-    Central source of truth for avatar runtime provider readiness.
+    """Single production authority for the Tavus LiveKit runtime."""
 
-    A remote provider is selectable only when it is explicitly enabled,
-    completely configured and backed by an implemented fail-closed adapter.
-    """
-
-    _TAVUS_REQUIRED_KEYS = (
+    _REQUIRED_KEYS = (
         "TAVUS_API_KEY",
         "LIVEKIT_URL",
         "LIVEKIT_API_KEY",
@@ -74,202 +55,64 @@ class AvatarRuntimeProviderRegistry:
         "DATABASE_URL",
     )
 
-    _BEYOND_PRESENCE_REQUIRED_KEYS = (
-        "BEY_API_KEY",
-        "BEY_AVATAR_ID",
-        "LIVEKIT_URL",
-        "LIVEKIT_API_KEY",
-        "LIVEKIT_API_SECRET",
-    )
+    def readiness(self) -> AvatarProviderReadiness:
+        enabled_value = _clean_environment_value(
+            "AVATAR_RUNTIME_ENABLE_TAVUS"
+        )
+        enabled = (
+            enabled_value is not None
+            and enabled_value.lower() in _TRUE_VALUES
+        )
+        missing = tuple(
+            key
+            for key in self._REQUIRED_KEYS
+            if _clean_environment_value(key) is None
+        )
+        configured = not missing
 
-    _HEYGEN_REQUIRED_KEYS = (
-        "LIVEAVATAR_API_KEY",
-        "LIVEAVATAR_AVATAR_ID",
-        "LIVEKIT_URL",
-        "LIVEKIT_API_KEY",
-        "LIVEKIT_API_SECRET",
-    )
-
-    _SIMLI_REQUIRED_KEYS = (
-        "SIMLI_API_KEY",
-        "SIMLI_FACE_ID",
-        "LIVEKIT_URL",
-        "LIVEKIT_API_KEY",
-        "LIVEKIT_API_SECRET",
-    )
-
-    def readiness(
-        self,
-        provider: AvatarRuntimeProvider,
-    ) -> AvatarProviderReadiness:
-        if provider == AvatarRuntimeProvider.LOCAL:
-            return AvatarProviderReadiness(
-                provider=provider,
-                enabled=True,
-                configured=True,
-                runtime_available=True,
-                missing_configuration=(),
-                reason="Local avatar runtime is available.",
+        if not enabled:
+            reason = (
+                "Tavus runtime is disabled because "
+                "AVATAR_RUNTIME_ENABLE_TAVUS=true is not configured."
             )
-
-        if provider == AvatarRuntimeProvider.TAVUS:
-            return self._remote_readiness(
-                provider=provider,
-                enable_key="AVATAR_RUNTIME_ENABLE_TAVUS",
-                required_keys=self._TAVUS_REQUIRED_KEYS,
-                adapter_available=True,
-                adapter_reason=(
-                    "The production Tavus LiveKit worker, persistent "
-                    "profile identity and VoiceDNA media bridge are installed."
-                ),
+        elif not configured:
+            reason = (
+                "Tavus runtime configuration is incomplete: "
+                + ", ".join(missing)
             )
-
-        if provider == AvatarRuntimeProvider.BEYOND_PRESENCE:
-            return self._remote_readiness(
-                provider=provider,
-                enable_key="AVATAR_RUNTIME_ENABLE_BEYOND_PRESENCE",
-                required_keys=self._BEYOND_PRESENCE_REQUIRED_KEYS,
-                adapter_available=False,
-                adapter_reason=(
-                    "Beyond Presence has no active production runtime adapter."
-                ),
-            )
-
-        if provider == AvatarRuntimeProvider.HEYGEN_LIVE_AVATAR:
-            return self._remote_readiness(
-                provider=provider,
-                enable_key="AVATAR_RUNTIME_ENABLE_HEYGEN",
-                required_keys=self._HEYGEN_REQUIRED_KEYS,
-                adapter_available=False,
-                adapter_reason=(
-                    "HeyGen LiveAvatar has no active production runtime adapter."
-                ),
-            )
-
-        if provider == AvatarRuntimeProvider.SIMLI:
-            return self._remote_readiness(
-                provider=provider,
-                enable_key="AVATAR_RUNTIME_ENABLE_SIMLI",
-                required_keys=self._SIMLI_REQUIRED_KEYS,
-                adapter_available=False,
-                adapter_reason=(
-                    "Simli has no active production runtime adapter."
-                ),
+        else:
+            reason = (
+                "The Tavus LiveKit worker, profile-bound face identity "
+                "and external ElevenLabs audio bridge are configured."
             )
 
         return AvatarProviderReadiness(
-            provider=provider,
-            enabled=False,
-            configured=False,
-            runtime_available=False,
-            missing_configuration=(),
-            reason="Unknown avatar runtime provider.",
+            provider=AvatarRuntimeProvider.TAVUS,
+            enabled=enabled,
+            configured=configured,
+            runtime_available=True,
+            missing_configuration=missing,
+            reason=reason,
         )
 
-    def select_provider(
+    def require_provider(
         self,
-        preferred_providers: Iterable[AvatarRuntimeProvider],
-        *,
-        allow_tavus_fallback: bool,
-        allow_local_fallback: bool,
-    ) -> Tuple[
+    ) -> tuple[
         AvatarRuntimeProvider,
-        List[AvatarRuntimeProvider],
         Dict[str, str],
     ]:
-        ordered_providers: List[AvatarRuntimeProvider] = []
-
-        for provider in preferred_providers:
-            if provider not in ordered_providers:
-                ordered_providers.append(provider)
-
-        if (
-            allow_tavus_fallback
-            and AvatarRuntimeProvider.TAVUS not in ordered_providers
-        ):
-            ordered_providers.append(
-                AvatarRuntimeProvider.TAVUS
-            )
-
-        if (
-            allow_local_fallback
-            and AvatarRuntimeProvider.LOCAL not in ordered_providers
-        ):
-            ordered_providers.append(
-                AvatarRuntimeProvider.LOCAL
-            )
-
-        diagnostics: Dict[str, str] = {}
-
-        for provider in ordered_providers:
-            readiness = self.readiness(provider)
-            diagnostics[provider.value] = readiness.reason
-
-            if readiness.selectable:
-                fallback_providers = [
-                    candidate
-                    for candidate in ordered_providers
-                    if candidate != provider
-                ]
-
-                return (
-                    provider,
-                    fallback_providers,
-                    diagnostics,
-                )
-
-        raise RuntimeError(
-            "No configured avatar runtime provider is available."
+        readiness = self.readiness()
+        if not readiness.selectable:
+            raise RuntimeError(readiness.reason)
+        return (
+            AvatarRuntimeProvider.TAVUS,
+            {"tavus": readiness.reason},
         )
 
     def readiness_snapshot(
         self,
     ) -> Dict[str, AvatarProviderReadiness]:
+        readiness = self.readiness()
         return {
-            provider.value: self.readiness(provider)
-            for provider in AvatarRuntimeProvider
+            readiness.provider.value: readiness
         }
-
-    def _remote_readiness(
-        self,
-        *,
-        provider: AvatarRuntimeProvider,
-        enable_key: str,
-        required_keys: Tuple[str, ...],
-        adapter_available: bool,
-        adapter_reason: str,
-    ) -> AvatarProviderReadiness:
-        enabled = _environment_flag(
-            enable_key,
-            default=False,
-        )
-
-        missing_configuration = tuple(
-            key
-            for key in required_keys
-            if _clean_environment_value(key) is None
-        )
-
-        configured = not missing_configuration
-
-        if not enabled:
-            reason = (
-                f"{provider.value} is disabled because "
-                f"{enable_key}=true is not configured."
-            )
-        elif not configured:
-            reason = (
-                f"{provider.value} is missing required configuration: "
-                + ", ".join(missing_configuration)
-            )
-        else:
-            reason = adapter_reason
-
-        return AvatarProviderReadiness(
-            provider=provider,
-            enabled=enabled,
-            configured=configured,
-            runtime_available=adapter_available,
-            missing_configuration=missing_configuration,
-            reason=reason,
-        )

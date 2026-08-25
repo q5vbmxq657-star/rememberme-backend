@@ -1,49 +1,78 @@
-import os
-
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from app.schemas.vector_memory import (
     IndexMemoryRequest,
     SearchMemoryRequest,
     SearchMemoryResponse,
 )
-
-from app.services.vector_memory_service import VectorMemoryService
-from app.services.pgvector_memory_service import PGVectorMemoryService
+from app.services.pgvector_memory_service import (
+    PGVectorMemoryService,
+    PGVectorSchemaNotReadyError,
+)
+from app.security.profile_authorization import require_profile_access
+from app.security.user_auth import (
+    AuthenticatedSessionPrincipal,
+    require_authenticated_principal,
+)
 
 router = APIRouter()
 
 
-def make_service():
-    backend = os.getenv("VECTOR_MEMORY_BACKEND", "json").lower()
+def make_service() -> PGVectorMemoryService:
+    return PGVectorMemoryService()
 
-    if backend == "pgvector":
-        return PGVectorMemoryService()
 
-    return VectorMemoryService()
+def memory_runtime_error(operation: str, error: Exception) -> HTTPException:
+    if isinstance(error, PGVectorSchemaNotReadyError):
+        return HTTPException(
+            status_code=503,
+            detail=(
+                "Canonical memory storage is unavailable. "
+                "Apply the required database migrations before retrying."
+            ),
+        )
+
+    if isinstance(error, RuntimeError):
+        return HTTPException(
+            status_code=503,
+            detail="Canonical memory storage is not configured.",
+        )
+
+    return HTTPException(
+        status_code=500,
+        detail=f"Vector {operation} failed.",
+    )
 
 
 @router.post("/index")
-def index_memories(request: IndexMemoryRequest):
+def index_memories(
+    request: IndexMemoryRequest,
+    principal: AuthenticatedSessionPrincipal = Depends(
+        require_authenticated_principal
+    ),
+):
+    require_profile_access(
+        principal=principal,
+        profile_id=request.profile_id,
+    )
     try:
-        service = make_service()
-        return service.index(request)
-
+        return make_service().index(request)
     except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Vector indexing failed: {str(error)}"
-        )
+        raise memory_runtime_error("indexing", error) from error
 
 
 @router.post("/search", response_model=SearchMemoryResponse)
-def search_memories(request: SearchMemoryRequest):
+def search_memories(
+    request: SearchMemoryRequest,
+    principal: AuthenticatedSessionPrincipal = Depends(
+        require_authenticated_principal
+    ),
+):
+    require_profile_access(
+        principal=principal,
+        profile_id=request.profile_id,
+    )
     try:
-        service = make_service()
-        return service.search(request)
-
+        return make_service().search(request)
     except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Vector search failed: {str(error)}"
-        )
+        raise memory_runtime_error("search", error) from error

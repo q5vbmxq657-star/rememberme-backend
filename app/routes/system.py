@@ -13,8 +13,8 @@ def deep_health():
     except Exception as error:
         raise HTTPException(
             status_code=500,
-            detail=f"Deep health check failed: {str(error)}"
-        )
+            detail="System health diagnostics are temporarily unavailable."
+        ) from error
 
 
 @router.get("/ai/routes")
@@ -25,5 +25,5 @@ def ai_routes():
     except Exception as error:
         raise HTTPException(
             status_code=500,
-            detail=f"AI route diagnostics failed: {str(error)}"
-        )
+            detail="AI route diagnostics are temporarily unavailable."
+        ) from error

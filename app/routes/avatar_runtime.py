@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import (
     APIRouter,
+    Depends,
     File,
     Form,
     HTTPException,
@@ -9,19 +10,19 @@ from fastapi import (
     UploadFile,
     status,
 )
+from app.security.profile_authorization import require_profile_access
+from app.security.user_auth import (
+    AuthenticatedSessionPrincipal,
+    require_authenticated_principal,
+)
 from pydantic import ValidationError
 
 from app.schemas.avatar_runtime import (
     AvatarRuntimeOperationResponse,
-    AvatarRuntimePlanRequest,
-    AvatarRuntimePlanResponse,
     AvatarRuntimeSessionCreateRequest,
     AvatarRuntimeSessionResponse,
     AvatarRuntimeSpeechMetadata,
     AvatarRuntimeSpeechResponse,
-)
-from app.services.avatar_runtime_plan_service import (
-    AvatarRuntimePlanService,
 )
 from app.services.avatar_runtime_session_service import (
     AvatarRuntimeServiceError,
@@ -33,36 +34,20 @@ router = APIRouter()
 
 
 @router.post(
-    "/plan",
-    response_model=AvatarRuntimePlanResponse,
-)
-def build_avatar_runtime_plan(
-    request: AvatarRuntimePlanRequest,
-) -> AvatarRuntimePlanResponse:
-    try:
-        service = AvatarRuntimePlanService()
-        return service.build(request)
-
-    except Exception as error:
-        raise HTTPException(
-            status_code=(
-                status.HTTP_500_INTERNAL_SERVER_ERROR
-            ),
-            detail=(
-                "Avatar runtime plan failed: "
-                f"{str(error)}"
-            ),
-        ) from error
-
-
-@router.post(
     "/sessions",
     response_model=AvatarRuntimeSessionResponse,
     status_code=status.HTTP_201_CREATED,
 )
 async def create_avatar_runtime_session(
     request: AvatarRuntimeSessionCreateRequest,
+    principal: AuthenticatedSessionPrincipal = Depends(
+        require_authenticated_principal
+    ),
 ) -> AvatarRuntimeSessionResponse:
+    require_profile_access(
+        principal=principal,
+        profile_id=request.profile_id,
+    )
     try:
         return (
             await AvatarRuntimeSessionService
@@ -73,7 +58,7 @@ async def create_avatar_runtime_session(
     except AvatarRuntimeServiceError as error:
         raise HTTPException(
             status_code=error.status_code,
-            detail=error.message,
+            detail="We could not start this avatar right now. Please try again.",
         ) from error
 
 
@@ -85,11 +70,19 @@ async def render_avatar_runtime_speech(
     session_id: str,
     metadata: str = Form(...),
     audio: UploadFile = File(...),
+    principal: AuthenticatedSessionPrincipal = Depends(
+        require_authenticated_principal
+    ),
 ) -> AvatarRuntimeSpeechResponse:
     try:
         parsed_metadata = (
             AvatarRuntimeSpeechMetadata
             .model_validate_json(metadata)
+        )
+
+        require_profile_access(
+            principal=principal,
+            profile_id=parsed_metadata.profile_id,
         )
 
         return (
@@ -119,7 +112,7 @@ async def render_avatar_runtime_speech(
     except AvatarRuntimeServiceError as error:
         raise HTTPException(
             status_code=error.status_code,
-            detail=error.message,
+            detail="We could not animate this response right now. Please try again.",
         ) from error
 
     finally:
@@ -132,18 +125,26 @@ async def render_avatar_runtime_speech(
 )
 async def interrupt_avatar_runtime_session(
     session_id: str,
+    principal: AuthenticatedSessionPrincipal = Depends(
+        require_authenticated_principal
+    ),
 ) -> AvatarRuntimeOperationResponse:
     try:
+        service = AvatarRuntimeSessionService.shared()
+        require_profile_access(
+            principal=principal,
+            profile_id=service.require_session_profile_id(
+                session_id
+            ),
+        )
         return (
-            await AvatarRuntimeSessionService
-            .shared()
-            .interrupt_session(session_id)
+            await service.interrupt_session(session_id)
         )
 
     except AvatarRuntimeServiceError as error:
         raise HTTPException(
             status_code=error.status_code,
-            detail=error.message,
+            detail="We could not pause this avatar right now. Please try again.",
         ) from error
 
 
@@ -153,13 +154,19 @@ async def interrupt_avatar_runtime_session(
 )
 async def close_avatar_runtime_session(
     session_id: str,
+    principal: AuthenticatedSessionPrincipal = Depends(
+        require_authenticated_principal
+    ),
 ) -> Response:
     try:
-        await (
-            AvatarRuntimeSessionService
-            .shared()
-            .close_session(session_id)
+        service = AvatarRuntimeSessionService.shared()
+        require_profile_access(
+            principal=principal,
+            profile_id=service.require_session_profile_id(
+                session_id
+            ),
         )
+        await service.close_session(session_id)
 
         return Response(
             status_code=(
@@ -170,7 +177,7 @@ async def close_avatar_runtime_session(
     except AvatarRuntimeServiceError as error:
         raise HTTPException(
             status_code=error.status_code,
-            detail=error.message,
+            detail="We could not end this avatar session right now. Please try again.",
         ) from error
 
 

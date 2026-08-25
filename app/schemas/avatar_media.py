@@ -21,6 +21,7 @@ class AvatarMediaUploadResponse(BaseModel):
     size_bytes: int
     signed_url: str
     expires_in_seconds: int
+    was_existing: bool = False
     face_analysis: Optional[Dict] = None
 
 
@@ -61,6 +62,8 @@ class AvatarMediaStorageHealthResponse(BaseModel):
     storage_exists: bool
     storage_is_directory: bool
     storage_writable: bool
+    volume_mount_path: Optional[str] = None
+    persistent_volume_configured: bool
     public_base_url: Optional[str]
     public_base_url_configured: bool
     secure_public_url: bool
@@ -68,4 +71,3 @@ class AvatarMediaStorageHealthResponse(BaseModel):
     signing_secret_secure: bool
     production_ready: bool
     error_message: Optional[str] = None
-
