@@ -181,6 +181,51 @@ class PGVectorMemoryService:
             "count": len(prepared_rows),
         }
 
+    def upsert_external_memory(
+        self,
+        *,
+        memory_id: str,
+        profile_id: str,
+        title: str,
+        summary: str,
+        original_text: str,
+        memory_type: str,
+        emotional_tags: list[str],
+        confidence_score: float,
+    ) -> None:
+        """Index one externally captured memory without replacing local memories."""
+        content = "\n".join(
+            value.strip()
+            for value in (title, summary, original_text)
+            if value and value.strip()
+        )
+        embedding = self._vector_literal(self._embed(content))
+        with psycopg.connect(self.database_url) as connection:
+            with connection.transaction():
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO memory_embeddings (
+                            memory_id, profile_id, title, summary, original_text,
+                            type, emotional_tags, confidence_score, content, embedding
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector)
+                        ON CONFLICT (profile_id, memory_id) DO UPDATE SET
+                            title = EXCLUDED.title,
+                            summary = EXCLUDED.summary,
+                            original_text = EXCLUDED.original_text,
+                            type = EXCLUDED.type,
+                            emotional_tags = EXCLUDED.emotional_tags,
+                            confidence_score = EXCLUDED.confidence_score,
+                            content = EXCLUDED.content,
+                            embedding = EXCLUDED.embedding,
+                            updated_at = NOW()
+                        """,
+                        (
+                            memory_id, profile_id, title, summary, original_text,
+                            memory_type, emotional_tags, confidence_score, content, embedding,
+                        ),
+                    )
+
     def search(
         self,
         request: SearchMemoryRequest,

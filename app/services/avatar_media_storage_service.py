@@ -160,6 +160,8 @@ class AvatarMediaStorageService:
             "audio/x-wav",
             "audio/aac",
             "audio/x-m4a",
+            "audio/webm",
+            "audio/ogg",
             "application/octet-stream",
         }
 
@@ -177,6 +179,8 @@ class AvatarMediaStorageService:
             ".m4a": "audio/m4a",
             ".wav": "audio/wav",
             ".aac": "audio/aac",
+            ".webm": "audio/webm",
+            ".ogg": "audio/ogg",
         }
 
         self._validate_configuration()
