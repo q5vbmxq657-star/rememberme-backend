@@ -226,6 +226,27 @@ class PGVectorMemoryService:
                         ),
                     )
 
+    def delete_external_memories(
+        self,
+        *,
+        profile_id: str,
+        memory_ids: list[str],
+    ) -> None:
+        """Rollback externally captured memories that never became canonical."""
+        if not memory_ids:
+            return
+        with psycopg.connect(self.database_url) as connection:
+            with connection.transaction():
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        DELETE FROM memory_embeddings
+                        WHERE profile_id = %s
+                          AND memory_id = ANY(%s)
+                        """,
+                        (profile_id, memory_ids),
+                    )
+
     def search(
         self,
         request: SearchMemoryRequest,

@@ -7,6 +7,13 @@ type PodcastMetadata = {
   subject_name: string;
   prompt: string;
   prompt_audio_url: string | null;
+  theme: string;
+  prompts: Array<{
+    prompt_id: string;
+    category: string;
+    question: string;
+    audio_url: string | null;
+  }>;
 };
 
 const apiURL = process.env.STAY_API_URL?.replace(/\/$/, "") ?? process.env.NEXT_PUBLIC_STAY_API_URL?.replace(/\/$/, "") ?? "";
@@ -26,12 +33,16 @@ export async function generateMetadata({ params }: { params: Promise<{ token: st
   const { token } = await params;
   const metadata = await loadMetadata(token).catch(() => null);
   if (!metadata) return { title: "Persönliche Frage | STAY", robots: { index: false, follow: false } };
-  const title = `${metadata.requester_name} hat eine Frage an dich`;
+  const title = `${metadata.requester_name} lädt dich zu einem privaten Gespräch ein`;
   return {
     title,
-    description: metadata.prompt,
+    description: `Erzähle deine Geschichte für ${metadata.subject_name}. Keine App und kein Konto nötig.`,
     robots: { index: false, follow: false },
-    openGraph: { title, description: metadata.prompt, type: "website" }
+    openGraph: {
+      title,
+      description: `Erzähle deine Geschichte für ${metadata.subject_name}. Keine App und kein Konto nötig.`,
+      type: "website"
+    }
   };
 }
 
@@ -39,5 +50,5 @@ export default async function PodcastPage({ params }: { params: Promise<{ token:
   const { token } = await params;
   const metadata = await loadMetadata(token);
   if (!metadata) notFound();
-  return <SeniorRecorder token={token} metadata={metadata} />;
+  return <SeniorRecorder token={token} apiBaseURL={apiURL} metadata={metadata} />;
 }

@@ -3,12 +3,14 @@ from __future__ import annotations
 import os
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 
 from app.schemas.podcast import (
     PodcastInvitationCreateRequest,
     PodcastInvitationCreateResponse,
+    PodcastInvitationSummaryList,
     PodcastMemoryImportList,
+    PodcastMemoryImportAcknowledgement,
     PodcastPublicMetadata,
     PodcastUploadResponse,
 )
@@ -52,7 +54,27 @@ async def create_invitation(
     except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="We could not prepare this question. Please try again.",
+            detail="We could not prepare the private interview. Please try again.",
+        ) from error
+
+
+@router.get(
+    "/profiles/{profile_id}/invitations",
+    response_model=PodcastInvitationSummaryList,
+)
+def list_invitations(
+    profile_id: UUID,
+    principal: AuthenticatedSessionPrincipal = Depends(require_authenticated_principal),
+) -> PodcastInvitationSummaryList:
+    require_profile_access(principal=principal, profile_id=profile_id)
+    try:
+        return PodcastInvitationSummaryList(
+            invitations=PodcastService().list_invitations(profile_id=profile_id)
+        )
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Private interview status is temporarily unavailable.",
         ) from error
 
 
@@ -76,6 +98,31 @@ def list_completed_memories(
         ) from error
 
 
+@router.post(
+    "/profiles/{profile_id}/invitations/{invitation_id}/voice-training-used",
+    response_model=PodcastMemoryImportAcknowledgement,
+)
+def acknowledge_voice_training_use(
+    profile_id: UUID,
+    invitation_id: UUID,
+    principal: AuthenticatedSessionPrincipal = Depends(require_authenticated_principal),
+) -> PodcastMemoryImportAcknowledgement:
+    require_profile_access(principal=principal, profile_id=profile_id)
+    acknowledged = PodcastService().mark_voice_training_used(
+        invitation_id=invitation_id,
+        profile_id=profile_id,
+    )
+    if not acknowledged:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This recording is not authorized for voice training.",
+        )
+    return PodcastMemoryImportAcknowledgement(
+        invitation_id=invitation_id,
+        acknowledged=True,
+    )
+
+
 @public_router.get("/{token}", response_model=PodcastPublicMetadata)
 def public_metadata(token: str, request: Request) -> PodcastPublicMetadata:
     try:
@@ -84,7 +131,7 @@ def public_metadata(token: str, request: Request) -> PodcastPublicMetadata:
             backend_base_url=str(request.base_url).rstrip("/"),
         )
     except (PodcastInvitationNotFound, PodcastServiceError) as error:
-        detail = error.safe_message if isinstance(error, PodcastServiceError) else "This question is no longer available."
+        detail = error.safe_message if isinstance(error, PodcastServiceError) else "This private interview is no longer available."
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail) from error
 
 
@@ -101,11 +148,43 @@ async def upload_response(
             backend_base_url=str(request.base_url).rstrip("/"),
         )
     except PodcastInvitationNotFound as error:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This question is no longer available.") from error
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This private interview is no longer available.") from error
     except PodcastServiceError as error:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=error.safe_message) from error
     except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Your answer could not be processed. Please try again.",
+        ) from error
+
+
+@public_router.post("/{token}/complete", response_model=PodcastUploadResponse)
+async def complete_interview(
+    token: str,
+    request: Request,
+    files: list[UploadFile] = File(...),
+    speaker_confirmed_subject: bool = Form(False),
+    voice_training_consent_granted: bool = Form(False),
+) -> PodcastUploadResponse:
+    try:
+        return await PodcastService().complete_session(
+            token=token,
+            files=files,
+            speaker_confirmed_subject=speaker_confirmed_subject,
+            voice_training_consent_granted=voice_training_consent_granted,
+            backend_base_url=str(request.base_url).rstrip("/"),
+        )
+    except PodcastInvitationNotFound as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This interview is no longer available.") from error
+    except PodcastServiceError as error:
+        response_status = (
+            status.HTTP_409_CONFLICT
+            if error.code == "processing_in_progress"
+            else status.HTTP_422_UNPROCESSABLE_ENTITY
+        )
+        raise HTTPException(status_code=response_status, detail=error.safe_message) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Your story could not be processed. The recording remains in this browser for another try.",
         ) from error
