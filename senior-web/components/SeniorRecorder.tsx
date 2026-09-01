@@ -9,6 +9,7 @@ type Metadata = {
   subject_name: string;
   prompt: string;
   prompt_audio_url: string | null;
+  status: "pending" | "recording" | "uploaded" | "processing" | "completed" | "retryable_failed" | "expired";
   prompts: PodcastPrompt[];
 };
 
@@ -34,6 +35,32 @@ export function SeniorRecorder({
   const recorder = useSeniorVADRecorder({ token, apiBaseURL, prompts, onSuccess });
   const currentPrompt = prompts[recorder.currentPromptIndex] ?? prompts[0];
   const busy = ["PLAYING_PROMPT", "RECORDING", "SILENCE_DETECTED", "UPLOADING"].includes(recorder.state);
+
+  if (metadata.status === "completed") {
+    return (
+      <main className="flex min-h-[100svh] items-center justify-center bg-[#fffaf9] px-6 py-10 text-center">
+        <section className="w-full max-w-md" aria-live="polite">
+          <div className="mx-auto mb-8 grid h-28 w-28 place-items-center rounded-full bg-emerald-100 text-6xl text-emerald-700" aria-hidden="true">✓</div>
+          <p className="text-lg font-bold uppercase tracking-[0.18em] text-[#d85048]">Sicher angekommen</p>
+          <h1 className="mt-3 text-4xl font-bold tracking-tight text-zinc-950">Deine Geschichte ist bereits gespeichert.</h1>
+          <p className="mt-5 text-2xl font-semibold leading-snug text-zinc-700">Du musst nichts weiter tun.</p>
+        </section>
+      </main>
+    );
+  }
+
+  if (["recording", "uploaded", "processing"].includes(metadata.status)) {
+    return (
+      <main className="flex min-h-[100svh] items-center justify-center bg-[#fffaf9] px-6 py-10 text-center">
+        <section className="w-full max-w-md" aria-live="polite">
+          <div className="mx-auto mb-8 grid h-28 w-28 place-items-center rounded-full bg-[#ffe8e2] text-5xl text-[#a42d2a]" aria-hidden="true">•••</div>
+          <p className="text-lg font-bold uppercase tracking-[0.18em] text-[#d85048]">Wird sicher gespeichert</p>
+          <h1 className="mt-3 text-4xl font-bold tracking-tight text-zinc-950">Deine Geschichte ist unterwegs.</h1>
+          <p className="mt-5 text-2xl font-semibold leading-snug text-zinc-700">Bitte öffne diesen Link in ein paar Minuten erneut.</p>
+        </section>
+      </main>
+    );
+  }
 
   if (recorder.state === "SUCCESS") {
     return (

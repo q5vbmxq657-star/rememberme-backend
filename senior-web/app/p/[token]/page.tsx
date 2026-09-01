@@ -2,12 +2,15 @@ import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { SeniorRecorder } from "@/components/SeniorRecorder";
 
+export const dynamic = "force-dynamic";
+
 type PodcastMetadata = {
   requester_name: string;
   subject_name: string;
   prompt: string;
   prompt_audio_url: string | null;
   theme: string;
+  status: "pending" | "recording" | "uploaded" | "processing" | "completed" | "retryable_failed" | "expired";
   prompts: Array<{
     prompt_id: string;
     category: string;

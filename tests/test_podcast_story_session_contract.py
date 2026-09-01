@@ -29,6 +29,27 @@ class PodcastRepositoryStub:
         self.record.voice_training_used_at = datetime.now(timezone.utc)
         return True
 
+    def get_by_token_digest(self, token_digest, *, for_update=False):
+        assert token_digest
+        assert for_update is False
+        return self.record
+
+    def mark_status(
+        self,
+        *,
+        invitation_id,
+        expected_statuses,
+        status,
+        response_audio_asset_id=None,
+        safe_error_code=None,
+    ):
+        assert invitation_id == self.record.invitation_id
+        assert self.record.status in expected_statuses
+        self.record.status = status
+        self.record.safe_error_code = safe_error_code
+        self.record.updated_at = datetime.now(timezone.utc)
+        return self.record
+
 
 class PodcastMediaStub:
     def sign_download_url(self, *, asset_id, base_url, expires_in_seconds):
@@ -109,6 +130,31 @@ def test_story_session_prompt_selection_is_deterministic_and_bounded():
 def test_unknown_theme_uses_one_canonical_life_story_fallback():
     service = object.__new__(PodcastService)
     assert service._normalized_theme("not-a-real-theme") == "life_story"
+
+
+def test_read_only_service_construction_does_not_require_openai(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    service = PodcastService(
+        repository=PodcastRepositoryStub(make_record(), []),
+        media=PodcastMediaStub(),
+    )
+
+    assert service._openai_client is None
+
+
+def test_expired_processing_lease_recovers_the_same_invitation_for_retry():
+    record = make_record()
+    record.status = PodcastInvitationStatus.processing
+    record.updated_at = datetime.now(timezone.utc) - timedelta(minutes=16)
+    repository = PodcastRepositoryStub(record, [])
+    service = PodcastService(repository=repository, media=PodcastMediaStub())
+
+    recovered = service._active_record("a" * 32)
+
+    assert recovered.invitation_id == record.invitation_id
+    assert recovered.status == PodcastInvitationStatus.retryable_failed
+    assert recovered.safe_error_code == "processing_lease_expired"
 
 
 def test_imports_are_profile_bound_categorized_and_offer_voice_only_once():

@@ -24,6 +24,7 @@ type RecorderOptions = {
 };
 
 const maximumTurnMilliseconds = 12 * 60 * 1000;
+const promptPlaybackTimeoutMilliseconds = 45 * 1000;
 
 class NonRetryableUploadError extends Error {}
 
@@ -53,12 +54,18 @@ export function useSeniorVADRecorder({
   const stoppingRef = useRef(false);
   const maximumDurationRef = useRef<number | null>(null);
   const currentPromptIndexRef = useRef(0);
+  const mediaSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
 
   const stopTurnMonitoring = useCallback(() => {
     if (animationRef.current !== null) cancelAnimationFrame(animationRef.current);
     animationRef.current = null;
     if (maximumDurationRef.current !== null) window.clearTimeout(maximumDurationRef.current);
     maximumDurationRef.current = null;
+    mediaSourceRef.current?.disconnect();
+    mediaSourceRef.current = null;
+    analyserRef.current?.disconnect();
+    analyserRef.current = null;
     setLevel(0);
   }, []);
 
@@ -163,7 +170,18 @@ export function useSeniorVADRecorder({
         const source = context.createBufferSource();
         source.buffer = buffer;
         source.connect(context.destination);
-        await new Promise<void>((resolve) => { source.onended = () => resolve(); source.start(); });
+        await new Promise<void>((resolve, reject) => {
+          const timeout = window.setTimeout(() => {
+            source.stop();
+            reject(new Error("Prompt audio timed out."));
+          }, promptPlaybackTimeoutMilliseconds);
+          source.onended = () => {
+            window.clearTimeout(timeout);
+            source.disconnect();
+            resolve();
+          };
+          source.start();
+        });
         promptWasPlayed = true;
       } catch {
         // The server recording is an enhancement. The unlocked browser voice
@@ -173,10 +191,20 @@ export function useSeniorVADRecorder({
     if (!promptWasPlayed) {
       await new Promise<void>((resolve, reject) => {
         const utterance = new SpeechSynthesisUtterance(prompt.question);
+        const timeout = window.setTimeout(() => {
+          window.speechSynthesis.cancel();
+          reject(new Error("Die Frage konnte nicht vorgelesen werden. Bitte tippe erneut auf Start."));
+        }, promptPlaybackTimeoutMilliseconds);
         utterance.lang = navigator.language || "de-DE";
         utterance.rate = 0.9;
-        utterance.onend = () => resolve();
-        utterance.onerror = () => reject(new Error("Die Frage konnte nicht vorgelesen werden."));
+        utterance.onend = () => {
+          window.clearTimeout(timeout);
+          resolve();
+        };
+        utterance.onerror = () => {
+          window.clearTimeout(timeout);
+          reject(new Error("Die Frage konnte nicht vorgelesen werden. Bitte tippe erneut auf Start."));
+        };
         window.speechSynthesis.cancel();
         window.speechSynthesis.speak(utterance);
       });
@@ -198,7 +226,10 @@ export function useSeniorVADRecorder({
 
     const analyser = context.createAnalyser();
     analyser.fftSize = 1024;
-    context.createMediaStreamSource(stream).connect(analyser);
+    const mediaSource = context.createMediaStreamSource(stream);
+    mediaSource.connect(analyser);
+    mediaSourceRef.current = mediaSource;
+    analyserRef.current = analyser;
     const samples = new Float32Array(analyser.fftSize);
     const monitor = () => {
       analyser.getFloatTimeDomainData(samples);
@@ -235,13 +266,14 @@ export function useSeniorVADRecorder({
     await vadRef.current?.pause().catch(() => undefined);
     const recorder = recorderRef.current;
     recorderRef.current = null;
-    const stopped = new Promise<Blob>((resolve) => {
-      recorder.addEventListener("stop", () => resolve(
-        new Blob(chunksRef.current, { type: recorder.mimeType })
-      ), { once: true });
-    });
-    if (recorder.state !== "inactive") recorder.stop();
-    const blob = await stopped;
+    const blob = recorder.state === "inactive"
+      ? new Blob(chunksRef.current, { type: recorder.mimeType })
+      : await new Promise<Blob>((resolve) => {
+        recorder.addEventListener("stop", () => resolve(
+          new Blob(chunksRef.current, { type: recorder.mimeType })
+        ), { once: true });
+        recorder.stop();
+      });
     try {
       if (blob.size < 1500 || !speechHeardRef.current) {
         throw new Error("Ich konnte noch keine Antwort hören. Bitte sprich etwas länger.");
@@ -290,24 +322,30 @@ export function useSeniorVADRecorder({
       try {
         const stream = await microphonePromise;
         streamRef.current = stream;
-        const { MicVAD } = await import("@ricky0123/vad-web");
-        vadRef.current = await MicVAD.new({
-          model: "v5",
-          baseAssetPath: "/vad/",
-          onnxWASMBasePath: "/ort/",
-          startOnLoad: false,
-          audioContext: context,
-          getStream: async () => stream,
-          pauseStream: async () => undefined,
-          resumeStream: async () => stream,
-          onSpeechStart: () => {
-            speechHeardRef.current = true;
-            silenceStartedRef.current = null;
-          },
-          onSpeechEnd: () => {
-            if (speechHeardRef.current) silenceStartedRef.current ??= performance.now();
-          }
-        });
+        try {
+          const { MicVAD } = await import("@ricky0123/vad-web");
+          vadRef.current = await MicVAD.new({
+            model: "v5",
+            baseAssetPath: "/vad/",
+            onnxWASMBasePath: "/ort/",
+            startOnLoad: false,
+            audioContext: context,
+            getStream: async () => stream,
+            pauseStream: async () => undefined,
+            resumeStream: async () => stream,
+            onSpeechStart: () => {
+              speechHeardRef.current = true;
+              silenceStartedRef.current = null;
+            },
+            onSpeechEnd: () => {
+              if (speechHeardRef.current) silenceStartedRef.current ??= performance.now();
+            }
+          });
+        } catch {
+          // RMS monitoring is the canonical offline-capable detector. The
+          // WASM model adds accuracy but must never block a senior's answer.
+          vadRef.current = null;
+        }
         await playPromptAndRecord(0);
       } catch (startError) {
         await cleanup();

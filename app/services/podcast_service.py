@@ -39,6 +39,7 @@ class PodcastServiceError(RuntimeError):
 
 class PodcastService:
     INVITATION_LIFETIME = timedelta(days=14)
+    PROCESSING_LEASE = timedelta(minutes=15)
     SESSION_PROMPT_COUNT = 3
 
     PROMPT_LIBRARY: dict[str, dict[str, list[tuple[str, str]]]] = {
@@ -107,7 +108,7 @@ class PodcastService:
     ) -> None:
         self.repository = repository or PodcastRepository()
         self.media = media or AvatarMediaStorageService()
-        self.openai_client = openai_client or OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        self._openai_client = openai_client
         self.tts_model = os.getenv("OPENAI_PODCAST_TTS_MODEL", "tts-1-hd")
         self.tts_voice = os.getenv("OPENAI_PODCAST_TTS_VOICE", "coral")
 
@@ -512,6 +513,27 @@ class PodcastService:
         record = self.repository.get_by_token_digest(self.token_digest(clean))
         if record.expires_at <= datetime.now(timezone.utc):
             raise PodcastServiceError("This private interview has expired.", code="invitation_expired")
+        if (
+            record.status
+            in {
+                PodcastInvitationStatus.recording,
+                PodcastInvitationStatus.uploaded,
+                PodcastInvitationStatus.processing,
+            }
+            and record.updated_at
+            <= datetime.now(timezone.utc) - self.PROCESSING_LEASE
+        ):
+            try:
+                record = self.repository.mark_status(
+                    invitation_id=record.invitation_id,
+                    expected_statuses=(record.status,),
+                    status=PodcastInvitationStatus.retryable_failed,
+                    safe_error_code="processing_lease_expired",
+                )
+            except Exception:
+                # A concurrent worker may have completed or advanced the
+                # invitation after it was read. Its authoritative state wins.
+                record = self.repository.get_by_token_digest(self.token_digest(clean))
         return record
 
     def _mark_retryable(self, invitation_id: UUID, code: str) -> None:
@@ -554,13 +576,18 @@ class PodcastService:
                 pass
 
     def _synthesize_prompt(self, prompt: str) -> bytes:
-        response = self.openai_client.audio.speech.create(
+        response = self._resolved_openai_client().audio.speech.create(
             model=self.tts_model,
             voice=self.tts_voice,
             input=prompt,
             response_format="mp3",
         )
         return response.read()
+
+    def _resolved_openai_client(self) -> OpenAI:
+        if self._openai_client is None:
+            self._openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        return self._openai_client
 
     def _session_prompts(
         self,
