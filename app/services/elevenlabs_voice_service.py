@@ -236,21 +236,8 @@ class ElevenLabsVoiceService:
             consent_verified=True,
         )
 
-        if (
-            profile.voice_training_status
-            == "ready"
-            and profile.voice_provider
-            == "elevenlabs"
-            and profile.voice_id
-        ):
-            return VoiceCloneResult(
-                job_id=uuid4(),
-                profile_id=profile.profile_id,
-                voice_id=profile.voice_id,
-                status="ready",
-                requires_verification=False,
-            )
-
+        # A ready profile may be replacing its voice. Only the exact training
+        # request may be reused, never the profile's previously trained voice.
         request_hash = self._request_hash(
             profile_id=profile_id,
             idempotency_key=clean_idempotency_key,
