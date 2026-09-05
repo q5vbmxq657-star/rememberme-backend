@@ -229,6 +229,27 @@ def test_delete_rejects_path_outside_root(
     )
 
 
+@pytest.mark.parametrize(
+    ("asset_type", "content_type"),
+    [
+        ("memory_image", "image/jpeg"),
+        ("memory_video", "video/quicktime"),
+    ],
+)
+def test_memory_gallery_media_types_are_supported(
+    tmp_path: Path,
+    asset_type: str,
+    content_type: str,
+):
+    service = make_service(tmp_path)
+
+    service._validate_asset_type(asset_type)
+    service._validate_asset_type_matches_content_type(
+        asset_type,
+        content_type,
+    )
+
+
 def test_metadata_persists_a_portable_relative_storage_path(
     tmp_path: Path,
 ):

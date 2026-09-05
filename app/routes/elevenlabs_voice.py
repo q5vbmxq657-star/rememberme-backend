@@ -90,8 +90,21 @@ async def clone_profile_voice(
     ] = []
 
     try:
+        if len(files) > ElevenLabsVoiceService.max_samples:
+            raise ElevenLabsVoiceValidationError("Too many voice samples.")
+        total_bytes = 0
         for upload in files:
-            data = await upload.read()
+            read_limit = min(
+                ElevenLabsVoiceService.max_sample_bytes,
+                ElevenLabsVoiceService.max_total_bytes - total_bytes,
+            )
+            data = await upload.read(max(0, read_limit) + 1)
+            if len(data) > read_limit:
+                raise HTTPException(
+                    status_code=413,
+                    detail="These recordings are too large. Please use shorter recordings.",
+                )
+            total_bytes += len(data)
 
             uploads.append(
                 VoiceCloneSample(
@@ -145,13 +158,25 @@ async def clone_profile_voice(
     except ElevenLabsVoiceConflictError as error:
         raise HTTPException(
             status_code=409,
-            detail="Voice training is already in progress for this profile.",
+            detail=(
+                "Voice creation is already running or its previous result "
+                "cannot be retried safely. Your recording remains saved."
+            ),
         ) from error
 
     except ElevenLabsVoiceProviderError as error:
+        detail = (
+            "Voice creation capacity is temporarily unavailable. "
+            "Your recording remains saved."
+            if error.is_capacity_unavailable
+            else (
+                "Voice creation is temporarily unavailable. "
+                "Your recording remains saved."
+            )
+        )
         raise HTTPException(
             status_code=503,
-            detail="Voice training is temporarily unavailable. Please try again.",
+            detail=detail,
         ) from error
 
     finally:

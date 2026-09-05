@@ -12,17 +12,31 @@ from app.services.avatar_media_evidence_bridge_service import (
     AvatarMediaEvidenceBridgeError,
     AvatarMediaEvidenceBridgeService,
 )
+from app.services.avatar_evidence_repository import (
+    AvatarEvidenceNotFoundError,
+)
 
 
 class FakeEvidenceRepository:
     def __init__(self):
         self.calls = []
+        self.archive_calls = []
+        self.archive_is_missing = False
 
     def upsert_uploaded_asset(
         self,
         **kwargs,
     ):
         self.calls.append(kwargs)
+
+        return kwargs
+
+    def archive(self, **kwargs):
+        self.archive_calls.append(kwargs)
+        if self.archive_is_missing:
+            raise AvatarEvidenceNotFoundError(
+                "missing"
+            )
 
         return kwargs
 
@@ -228,3 +242,37 @@ def test_audio_registration_is_not_voice_ready():
     assert analysis.has_voice is True
     assert analysis.voice_usable is False
     assert analysis.quality_score == 0.0
+
+
+def test_delete_archives_profile_bound_evidence():
+    repository = FakeEvidenceRepository()
+    service = AvatarMediaEvidenceBridgeService(
+        repository=repository
+    )
+    asset_id = uuid4()
+    profile_id = uuid4()
+
+    service.archive_uploaded_media_if_present(
+        asset_id=str(asset_id),
+        profile_id=str(profile_id),
+    )
+
+    assert repository.archive_calls == [
+        {
+            "asset_id": asset_id,
+            "profile_id": profile_id,
+        }
+    ]
+
+
+def test_delete_is_idempotent_without_evidence():
+    repository = FakeEvidenceRepository()
+    repository.archive_is_missing = True
+    service = AvatarMediaEvidenceBridgeService(
+        repository=repository
+    )
+
+    service.archive_uploaded_media_if_present(
+        asset_id=str(uuid4()),
+        profile_id=str(uuid4()),
+    )

@@ -197,6 +197,7 @@ class DigitalHumanProfileRepository:
         persona_id: Optional[str] = None,
         error_code: Optional[str] = None,
         error_message: Optional[str] = None,
+        expected_provider_job_id: Optional[str] = None,
     ) -> DigitalHumanProfile:
         ready = (
             status == "ready"
@@ -231,6 +232,7 @@ class DigitalHumanProfileRepository:
                         last_error_code = %s,
                         last_error_message = %s
                     WHERE profile_id = %s
+                      AND (%s::text IS NULL OR avatar_training_job_id = %s)
                     RETURNING *
                     """,
                     (
@@ -243,10 +245,19 @@ class DigitalHumanProfileRepository:
                         error_code,
                         error_message,
                         profile_id,
+                        expected_provider_job_id,
+                        expected_provider_job_id,
                     ),
                 )
 
                 row = cursor.fetchone()
+                if row is None and expected_provider_job_id is not None:
+                    # A late result may update its own job, never a newer avatar.
+                    cursor.execute(
+                        "SELECT * FROM digital_human_profiles WHERE profile_id = %s",
+                        (profile_id,),
+                    )
+                    row = cursor.fetchone()
 
             connection.commit()
 
@@ -491,6 +502,62 @@ class DigitalHumanProfileRepository:
             )
 
         return dict(row)
+
+    def restart_failed_voice_training_job(
+        self,
+        *,
+        job_id: UUID,
+        profile_id: UUID,
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically reclaim a failed, provider-rejected voice request.
+
+        Only jobs with an explicit provider HTTP response are retryable. A
+        transport timeout can be ambiguous because the provider may have
+        created a voice before the connection failed; retrying that operation
+        could create a second biometric voice identity.
+        """
+
+        with psycopg.connect(
+            self.database_url,
+            connect_timeout=10,
+            row_factory=dict_row,
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE digital_human_training_jobs
+                    SET
+                        status = 'created',
+                        provider_job_id = NULL,
+                        provider_payload = '{}'::jsonb,
+                        error_code = NULL,
+                        error_message = NULL,
+                        submitted_at = NULL,
+                        completed_at = NULL
+                    WHERE job_id = %s
+                      AND profile_id = %s
+                      AND training_type = 'voice'
+                      AND provider = 'elevenlabs'
+                      AND status = 'failed'
+                      AND provider_job_id IS NULL
+                      AND error_code LIKE 'provider_http_%%'
+                    RETURNING *
+                    """,
+                    (
+                        job_id,
+                        profile_id,
+                    ),
+                )
+
+                row = cursor.fetchone()
+
+            connection.commit()
+
+        return (
+            dict(row)
+            if row is not None
+            else None
+        )
 
     def get_training_job(
         self,

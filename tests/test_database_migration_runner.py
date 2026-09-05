@@ -124,6 +124,7 @@ def test_legacy_migrations_are_exactly_frozen():
         "013_apple_provider_credentials",
         "014_podcast_invitation_authority",
         "015_podcast_story_session_and_voice_consent",
+        "016_voice_verification_status",
     ]
 
     for migration in migrations[:6]:
@@ -303,11 +304,16 @@ def test_future_wrapper_free_migration_is_allowed(
             / source_path.name,
         )
 
+    next_number = max(
+        int(path.name.split("_", 1)[0])
+        for path in migration_root.glob("*.sql")
+    ) + 1
+    future_version = f"{next_number:03d}_future_clean"
     (
         migration_root
-        / "016_future_clean.sql"
+        / f"{future_version}.sql"
     ).write_text(
-        """
+        f"""
 CREATE TABLE future_clean (
     id INTEGER PRIMARY KEY
 );
@@ -316,7 +322,7 @@ INSERT INTO schema_migrations (
     version
 )
 VALUES (
-        '016_future_clean'
+        '{future_version}'
 );
 """.lstrip(),
         encoding="utf-8",
@@ -332,7 +338,7 @@ VALUES (
 
     assert (
         migration.version
-            == "016_future_clean"
+            == future_version
     )
 
     assert (
@@ -637,6 +643,7 @@ def test_fresh_plan_bootstraps_through_008():
         "013_apple_provider_credentials",
         "014_podcast_invitation_authority",
         "015_podcast_story_session_and_voice_consent",
+        "016_voice_verification_status",
     ]
 
 

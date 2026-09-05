@@ -33,9 +33,30 @@ class ElevenLabsVoiceValidationError(
 class ElevenLabsVoiceProviderError(
     ElevenLabsVoiceError
 ):
-    def __init__(self, message: str, *, status_code: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: Optional[int] = None,
+        provider_code: Optional[str] = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.provider_code = provider_code
+
+    @property
+    def is_capacity_unavailable(self) -> bool:
+        code = (self.provider_code or "").lower()
+        return any(
+            marker in code
+            for marker in (
+                "quota",
+                "limit",
+                "capacity",
+                "subscription",
+                "voice_slot",
+            )
+        )
 
 
 class ElevenLabsVoiceConflictError(
@@ -295,9 +316,24 @@ class ElevenLabsVoiceService:
                     ),
                 )
 
-            raise ElevenLabsVoiceConflictError(
-                "The same voice training request is already being submitted."
-            )
+            if existing_status == "failed":
+                retry_was_claimed = (
+                    self.repository
+                    .restart_failed_voice_training_job(
+                        job_id=resolved_job_id,
+                        profile_id=profile_id,
+                    )
+                )
+
+                if retry_was_claimed is None:
+                    raise ElevenLabsVoiceConflictError(
+                        "The previous voice request cannot be retried safely."
+                    )
+
+            else:
+                raise ElevenLabsVoiceConflictError(
+                    "The same voice training request is already being submitted."
+                )
 
         self.repository.set_voice_training(
             profile_id,
@@ -410,15 +446,14 @@ class ElevenLabsVoiceService:
             )
 
         except Exception as error:
-            error_message = "Voice training failed before completion."
+            error_code = self._training_error_code(error)
+            error_message = self._training_error_message(error)
 
             try:
                 self.repository.update_training_job(
                     resolved_job_id,
                     status="failed",
-                    error_code=(
-                        type(error).__name__
-                    ),
+                    error_code=error_code,
                     error_message=error_message,
                 )
 
@@ -429,9 +464,7 @@ class ElevenLabsVoiceService:
                     provider_job_id=str(
                         resolved_job_id
                     ),
-                    error_code=(
-                        type(error).__name__
-                    ),
+                    error_code=error_code,
                     error_message=error_message,
                 )
             except (
@@ -774,4 +807,82 @@ class ElevenLabsVoiceService:
             f"{operation} failed "
             f"with provider status {response.status_code}.",
             status_code=response.status_code,
+            provider_code=self._provider_error_code(response),
         )
+
+    def _provider_error_code(
+        self,
+        response: httpx.Response,
+    ) -> Optional[str]:
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            return None
+
+        candidates = []
+
+        if isinstance(payload, dict):
+            candidates.extend(
+                payload.get(key)
+                for key in ("code", "status", "type")
+            )
+
+            detail = payload.get("detail")
+            if isinstance(detail, dict):
+                candidates.extend(
+                    detail.get(key)
+                    for key in ("code", "status", "type")
+                )
+
+        for candidate in candidates:
+            if not isinstance(candidate, str):
+                continue
+
+            normalized = "".join(
+                character
+                if character.isalnum() or character in {"_", "-"}
+                else "_"
+                for character in candidate.strip().lower()
+            )[:64]
+
+            if normalized:
+                return normalized
+
+        return None
+
+    def _training_error_code(self, error: Exception) -> str:
+        if (
+            isinstance(error, ElevenLabsVoiceProviderError)
+            and error.status_code is not None
+        ):
+            provider_code = error.provider_code or "unknown"
+            return (
+                f"provider_http_{error.status_code}_"
+                f"{provider_code}"
+            )[:120]
+
+        if isinstance(error, httpx.TimeoutException):
+            return "provider_transport_ambiguous_timeout"
+
+        if isinstance(error, httpx.HTTPError):
+            return "provider_transport_ambiguous"
+
+        return "voice_training_internal_failure"
+
+    def _training_error_message(self, error: Exception) -> str:
+        if (
+            isinstance(error, ElevenLabsVoiceProviderError)
+            and error.is_capacity_unavailable
+        ):
+            return "Voice provider capacity is temporarily unavailable."
+
+        if (
+            isinstance(error, ElevenLabsVoiceProviderError)
+            and error.status_code is not None
+        ):
+            return "The voice provider rejected the training request."
+
+        if isinstance(error, httpx.HTTPError):
+            return "Voice provider completion could not be confirmed."
+
+        return "Voice training failed before completion."

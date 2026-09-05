@@ -1,16 +1,21 @@
 import os
-import tempfile
-from openai import OpenAI
+from openai import AsyncOpenAI
+
+
+class VoiceRecordingTooLargeError(ValueError):
+    pass
 
 
 class OpenAIVoiceService:
+    MAX_RECORDING_BYTES = 25 * 1024 * 1024
+
     def __init__(self):
         api_key = os.getenv("OPENAI_API_KEY")
 
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is missing.")
 
-        self.client = OpenAI(api_key=api_key)
+        self.api_key = api_key
         self.transcribe_model = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
 
     async def transcribe(self, file):
@@ -29,7 +34,9 @@ class OpenAIVoiceService:
             ".flac"
         } else ".m4a"
 
-        content = await file.read()
+        content = await file.read(self.MAX_RECORDING_BYTES + 1)
+        if len(content) > self.MAX_RECORDING_BYTES:
+            raise VoiceRecordingTooLargeError("Recording exceeds the transcription size limit.")
 
         if not content:
             return {
@@ -42,16 +49,15 @@ class OpenAIVoiceService:
                 }
             }
 
-        with tempfile.NamedTemporaryFile(delete=True, suffix=rememberme_stt_suffix) as temp:
-            temp.write(content)
-            temp.flush()
-
-            with open(temp.name, "rb") as audio_file:
-                transcript = self.client.audio.transcriptions.create(
-                    model=self.transcribe_model,
-                    file=audio_file,
-                    language="de"
-                )
+        async with AsyncOpenAI(
+            api_key=self.api_key,
+            timeout=45.0,
+            max_retries=1,
+        ) as client:
+            transcript = await client.audio.transcriptions.create(
+                model=self.transcribe_model,
+                file=(f"recording{rememberme_stt_suffix}", content),
+            )
 
         return {
             "text": transcript.text,

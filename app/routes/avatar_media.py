@@ -14,7 +14,7 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from app.security.profile_authorization import require_profile_access
 from app.security.user_auth import (
@@ -145,10 +145,14 @@ async def upload_avatar_media(
         else:
             response.face_analysis = None
 
-        bridge.persist_uploaded_media(
-            metadata=metadata,
-            analysis=analysis,
-        )
+        if normalized_asset_type not in {
+            "memory_image",
+            "memory_video",
+        }:
+            bridge.persist_uploaded_media(
+                metadata=metadata,
+                analysis=analysis,
+            )
 
         return response
 
@@ -395,6 +399,66 @@ def list_avatar_media(
             ),
         ) from error
 
+
+@router.delete(
+    "/assets/{asset_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+    response_model=None,
+)
+def delete_avatar_media(
+    asset_id: str,
+    profile_id: str,
+    principal: AuthenticatedSessionPrincipal = Depends(
+        require_authenticated_principal
+    ),
+) -> Response:
+    try:
+        normalized_profile_id = str(UUID(profile_id))
+        require_profile_access(
+            principal=principal,
+            profile_id=normalized_profile_id,
+        )
+
+        service = AvatarMediaStorageService()
+        metadata = service.get_metadata(asset_id)
+        if metadata.profile_id != normalized_profile_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="This media no longer exists.",
+            )
+
+        if metadata.asset_type not in {
+            "memory_image",
+            "memory_video",
+        }:
+            (
+                AvatarMediaEvidenceBridgeService()
+                .archive_uploaded_media_if_present(
+                    asset_id=asset_id,
+                    profile_id=normalized_profile_id,
+                )
+            )
+
+        service.delete_asset(asset_id)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    except HTTPException:
+        raise
+    except AvatarMediaEvidenceBridgeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="This avatar source could not be deleted securely.",
+        ) from error
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="profile_id must be a valid UUID.",
+        ) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="This media no longer exists.",
+        ) from error
 
 @public_router.get(
     "/public/assets/{asset_id}"

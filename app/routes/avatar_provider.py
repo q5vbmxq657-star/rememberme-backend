@@ -1,3 +1,4 @@
+import asyncio
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -7,7 +8,10 @@ from app.schemas.avatar_provider import (
     AvatarProviderSubmitResponse,
     AvatarProviderStatusResponse,
 )
-from app.services.avatar_provider_service import avatar_provider_service
+from app.services.avatar_provider_service import (
+    AvatarProviderStatusUnavailableError,
+    avatar_provider_service,
+)
 from app.services.digital_human_profile_repository import (
     DigitalHumanProfileNotFoundError,
     DigitalHumanProfileRepositoryError,
@@ -56,17 +60,16 @@ async def get_avatar_provider_job_status(
         require_authenticated_principal
     ),
 ) -> AvatarProviderStatusResponse:
-    require_profile_access(
+    await asyncio.to_thread(
+        require_profile_access,
         principal=principal,
         profile_id=profile_id,
     )
 
     try:
-        job_profile_id = (
-            avatar_provider_service
-            .require_training_job_profile_id(
-                external_job_id
-            )
+        job_profile_id = await asyncio.to_thread(
+            avatar_provider_service.require_training_job_profile_id,
+            external_job_id,
         )
     except DigitalHumanProfileNotFoundError as error:
         raise HTTPException(
@@ -85,7 +88,14 @@ async def get_avatar_provider_job_status(
             detail="Provider job was not found.",
         )
 
-    state = await avatar_provider_service.status(external_job_id)
+    try:
+        state = await avatar_provider_service.status(external_job_id)
+    except AvatarProviderStatusUnavailableError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Avatar training status is temporarily unavailable. Please try again shortly.",
+            headers={"Retry-After": "12"},
+        ) from error
 
     return AvatarProviderStatusResponse(
         external_job_id=state.external_job_id,

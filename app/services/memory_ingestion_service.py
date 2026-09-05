@@ -1,6 +1,7 @@
 import os
 import json
 import base64
+import io
 from pathlib import Path
 from typing import Optional
 from openai import OpenAI
@@ -43,8 +44,9 @@ class MemoryIngestionService:
                 )
 
             elif metadata.content_type.startswith("video/"):
-                visual_description = (
-                    "Video uploaded. Detailed frame analysis will be added in the next pipeline step."
+                visual_description = self._analyze_video(
+                    path=path,
+                    user_context=request.user_context or "",
                 )
 
         original_text = self._build_original_text(
@@ -276,6 +278,66 @@ class MemoryIngestionService:
             max_output_tokens=450
         )
 
+        return response.output_text.strip()
+
+    def _analyze_video(self, path: Path, user_context: str) -> str:
+        import av
+
+        frames = []
+        with av.open(str(path)) as container:
+            stream = next(
+                (candidate for candidate in container.streams if candidate.type == "video"),
+                None,
+            )
+            if stream is None:
+                raise RuntimeError("The selected file contains no video track.")
+
+            decoded = []
+            for index, frame in enumerate(container.decode(stream)):
+                if index % 30 == 0:
+                    decoded.append(frame)
+                if len(decoded) >= 6:
+                    break
+
+            if not decoded:
+                raise RuntimeError("The selected video could not be decoded.")
+
+            for frame in decoded:
+                image = frame.to_image()
+                buffer = io.BytesIO()
+                image.save(buffer, format="JPEG", quality=82)
+                frames.append(base64.b64encode(buffer.getvalue()).decode("utf-8"))
+
+        content = [{
+            "type": "input_text",
+            "text": (
+                "Describe the visible events, people, places and actions in these "
+                "sampled frames as factual memory context. Do not identify unknown "
+                f"people or infer unsupported emotions. User context: {user_context}"
+            ),
+        }]
+        content.extend(
+            {
+                "type": "input_image",
+                "image_url": f"data:image/jpeg;base64,{encoded}",
+            }
+            for encoded in frames
+        )
+
+        response = self.client.responses.create(
+            model=self.vision_model,
+            input=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You analyze private personal videos conservatively. "
+                        "Describe only visible evidence."
+                    ),
+                },
+                {"role": "user", "content": content},
+            ],
+            max_output_tokens=500,
+        )
         return response.output_text.strip()
 
     def _analyze_memory(

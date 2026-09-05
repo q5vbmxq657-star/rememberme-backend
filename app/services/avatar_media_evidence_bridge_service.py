@@ -11,7 +11,9 @@ from app.schemas.avatar_media import (
     AvatarMediaMetadata,
 )
 from app.services.avatar_evidence_repository import (
+    AvatarEvidenceNotFoundError,
     AvatarEvidenceRepository,
+    AvatarEvidenceRepositoryError,
 )
 
 
@@ -249,6 +251,34 @@ class AvatarMediaEvidenceBridgeService:
                 },
             )
         )
+
+    def archive_uploaded_media_if_present(
+        self,
+        *,
+        asset_id: str,
+        profile_id: str,
+    ) -> None:
+        try:
+            normalized_asset_id = UUID(asset_id)
+            normalized_profile_id = UUID(profile_id)
+        except ValueError as error:
+            raise AvatarMediaEvidenceBridgeError(
+                "Media evidence identity is not valid."
+            ) from error
+
+        try:
+            self.repository.archive(
+                asset_id=normalized_asset_id,
+                profile_id=normalized_profile_id,
+            )
+        except AvatarEvidenceNotFoundError:
+            # Failed uploads can own stored bytes before evidence exists.
+            # Deletion remains idempotent when no active evidence is present.
+            return
+        except AvatarEvidenceRepositoryError as error:
+            raise AvatarMediaEvidenceBridgeError(
+                "Media evidence could not be archived."
+            ) from error
 
     @staticmethod
     def evidence_kind_for(

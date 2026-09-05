@@ -134,6 +134,8 @@ class AvatarMediaStorageService:
         self.allowed_asset_types = {
             "image",
             "video",
+            "memory_image",
+            "memory_video",
             "voice",
             "audio",
             "reference",
@@ -1879,6 +1881,7 @@ class AvatarMediaStorageService:
             in {
                 "image",
                 "reference",
+                "memory_image",
             }
             and not content_type.startswith(
                 "image/"
@@ -1895,6 +1898,7 @@ class AvatarMediaStorageService:
             in {
                 "video",
                 "training_sample",
+                "memory_video",
             }
             and not content_type.startswith(
                 "video/"
