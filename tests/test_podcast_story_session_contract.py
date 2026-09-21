@@ -1,13 +1,18 @@
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import uuid4
+import asyncio
+from unittest.mock import AsyncMock, Mock
+
+import pytest
 
 from app.schemas.podcast import (
     PodcastInvitationRecord,
     PodcastInvitationStatus,
     PodcastResponseRecord,
 )
-from app.services.podcast_service import PodcastService
+from app.services.podcast_service import PodcastService, PodcastServiceError
+from app.services import podcast_service
 
 
 class PodcastRepositoryStub:
@@ -203,3 +208,72 @@ def test_voice_training_is_never_offered_without_source_consent():
         backend_base_url="https://api.stay.example",
     )
     assert imports[0].voice_training_eligible is False
+
+
+@pytest.mark.parametrize("failure", [None, "index", "complete"])
+def test_interview_publishes_one_batch_and_rolls_back_only_confirmed_publication(monkeypatch, failure):
+    record = make_record(consent=False)
+    record.status = PodcastInvitationStatus.pending
+    record.prompt_sequence = [
+        {"prompt_id": f"question-{index}", "category": "childhood", "question": f"Question {index}"}
+        for index in range(3)
+    ]
+    repository = PodcastRepositoryStub(record, [])
+    vector = Mock()
+    generation = (7, uuid4())
+    vector.index_external_memories.return_value = generation
+    if failure == "index":
+        vector.index_external_memories.side_effect = RuntimeError("Synthetic publication failure")
+
+    def claim(**kwargs):
+        record.status = PodcastInvitationStatus.recording
+        return record
+
+    def complete(**kwargs):
+        vector.index_external_memories.assert_called_once()
+        assert len(kwargs["responses"]) == 3
+        assert kwargs["voice_training_consent_granted"] is False
+        if failure == "complete":
+            raise RuntimeError("Synthetic session completion failure")
+        record.status = PodcastInvitationStatus.completed
+        return record
+
+    repository.claim_recording_upload = Mock(side_effect=claim)
+    repository.complete_session = Mock(side_effect=complete)
+    media = PodcastMediaStub()
+    media.upload = AsyncMock(side_effect=[SimpleNamespace(asset_id=str(uuid4())) for _ in range(3)])
+    media.delete_asset = Mock()
+    ingestion = SimpleNamespace(
+        title="A story", summary="Summary", transcript="A sufficiently long interview answer",
+        emotional_tags=[], confidence_score=0.9, model_dump=lambda **kwargs: {},
+    )
+    monkeypatch.setattr(podcast_service, "PGVectorMemoryService", lambda: vector)
+    monkeypatch.setattr(podcast_service, "MemoryIngestionService", lambda: SimpleNamespace(ingest=lambda request: ingestion))
+    service = PodcastService(repository=repository, media=media, openai_client=object())
+    request = service.complete_session(token="a" * 32, files=[object() for _ in range(3)],
+        speaker_confirmed_subject=False, voice_training_consent_granted=False,
+        backend_base_url="https://api.stay.example")
+    if failure:
+        with pytest.raises(PodcastServiceError):
+            asyncio.run(request)
+        assert record.status == PodcastInvitationStatus.retryable_failed
+        assert media.delete_asset.call_count == 3
+    else:
+        result = asyncio.run(request)
+        assert result.status == PodcastInvitationStatus.completed
+        media.delete_asset.assert_not_called()
+    vector.index_external_memories.assert_called_once()
+    batch = vector.index_external_memories.call_args.args[0]
+    assert batch.profile_id == str(record.profile_id)
+    assert len(batch.memories) == 3
+    assert len({item.id for item in batch.memories}) == 3
+    assert all(item.profile_id == batch.profile_id for item in batch.memories)
+    if failure == "complete":
+        vector.delete_external_memories.assert_called_once_with(
+            profile_id=str(record.profile_id), memory_ids=[item.id for item in batch.memories],
+            expected_generation=generation,
+        )
+    else:
+        vector.delete_external_memories.assert_not_called()
+    if failure == "index":
+        repository.complete_session.assert_not_called()

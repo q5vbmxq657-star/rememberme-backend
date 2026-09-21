@@ -1,10 +1,11 @@
+import asyncio
 import hmac
 import os
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 
-from app.services.avatar_provider_service import avatar_provider_service
+from app.services.avatar_provider_service import avatar_provider_service, AvatarProviderStatusUnavailableError
 
 
 router = APIRouter(
@@ -40,8 +41,8 @@ def _verify_tavus_webhook_secret(
         )
 
     if not hmac.compare_digest(
-        supplied_secret,
-        expected_secret,
+        supplied_secret.encode('utf-8'),
+        expected_secret.encode('utf-8'),
     ):
         raise HTTPException(
             status_code=401,
@@ -56,14 +57,24 @@ async def receive_tavus_webhook(
     x_tavus_webhook_secret: Optional[str] = Header(default=None),
     x_rememberme_webhook_secret: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
+    # FastAPI has bound the parameter already; do not retain it in access-log URLs.
+    request.scope['query_string'] = b''
     _verify_tavus_webhook_secret(
         query_secret=secret,
         tavus_secret_header=x_tavus_webhook_secret,
         rememberme_secret_header=x_rememberme_webhook_secret,
     )
 
-    payload = await request.json()
-    state = avatar_provider_service.apply_tavus_webhook(payload)
+    try:
+        payload = await request.json()
+    except ValueError as error:
+        raise HTTPException(422, 'Invalid callback payload.') from error
+    if not isinstance(payload, dict):
+        raise HTTPException(422, 'Invalid callback payload.')
+    try:
+        state = await asyncio.to_thread(avatar_provider_service.apply_tavus_webhook, payload)
+    except AvatarProviderStatusUnavailableError as error:
+        raise HTTPException(503, 'Avatar status could not be verified.', headers={'Retry-After': '12'}) from error
 
     if state.status == "failed" and state.error_message:
         return {

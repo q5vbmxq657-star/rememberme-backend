@@ -13,6 +13,8 @@ class AvatarProviderSubmitResponse(BaseModel):
     status: str
     preview_url: Optional[str] = None
     error_message: Optional[str] = None
+    current_stage: Optional[str] = None
+    provider_detail_message: Optional[str] = None
 
 class AvatarProviderStatusResponse(BaseModel):
     external_job_id: str
@@ -20,3 +22,5 @@ class AvatarProviderStatusResponse(BaseModel):
     status: str
     preview_url: Optional[str] = None
     error_message: Optional[str] = None
+    current_stage: Optional[str] = None
+    provider_detail_message: Optional[str] = None

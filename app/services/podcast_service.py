@@ -12,6 +12,7 @@ from fastapi import UploadFile
 from openai import OpenAI
 
 from app.schemas.memory_ingestion import MemoryIngestionRequest
+from app.schemas.vector_memory import IndexMemoryRequest, VectorMemoryItem
 from app.schemas.podcast import (
     PodcastInvitationCreateRequest,
     PodcastInvitationCreateResponse,
@@ -295,6 +296,7 @@ class PodcastService:
 
         stored_responses = []
         responses: list[PodcastResponseRecord] = []
+        published_generation: tuple[int, UUID] | None = None
         try:
             for index, upload in enumerate(files):
                 stored_responses.append(await self.media.upload(
@@ -357,18 +359,22 @@ class PodcastService:
                 ))
 
             vector_service = PGVectorMemoryService()
-            for response, ingestion in zip(responses, ingestions, strict=True):
-                await asyncio.to_thread(
-                    vector_service.upsert_external_memory,
-                    memory_id=str(response.memory_id),
+            published_generation = await asyncio.to_thread(
+                vector_service.index_external_memories,
+                IndexMemoryRequest(
                     profile_id=str(record.profile_id),
-                    title=ingestion.title,
-                    summary=ingestion.summary,
-                    original_text=response.transcript,
-                    memory_type="voiceMemory",
-                    emotional_tags=ingestion.emotional_tags,
-                    confidence_score=ingestion.confidence_score,
-                )
+                    memories=[VectorMemoryItem(
+                        id=str(response.memory_id),
+                        profile_id=str(record.profile_id),
+                        title=ingestion.title,
+                        summary=ingestion.summary,
+                        original_text=response.transcript,
+                        type="voiceMemory",
+                        emotional_tags=ingestion.emotional_tags,
+                        confidence_score=ingestion.confidence_score,
+                    ) for response, ingestion in zip(responses, ingestions, strict=True)],
+                ),
+            )
             completed = self.repository.complete_session(
                 invitation_id=record.invitation_id,
                 responses=responses,
@@ -385,6 +391,7 @@ class PodcastService:
                 record=record,
                 stored_responses=stored_responses,
                 responses=responses,
+                published_generation=published_generation,
             )
             raise
         except Exception as error:
@@ -393,6 +400,7 @@ class PodcastService:
                 record=record,
                 stored_responses=stored_responses,
                 responses=responses,
+                published_generation=published_generation,
             )
             raise PodcastServiceError(
                 "Your recording is still on this device. Please try sending it again.",
@@ -557,13 +565,15 @@ class PodcastService:
         record: PodcastInvitationRecord,
         stored_responses: list,
         responses: list[PodcastResponseRecord],
+        published_generation: tuple[int, UUID] | None,
     ) -> None:
         self._delete_assets(stored.asset_id for stored in stored_responses)
-        if responses:
+        if responses and published_generation is not None:
             try:
                 PGVectorMemoryService().delete_external_memories(
                     profile_id=str(record.profile_id),
                     memory_ids=[str(response.memory_id) for response in responses],
+                    expected_generation=published_generation,
                 )
             except Exception:
                 pass

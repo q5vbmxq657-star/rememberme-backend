@@ -15,6 +15,8 @@ from livekit import api, rtc
 from livekit.agents import utils as agent_utils
 
 from app.schemas.avatar_runtime import AvatarLiveKitSessionDescriptor
+from app.services.runtime_cleanup_repository import RuntimeCleanupRepository
+from app.security.purpose_authorization import require_profile_purposes
 from app.services.avatar_runtime_audio_output import (
     RememberMeDataStreamAudioOutput,
 )
@@ -193,6 +195,7 @@ class AvatarRuntimeTavusAdapter:
         ] = {}
 
         self._handles_lock = asyncio.Lock()
+        self.cleanup_repository = RuntimeCleanupRepository()
 
     @property
     def is_configured(self) -> bool:
@@ -272,7 +275,15 @@ class AvatarRuntimeTavusAdapter:
         room = rtc.Room()
         dispatch_id: Optional[str] = None
 
+        purposes = await asyncio.to_thread(self.cleanup_repository.material_purposes, profile_id, clean_face_id)
+        # Runtime transports externally synthesized voice, and no memory context.
+        purposes.add('voice_synthesis')
+        consent = await asyncio.to_thread(require_profile_purposes, profile_id, purposes)
+        await asyncio.to_thread(self.cleanup_repository.register, session_id, profile_id,
+                                room_name, client_token.expires_at, consent.revision, purposes)
+
         try:
+            await asyncio.to_thread(self.cleanup_repository.authorize, session_id)
             await self._create_room(
                 room_name
             )
@@ -298,6 +309,7 @@ class AvatarRuntimeTavusAdapter:
                 face_id=clean_face_id,
                 pal_id=clean_pal_id,
             )
+            await asyncio.to_thread(self.cleanup_repository.dispatch, session_id, dispatch_id)
 
             try:
                 await asyncio.wait_for(
@@ -372,6 +384,7 @@ class AvatarRuntimeTavusAdapter:
                 expires_at=client_token.expires_at,
             )
 
+            await asyncio.to_thread(self.cleanup_repository.authorize, session_id)
             return TavusRemoteSession(
                 session_id=session_id,
                 provider_avatar_id=clean_face_id,
@@ -393,19 +406,19 @@ class AvatarRuntimeTavusAdapter:
                 },
             )
 
-        except Exception as error:
-            await self._disconnect_room(
-                room
-            )
-
-            await self._delete_remote_resources(
-                room_name=room_name,
-                dispatch_id=dispatch_id,
-            )
+        except BaseException as error:
+            await asyncio.to_thread(self.cleanup_repository.request, session_id)
+            try:
+                await self._disconnect_room(room)
+            finally:
+                await self._delete_remote_resources(
+                    room_name=room_name,
+                    dispatch_id=dispatch_id,
+                )
 
             if isinstance(
                 error,
-                TavusRuntimeError,
+                (TavusRuntimeError, asyncio.CancelledError),
             ):
                 raise
 
@@ -420,6 +433,7 @@ class AvatarRuntimeTavusAdapter:
         session_id: str,
         audio_data: bytes,
     ) -> int:
+        await asyncio.to_thread(self.cleanup_repository.authorize, session_id)
         handle = await self._require_handle(
             session_id
         )
@@ -450,6 +464,7 @@ class AvatarRuntimeTavusAdapter:
             )
 
         async with handle.audio_lock:
+            await asyncio.to_thread(self.cleanup_repository.authorize, session_id)
             if handle.closing or handle.closed:
                 raise TavusRuntimeConnectionError(
                     "The Tavus session closed before audio streaming began."
@@ -491,18 +506,28 @@ class AvatarRuntimeTavusAdapter:
         self,
         session_id: str,
     ) -> None:
+        if hasattr(self, 'cleanup_repository'):
+            await asyncio.to_thread(self.cleanup_repository.request, session_id)
         async with self._handles_lock:
-            handle = self._handles.pop(
-                session_id,
-                None,
-            )
+            handle = self._handles.get(session_id)
 
         if handle is None:
-            return
+            row = await asyncio.to_thread(self.cleanup_repository.get, session_id)
+            if row and row['completed_at']:
+                return
+            raise TavusRuntimeConnectionError("Remote session cleanup is queued for verification.")
 
-        await self._close_handle(
-            handle
-        )
+        try:
+            await self._close_handle(handle)
+        except Exception as error:
+            raise TavusRuntimeConnectionError("Avatar session cleanup remains unverified.") from error
+        if hasattr(self, 'cleanup_repository'):
+            row = await asyncio.to_thread(self.cleanup_repository.get, session_id)
+            if row and row['provider_create_started'] and not row['tavus_ended']:
+                raise TavusRuntimeConnectionError("Provider termination is pending verification.")
+        async with self._handles_lock:
+            if self._handles.get(session_id) is handle:
+                self._handles.pop(session_id, None)
 
     async def has_active_session(
         self,
@@ -606,6 +631,7 @@ class AvatarRuntimeTavusAdapter:
         )
 
         try:
+            await asyncio.to_thread(self.cleanup_repository.authorize, session_id)
             dispatch = (
                 await client.agent_dispatch.create_dispatch(
                     api.CreateAgentDispatchRequest(
@@ -643,22 +669,17 @@ class AvatarRuntimeTavusAdapter:
 
             try:
                 async with handle.audio_lock:
-                    await self._prepare_output_for_disconnect(
-                        handle.audio_output
-                    )
-
-                await self._disconnect_room(
-                    handle.room
-                )
-
-                await self._delete_remote_resources(
-                    room_name=handle.room_name,
-                    dispatch_id=handle.dispatch_id,
-                )
-
+                    if handle.room.isconnected():
+                        await self._prepare_output_for_disconnect(handle.audio_output)
             finally:
-                handle.closed = True
-                handle.closing = False
+                try:
+                    await self._disconnect_room(handle.room)
+                finally:
+                    await self._delete_remote_resources(
+                        room_name=handle.room_name,
+                        dispatch_id=handle.dispatch_id,
+                    )
+            handle.closed = True
 
     async def _await_output_interrupt(
         self,
@@ -722,9 +743,10 @@ class AvatarRuntimeTavusAdapter:
         dispatch_id: Optional[str],
     ) -> None:
         if not self.token_service.is_configured:
-            return
+            raise TavusRuntimeConfigurationError("Remote session cleanup is unavailable.")
 
         client = self._make_api_client()
+        failures: list[Exception] = []
 
         try:
             if dispatch_id:
@@ -733,8 +755,9 @@ class AvatarRuntimeTavusAdapter:
                         dispatch_id=dispatch_id,
                         room_name=room_name,
                     )
-                except Exception:
-                    pass
+                except Exception as error:
+                    if not isinstance(error, api.TwirpError) or error.code != "not_found":
+                        failures.append(error)
 
             try:
                 await client.room.delete_room(
@@ -742,11 +765,14 @@ class AvatarRuntimeTavusAdapter:
                         room=room_name
                     )
                 )
-            except Exception:
-                pass
+            except Exception as error:
+                if not isinstance(error, api.TwirpError) or error.code != "not_found":
+                    failures.append(error)
 
         finally:
             await client.aclose()
+        if failures:
+            raise TavusRuntimeConnectionError("Remote session cleanup could not be verified.") from failures[0]
 
     async def _disconnect_room(
         self,
@@ -766,11 +792,8 @@ class AvatarRuntimeTavusAdapter:
                     ),
                 )
 
-        except asyncio.TimeoutError:
-            pass
-
-        except Exception:
-            pass
+        except Exception as error:
+            raise TavusRuntimeConnectionError("The local avatar bridge could not be disconnected.") from error
 
     def _make_api_client(
         self,

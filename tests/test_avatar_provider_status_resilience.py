@@ -102,7 +102,7 @@ def test_missing_provider_configuration_does_not_erase_ready_status(monkeypatch)
 
 @pytest.mark.parametrize("provider_status, expected", [("completed", "ready"), ("error", "failed"), ("started", "training")])
 def test_explicit_provider_status_still_updates_the_job(monkeypatch, provider_status, expected):
-    install_client(monkeypatch, response=httpx.Response(200, json={"status": provider_status}))
+    install_client(monkeypatch, response=httpx.Response(200, json={"face_id": "test-face", "status": provider_status}))
     service = AvatarProviderService()
     service._sync_tavus_status_to_profile = Mock()
     current = state()
@@ -175,14 +175,19 @@ def test_foreign_profile_job_is_rejected_before_provider_polling(monkeypatch):
 def test_provider_projection_is_fenced_to_its_own_job():
     service = AvatarProviderService()
     profile_id = uuid4()
+    job_id = uuid4()
     repository = SimpleNamespace(
-        get_training_job_by_provider_job_id=Mock(return_value={"profile_id": profile_id, "job_id": uuid4()}),
-        update_training_job=Mock(),
-        set_avatar_training=Mock(),
+        get_training_job_by_provider_job_id=Mock(return_value={"profile_id": profile_id, "job_id": job_id}),
+        apply_avatar_training_result=Mock(return_value={"status": "ready", "profile_updated": True}),
     )
     service._profile_repository = repository
     service._sync_tavus_status_to_profile(state=state("ready"), provider_payload={"status": "completed"})
-    assert repository.set_avatar_training.call_args.kwargs["expected_provider_job_id"] == "tavus:test-face"
+    arguments = repository.apply_avatar_training_result.call_args.kwargs
+    assert arguments["profile_id"] == profile_id
+    assert arguments["job_id"] == job_id
+    assert arguments["provider_job_id"] == "tavus:test-face"
+    assert arguments["status"] == "ready"
+    repository.apply_avatar_training_result.assert_called_once()
 
 
 def test_training_lookup_runs_off_the_event_loop():
@@ -201,7 +206,7 @@ def test_training_lookup_runs_off_the_event_loop():
 
 
 def test_status_persistence_runs_off_the_event_loop(monkeypatch):
-    install_client(monkeypatch, response=httpx.Response(200, json={"status": "completed"}))
+    install_client(monkeypatch, response=httpx.Response(200, json={"face_id": "test-face", "status": "completed"}))
     main_thread = threading.get_ident()
     workers = []
     service = AvatarProviderService()

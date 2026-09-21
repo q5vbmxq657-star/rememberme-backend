@@ -13,8 +13,14 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
+from starlette.concurrency import run_in_threadpool
+import httpx
+import psycopg
+from app.services.digital_human_profile_repository import DigitalHumanProfileRepositoryError, StaleVoiceTrainingError
+from app.services.avatar_media_analysis_service import AvatarMediaAnalysisUnavailableError
 from pydantic import BaseModel, Field
+from app.schemas.voice_delivery import VoiceDelivery
 
 from app.services.elevenlabs_voice_service import (
     ElevenLabsVoiceConflictError,
@@ -43,6 +49,7 @@ class ProfileVoiceTTSRequest(BaseModel):
         min_length=1,
         max_length=8_000,
     )
+    delivery: VoiceDelivery | None = None
 
 
 @router.get("/health")
@@ -81,15 +88,12 @@ async def clone_profile_voice(
         require_authenticated_principal
     ),
 ):
-    require_profile_access(
-        principal=principal,
-        profile_id=profile_id,
-    )
     uploads: List[
         VoiceCloneSample
     ] = []
 
     try:
+        await run_in_threadpool(require_profile_access, principal=principal, profile_id=profile_id)
         if len(files) > ElevenLabsVoiceService.max_samples:
             raise ElevenLabsVoiceValidationError("Too many voice samples.")
         total_bytes = 0
@@ -120,7 +124,8 @@ async def clone_profile_voice(
                 )
             )
 
-        service = ElevenLabsVoiceService()
+        service = await run_in_threadpool(ElevenLabsVoiceService)
+        await run_in_threadpool(require_profile_access, principal=principal, profile_id=profile_id)
 
         result = await service.clone_voice(
             profile_id=profile_id,
@@ -137,6 +142,7 @@ async def clone_profile_voice(
             ),
         )
 
+        await run_in_threadpool(require_profile_access, principal=principal, profile_id=profile_id)
         return {
             "job_id": str(result.job_id),
             "profile_id":
@@ -152,8 +158,12 @@ async def clone_profile_voice(
     except ElevenLabsVoiceValidationError as error:
         raise HTTPException(
             status_code=422,
-            detail="This recording cannot be used for voice training.",
+            detail=error.safe_user_message,
         ) from error
+
+    except StaleVoiceTrainingError as error:
+        raise HTTPException(status_code=409,
+            detail="The selected voice changed. Refresh before trying again.") from error
 
     except ElevenLabsVoiceConflictError as error:
         raise HTTPException(
@@ -165,6 +175,9 @@ async def clone_profile_voice(
         ) from error
 
     except ElevenLabsVoiceProviderError as error:
+        if error.status_code == 422 and error.provider_code == "invalid_audio":
+            raise HTTPException(status_code=422,
+                detail="This recording could not be read as audio. Choose another voice recording.") from error
         detail = (
             "Voice creation capacity is temporarily unavailable. "
             "Your recording remains saved."
@@ -178,6 +191,14 @@ async def clone_profile_voice(
             status_code=503,
             detail=detail,
         ) from error
+
+    except AvatarMediaAnalysisUnavailableError as error:
+        raise HTTPException(status_code=503,
+            detail="Recording checks are temporarily unavailable. Please try again shortly.") from error
+
+    except (httpx.HTTPError, psycopg.Error, DigitalHumanProfileRepositoryError, ElevenLabsVoiceError, TimeoutError) as error:
+        raise HTTPException(status_code=503,
+            detail="Voice creation is temporarily unavailable. Please try again shortly.") from error
 
     finally:
         for upload in files:
@@ -193,15 +214,15 @@ async def profile_voice_status(
         require_authenticated_principal
     ),
 ):
-    require_profile_access(
-        principal=principal,
-        profile_id=profile_id,
-    )
-    service = ElevenLabsVoiceService()
-
-    return service.status_for_profile(
-        profile_id
-    )
+    try:
+        await run_in_threadpool(require_profile_access, principal=principal, profile_id=profile_id)
+        service = await run_in_threadpool(ElevenLabsVoiceService)
+        result = await run_in_threadpool(service.status_for_profile, profile_id)
+        await run_in_threadpool(require_profile_access, principal=principal, profile_id=profile_id)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+    except (httpx.HTTPError, psycopg.Error, DigitalHumanProfileRepositoryError, ElevenLabsVoiceError, TimeoutError) as error:
+        raise HTTPException(status_code=503,
+            detail="Voice status is temporarily unavailable. Please try again shortly.") from error
 
 
 @router.post("/tts")
@@ -225,6 +246,7 @@ async def synthesize_profile_voice(
                     request.profile_id
                 ),
                 text=request.text,
+                delivery=request.delivery,
             )
         )
 
@@ -281,6 +303,11 @@ async def delete_profile_voice(
             status_code=status.HTTP_204_NO_CONTENT
         )
 
+    except ElevenLabsVoiceConflictError as error:
+        raise HTTPException(
+            status_code=409,
+            detail="The voice changed during deletion. Refresh before trying again.",
+        ) from error
     except ElevenLabsVoiceError as error:
         raise HTTPException(
             status_code=503,

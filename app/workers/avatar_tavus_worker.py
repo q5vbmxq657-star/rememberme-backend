@@ -8,6 +8,7 @@ install_tavus_worker_audio_output()
 
 
 import json
+import asyncio
 import logging
 import os
 from typing import Any, Dict
@@ -23,6 +24,9 @@ from livekit.agents import (
     cli,
 )
 from livekit.plugins import tavus
+from app.services.avatar_provider_service import AvatarProviderService
+from app.services.runtime_cleanup_repository import RuntimeCleanupRepository
+from app.services.tavus_runtime_correlation import CorrelatedAvatarSession
 
 
 load_dotenv()
@@ -134,11 +138,23 @@ async def entrypoint(
         "LIVEKIT_API_SECRET"
     )
 
-    await ctx.connect()
+    registry = RuntimeCleanupRepository()
+    await asyncio.to_thread(registry.authorize, session_id)
+    await asyncio.to_thread(registry.begin_worker, session_id, profile_id, ctx.room.name)
+    async def request_cleanup():
+        await asyncio.to_thread(registry.request, session_id)
+    ctx.add_shutdown_callback(request_cleanup)
+    try:
+        await ctx.connect()
+    except BaseException:
+        await asyncio.to_thread(registry.request, session_id)
+        raise
 
     agent_session = AgentSession()
 
-    avatar_session = tavus.AvatarSession(
+    avatar_session = CorrelatedAvatarSession(
+        repository=registry,
+        session_id=session_id,
         face_id=face_id,
         pal_id=pal_id or None,
         api_key=tavus_api_key,
@@ -151,37 +167,49 @@ async def entrypoint(
     )
 
     async def cleanup() -> None:
+        await asyncio.to_thread(registry.request, session_id)
+        failures: list[Exception] = []
         try:
             await agent_session.aclose()
-        except Exception:
-            logger.exception(
-                "AgentSession cleanup failed",
-                extra={
-                    "session_id": session_id,
-                },
-            )
+        except Exception as error:
+            failures.append(error)
+
+        try:
+            if not avatar_session.conversation_id:
+                row = await asyncio.to_thread(registry.get, session_id)
+                if row['provider_create_started']:
+                    raise RuntimeError("The remote conversation identity is unavailable for cleanup.")
+            else:
+                await AvatarProviderService().end_tavus_conversation(
+                    conversation_id=avatar_session.conversation_id
+                )
+                await asyncio.to_thread(registry.ended, session_id, avatar_session.conversation_id)
+        except Exception as error:
+            failures.append(error)
 
         try:
             await avatar_session.aclose()
-        except Exception:
-            logger.exception(
-                "Tavus AvatarSession cleanup failed",
-                extra={
-                    "session_id": session_id,
-                },
-            )
+        except Exception as error:
+            failures.append(error)
+        if failures:
+            logger.error("Avatar cleanup requires verification; not all cleanup steps succeeded.")
+            raise RuntimeError("Avatar cleanup could not be verified.") from None
 
     ctx.add_shutdown_callback(cleanup)
 
-    await avatar_session.start(
-        agent_session,
-        room=ctx.room,
-        livekit_url=livekit_url,
-        livekit_api_key=livekit_api_key,
-        livekit_api_secret=(
-            livekit_api_secret
-        ),
-    )
+    try:
+        await asyncio.to_thread(registry.authorize, session_id)
+        await avatar_session.start(
+            agent_session, room=ctx.room, livekit_url=livekit_url,
+            livekit_api_key=livekit_api_key, livekit_api_secret=livekit_api_secret,
+        )
+        await asyncio.to_thread(registry.conversation, session_id, avatar_session.conversation_id)
+        await asyncio.to_thread(registry.authorize, session_id)
+    except BaseException:
+        if avatar_session.conversation_id:
+            await asyncio.to_thread(registry.conversation, session_id, avatar_session.conversation_id)
+        await asyncio.to_thread(registry.request, session_id)
+        raise
 
     agent = Agent(
         instructions=(

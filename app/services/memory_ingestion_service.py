@@ -4,7 +4,11 @@ import base64
 import io
 from pathlib import Path
 from typing import Optional
+from collections.abc import Callable
+from uuid import UUID
+from fastapi import HTTPException
 from openai import OpenAI
+from app.security.purpose_authorization import require_profile_purposes
 
 from app.schemas.memory_ingestion import MemoryIngestionRequest, MemoryIngestionResponse
 from app.services.avatar_media_storage_service import AvatarMediaStorageService
@@ -17,13 +21,26 @@ class MemoryIngestionService:
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is missing.")
 
-        self.client = OpenAI(api_key=api_key)
+        self.client = OpenAI(api_key=api_key, max_retries=0, timeout=30)
         self.media = AvatarMediaStorageService()
         self.vision_model = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
         self.reasoning_model = os.getenv("OPENAI_MEMORY_ANALYSIS_MODEL", "gpt-4o-mini")
         self.transcribe_model = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
 
     def ingest(self, request: MemoryIngestionRequest) -> MemoryIngestionResponse:
+        try:
+            consent = require_profile_purposes(request.profile_id, {"memory_context"})
+
+            def authorize():
+                require_profile_purposes(request.profile_id, {"memory_context"}, expected_revision=consent.revision)
+
+            result = self._ingest(request, authorize=authorize)
+            authorize()
+            return result
+        finally:
+            self.client.close()
+
+    def _ingest(self, request: MemoryIngestionRequest, *, authorize: Callable[[], None]) -> MemoryIngestionResponse:
         transcript = None
         visual_description = None
 
@@ -31,22 +48,29 @@ class MemoryIngestionService:
             transcript = request.text.strip()
         else:
             metadata = self.media.get_metadata(request.asset_id)
+            try:
+                if UUID(str(metadata.profile_id)) != UUID(request.profile_id):
+                    raise ValueError("Profile mismatch")
+            except (ValueError, TypeError, AttributeError) as error:
+                raise HTTPException(404, "Memory source not found.") from error
             path = Path(metadata.storage_path)
 
             if metadata.content_type.startswith("audio/"):
-                transcript = self._transcribe(path)
+                transcript = self._transcribe(path, authorize=authorize)
 
             elif metadata.content_type.startswith("image/"):
                 visual_description = self._analyze_image(
                     path=path,
                     content_type=metadata.content_type,
-                    user_context=request.user_context or ""
+                    user_context=request.user_context or "",
+                    authorize=authorize,
                 )
 
             elif metadata.content_type.startswith("video/"):
                 visual_description = self._analyze_video(
                     path=path,
                     user_context=request.user_context or "",
+                    authorize=authorize,
                 )
 
         original_text = self._build_original_text(
@@ -62,6 +86,7 @@ class MemoryIngestionService:
             transcript=transcript,
             visual_description=visual_description,
             original_text=original_text,
+            authorize=authorize,
         )
 
         avatar_memory_text = self._clean_string(
@@ -238,8 +263,9 @@ class MemoryIngestionService:
 
         return "I remember this, but the preserved detail is incomplete."
 
-    def _transcribe(self, path: Path) -> str:
+    def _transcribe(self, path: Path, *, authorize: Callable[[], None]) -> str:
         with path.open("rb") as audio_file:
+            authorize()
             result = self.client.audio.transcriptions.create(
                 model=self.transcribe_model,
                 file=audio_file
@@ -247,10 +273,12 @@ class MemoryIngestionService:
 
         return result.text.strip()
 
-    def _analyze_image(self, path: Path, content_type: str, user_context: str) -> str:
+    def _analyze_image(self, path: Path, content_type: str, user_context: str, *, authorize: Callable[[], None]) -> str:
         encoded = base64.b64encode(path.read_bytes()).decode("utf-8")
 
+        authorize()
         response = self.client.responses.create(
+            store=False,
             model=self.vision_model,
             input=[
                 {
@@ -280,7 +308,7 @@ class MemoryIngestionService:
 
         return response.output_text.strip()
 
-    def _analyze_video(self, path: Path, user_context: str) -> str:
+    def _analyze_video(self, path: Path, user_context: str, *, authorize: Callable[[], None]) -> str:
         import av
 
         frames = []
@@ -324,7 +352,9 @@ class MemoryIngestionService:
             for encoded in frames
         )
 
+        authorize()
         response = self.client.responses.create(
+            store=False,
             model=self.vision_model,
             input=[
                 {
@@ -348,6 +378,7 @@ class MemoryIngestionService:
         transcript: Optional[str],
         visual_description: Optional[str],
         original_text: str,
+        authorize: Callable[[], None],
     ) -> dict:
         prompt = f"""
 You are the AI ingestion engine for RememberMeAI.
@@ -423,7 +454,9 @@ Return JSON:
 }}
 """
 
+        authorize()
         response = self.client.responses.create(
+            store=False,
             model=self.reasoning_model,
             input=[
                 {"role": "system", "content": "You return only strict JSON. No markdown. No commentary."},

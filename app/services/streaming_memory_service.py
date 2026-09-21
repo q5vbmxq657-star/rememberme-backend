@@ -1,5 +1,6 @@
 import json
-from collections.abc import Generator
+from time import perf_counter
+from collections.abc import Callable, Generator
 
 from app.schemas.emotional_reasoning import EmotionalReasoningRequest
 from app.schemas.streaming_memory import StreamingMemoryChatRequest
@@ -12,14 +13,23 @@ from app.services.memory_conversation_prompt_builder import MemoryConversationPr
 class StreamingMemoryService:
     def __init__(self):
         self.client = make_memory_chat_openai_client()
-        self.orchestration = AIOrchestrationService()
-        self.emotional_reasoning_service = EmotionalReasoningService()
+        try:
+            self.orchestration = AIOrchestrationService()
+            self.emotional_reasoning_service = EmotionalReasoningService()
+        except BaseException:
+            self.client.close()
+            raise
 
     def stream_response(
         self,
         request: StreamingMemoryChatRequest,
+        *,
+        authorize: Callable[[], None],
     ) -> Generator[str, None, None]:
+        started_at = perf_counter()
+        authorize()
         route = self.orchestration.route(AITaskType.MEMORY_CHAT)
+        assessment_started_at = perf_counter()
         assessment = self.emotional_reasoning_service.assess(
             EmotionalReasoningRequest(
                 user_message=request.user_message,
@@ -28,6 +38,8 @@ class StreamingMemoryService:
                 relationship=request.relationship,
             )
         )
+        assessment_ms = round((perf_counter() - assessment_started_at) * 1000, 3)
+        authorize()
         emotional_mode = request.emotional_mode or assessment.recommended_mode
 
         yield self._event(
@@ -37,6 +49,7 @@ class StreamingMemoryService:
                 "model": route.model,
                 "latency_profile": route.latency_profile.value,
                 "emotional_mode": emotional_mode,
+                "timing_ms": {"assessment": assessment_ms},
                 "emotional_assessment": {
                     "emotional_intensity": assessment.emotional_intensity,
                     "dependency_risk": assessment.dependency_risk,
@@ -48,8 +61,11 @@ class StreamingMemoryService:
         )
 
         if emotional_mode == "crisis_redirect":
+            first_delta_ms = round((perf_counter() - started_at) * 1000, 3)
             yield self._event("delta", {"text": self._crisis_response(request.user_message)})
-            yield self._event("done", {"status": "completed", "mode": emotional_mode})
+            yield self._event("done", {"status": "completed", "mode": emotional_mode,
+                "timing_ms": {"assessment": assessment_ms, "first_delta": first_delta_ms,
+                              "total": round((perf_counter() - started_at) * 1000, 3)}})
             return
 
         prompt = MemoryConversationPromptBuilder.build(
@@ -63,10 +79,13 @@ class StreamingMemoryService:
         )
 
         emitted_text = False
-        emitted_done = False
+        first_delta_ms = None
 
+        stream = None
         try:
+            authorize()
             stream = self.client.responses.create(
+                store=False,
                 model=route.model,
                 input=[
                     {"role": "system", "content": prompt},
@@ -81,23 +100,31 @@ class StreamingMemoryService:
                 event_type = getattr(event, "type", "")
                 if event_type == "response.output_text.delta":
                     delta = getattr(event, "delta", "")
+                    if not isinstance(delta, str):
+                        raise RuntimeError("The model returned an invalid text delta.")
                     if delta:
-                        emitted_text = True
+                        # The canonical route checks authorization after next()
+                        # returns and before disclosing each emitted SSE frame.
+                        if first_delta_ms is None and delta.strip():
+                            first_delta_ms = round((perf_counter() - started_at) * 1000, 3)
+                        emitted_text = emitted_text or bool(delta.strip())
                         yield self._event("delta", {"text": delta})
                 elif event_type == "response.completed":
-                    emitted_done = True
+                    if not emitted_text:
+                        raise RuntimeError("The model returned an empty streaming response.")
+                    stream.close()
+                    stream = None
                     yield self._event(
                         "done",
-                        {"status": "completed", "mode": emotional_mode},
+                        {"status": "completed", "mode": emotional_mode,
+                         "timing_ms": {"assessment": assessment_ms, "first_delta": first_delta_ms,
+                                       "total": round((perf_counter() - started_at) * 1000, 3)}},
                     )
+                    return
+                elif event_type in {"response.failed", "response.incomplete", "error"}:
+                    raise RuntimeError("The model did not complete its response.")
 
-            if not emitted_text:
-                raise RuntimeError("The model returned an empty streaming response.")
-            if not emitted_done:
-                yield self._event(
-                    "done",
-                    {"status": "completed", "mode": emotional_mode},
-                )
+            raise RuntimeError("The model stream ended without completion.")
         except Exception:
             yield self._event(
                 "error",
@@ -106,6 +133,15 @@ class StreamingMemoryService:
                     "message": "We could not complete that response. Please try again.",
                 },
             )
+        finally:
+            if stream is not None:
+                stream.close()
+
+    def close(self) -> None:
+        try:
+            self.client.close()
+        finally:
+            self.emotional_reasoning_service.close()
 
     @staticmethod
     def _crisis_response(user_message: str) -> str:

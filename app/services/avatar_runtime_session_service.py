@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import threading
+import psycopg
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from time import perf_counter
 from typing import Dict, Optional
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import UploadFile
 
@@ -37,6 +39,7 @@ from app.services.digital_human_profile_repository import (
     DigitalHumanProfileNotFoundError,
     DigitalHumanProfileRepository,
     DigitalHumanProfileRepositoryError,
+    StaleAvatarTrainingError,
 )
 
 
@@ -132,6 +135,7 @@ class AvatarRuntimeSessionService:
             str,
             StoredRuntimeSession,
         ] = {}
+        self._cleanup_tasks: dict[str, asyncio.Task] = {}
 
         self.provider_registry = (
             AvatarRuntimeProviderRegistry()
@@ -163,7 +167,9 @@ class AvatarRuntimeSessionService:
             )
         except DigitalHumanProfileNotFoundError:
             digital_human_profile = None
-        except DigitalHumanProfileRepositoryError as error:
+        except StaleAvatarTrainingError as error:
+            raise AvatarRuntimeConflictError('Avatar material changed. Please start the call again.') from error
+        except (DigitalHumanProfileRepositoryError, psycopg.Error) as error:
             raise AvatarRuntimeProviderUnavailableError(
                 "Digital human profile storage is unavailable."
             ) from error
@@ -189,6 +195,8 @@ class AvatarRuntimeSessionService:
                 "This profile has no production-ready Tavus face."
             )
 
+        binding = self._avatar_binding(digital_human_profile)
+
         try:
             remote = (
                 await self.tavus_adapter
@@ -206,6 +214,14 @@ class AvatarRuntimeSessionService:
                     ),
                 )
             )
+
+            self._require_avatar_binding(request.profile_id, binding)
+            if remote.provider_avatar_id != digital_human_profile.avatar_replica_id or any(
+                remote.metadata.get(key) != 'true' for key in (
+                    'remote_session_verified', 'avatar_participant_verified', 'avatar_video_track_verified'
+                )
+            ):
+                raise AvatarRuntimeProviderUnavailableError('Animated avatar video could not be verified.')
 
             session = AvatarRuntimeSessionResponse(
                 session_id=session_id,
@@ -225,10 +241,15 @@ class AvatarRuntimeSessionService:
             )
 
         except TavusRuntimeError as error:
+            await self._cleanup_failed_activation(session_id)
             raise AvatarRuntimeProviderUnavailableError(
                 "Tavus activation failed: "
                 f"{error}"
             ) from error
+        except BaseException as error:
+            await self._cleanup_failed_activation(session_id)
+            self._map_activation_storage_error(error)
+            raise
 
         with self._lock:
             self._sessions[session_id] = (
@@ -239,12 +260,11 @@ class AvatarRuntimeSessionService:
 
         try:
             self.profile_repository.mark_runtime_verified(
-                request.profile_id
+                request.profile_id, expected_profile=digital_human_profile
             )
-        except DigitalHumanProfileRepositoryError:
-            await self.tavus_adapter.close_session(
-                session.session_id
-            )
+            self._require_avatar_binding(request.profile_id, binding)
+        except BaseException as error:
+            await self._cleanup_failed_activation(session.session_id)
 
             with self._lock:
                 self._sessions.pop(
@@ -252,11 +272,37 @@ class AvatarRuntimeSessionService:
                     None,
                 )
 
-            raise AvatarRuntimeProviderUnavailableError(
-                "The avatar session could not be verified persistently."
-            )
+            self._map_activation_storage_error(error)
+            raise
 
         return session
+
+    @staticmethod
+    def _map_activation_storage_error(error: BaseException) -> None:
+        if isinstance(error, (StaleAvatarTrainingError, DigitalHumanProfileNotFoundError)):
+            raise AvatarRuntimeConflictError('Avatar material changed. Please start the call again.') from error
+        if isinstance(error, (DigitalHumanProfileRepositoryError, psycopg.Error)):
+            raise AvatarRuntimeProviderUnavailableError('Avatar verification is temporarily unavailable.') from error
+
+    async def _cleanup_failed_activation(self, session_id: str) -> None:
+        try:
+            await self.tavus_adapter.close_session(session_id)
+        except BaseException:
+            # Adapter retains the handle and durable registry for retry. Do not
+            # replace the activation error with a secondary cleanup failure.
+            logging.getLogger(__name__).warning('Avatar activation cleanup remains pending.')
+
+    @staticmethod
+    def _avatar_binding(profile) -> tuple:
+        return (profile.avatar_provider, profile.avatar_replica_id,
+                profile.avatar_persona_id, profile.avatar_training_job_id,
+                profile.training_version, profile.avatar_training_status,
+                profile.consent_verified)
+
+    def _require_avatar_binding(self, profile_id: UUID, expected: tuple) -> None:
+        current = self.profile_repository.require(profile_id)
+        if not current.has_runtime_avatar or self._avatar_binding(current) != expected:
+            raise AvatarRuntimeConflictError('Avatar material changed. Please start the call again.')
 
     async def render_speech(
         self,
@@ -387,17 +433,26 @@ class AvatarRuntimeSessionService:
             )
 
         if stored is None:
-            raise AvatarRuntimeSessionNotFoundError(
-                "The avatar runtime session does not exist."
-            )
+            repository = getattr(self.tavus_adapter, 'cleanup_repository', None)
+            row = await asyncio.to_thread(repository.get, clean_session_id) if repository else None
+            if not row:
+                raise AvatarRuntimeSessionNotFoundError("The avatar runtime session does not exist.")
+            try:
+                await self.tavus_adapter.close_session(clean_session_id)
+            except TavusRuntimeError as error:
+                raise AvatarRuntimeProviderUnavailableError("Remote cleanup is pending verification.") from error
+            return AvatarRuntimeOperationResponse(session_id=clean_session_id, status='closed', updated_at=self._utc_now())
 
         if (
             stored.session.provider
             == AvatarRuntimeProvider.TAVUS
         ):
-            await self.tavus_adapter.close_session(
-                clean_session_id
-            )
+            try:
+                await self.tavus_adapter.close_session(clean_session_id)
+            except TavusRuntimeError as error:
+                raise AvatarRuntimeProviderUnavailableError(
+                    "The remote avatar session could not be closed."
+                ) from error
 
         with self._lock:
             self._sessions.pop(
@@ -410,6 +465,18 @@ class AvatarRuntimeSessionService:
             status="closed",
             updated_at=self._utc_now(),
         )
+
+    def require_session_profile_id(self, session_id: str) -> UUID:
+        # Cleanup must remain possible after expiry; do not evict the session here.
+        with self._lock:
+            stored = self._sessions.get(session_id.strip())
+        if stored is None:
+            repository = getattr(self.tavus_adapter, 'cleanup_repository', None)
+            row = repository.get(session_id.strip()) if repository else None
+            if row:
+                return row['profile_id']
+            raise AvatarRuntimeSessionNotFoundError("The avatar runtime session does not exist.")
+        return stored.session.profile_id
 
     def provider_readiness_snapshot(
         self,
@@ -542,12 +609,6 @@ class AvatarRuntimeSessionService:
             if not expired_sessions:
                 return
 
-            for session in expired_sessions:
-                self._sessions.pop(
-                    session.session_id,
-                    None,
-                )
-
         for session in expired_sessions:
             if (
                 session.provider
@@ -555,13 +616,24 @@ class AvatarRuntimeSessionService:
             ):
                 try:
                     loop = asyncio.get_running_loop()
-                    loop.create_task(
-                        self.tavus_adapter.close_session(
-                            session.session_id
-                        )
-                    )
                 except RuntimeError:
-                    pass
+                    continue
+                with self._lock:
+                    if session.session_id in self._cleanup_tasks:
+                        continue
+                    task = loop.create_task(self.close_session(session.session_id))
+                    self._cleanup_tasks[session.session_id] = task
+                task.add_done_callback(
+                    lambda completed, identifier=session.session_id:
+                        self._cleanup_finished(identifier, completed)
+                )
+
+    def _cleanup_finished(self, session_id: str, task: asyncio.Task) -> None:
+        with self._lock:
+            if self._cleanup_tasks.get(session_id) is task:
+                self._cleanup_tasks.pop(session_id, None)
+        if not task.cancelled() and task.exception() is not None:
+            logging.getLogger(__name__).warning("Expired avatar cleanup remains unverified and retryable.")
 
     @staticmethod
     def _utc_now() -> datetime:

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from fastapi.responses import JSONResponse
 
 from fastapi import (
     APIRouter,
@@ -275,9 +276,14 @@ async def delete_account(
 ) -> Response:
     """Delete the authenticated account and every profile-owned artifact."""
     try:
-        await AccountErasureService().erase_account(
+        result = await AccountErasureService().erase_account(
             user_id=principal.user.user_id
         )
+        if result == 'deletion_pending':
+            return JSONResponse(status_code=202, content={'status': 'deletion_pending'},
+                                headers={'Cache-Control': 'no-store'})
+        if result != 'completed':
+            raise RuntimeError('Account deletion outcome is unverified.')
     except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

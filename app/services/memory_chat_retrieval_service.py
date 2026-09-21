@@ -3,13 +3,34 @@ from __future__ import annotations
 import os
 import logging
 from collections.abc import Callable, Sequence
+from fastapi import HTTPException
 
 from app.schemas.memory import MemoryItem
+from app.schemas.persona import PersonaMemoryItem
 from app.schemas.vector_memory import SearchMemoryRequest, SearchMemoryResult
-from app.services.pgvector_memory_service import PGVectorMemoryService
+from app.services.pgvector_memory_service import PGVectorMemoryService, PGVectorStaleIndexError
 
 
 logger = logging.getLogger(__name__)
+
+
+class MemoryEvidence(list):
+    """List-compatible evidence with server-only provenance, never serialized as content."""
+
+    def __init__(self, items, *, profile_id: str, verify: Callable[[], None], confirmed_address: str | None = None):
+        super().__init__(items)
+        self.profile_id = profile_id
+        self.verify = verify
+        self.confirmed_address = confirmed_address
+
+
+def require_current_memory_evidence(items, *, profile_id: str) -> None:
+    if isinstance(items, MemoryEvidence):
+        if items.profile_id.lower() != str(profile_id).lower():
+            raise PGVectorStaleIndexError("Memory evidence belongs to another profile.")
+        items.verify()
+    elif items:
+        raise PGVectorStaleIndexError("Memory evidence has no server provenance.")
 
 
 class MemoryChatRetrievalService:
@@ -20,6 +41,21 @@ class MemoryChatRetrievalService:
         service_factory: Callable[[], PGVectorMemoryService] = PGVectorMemoryService,
     ) -> None:
         self._service_factory = service_factory
+
+    def persona_memories(self, *, profile_id: str) -> list[PersonaMemoryItem]:
+        # Unlike conversational retrieval, failed publication must not overwrite a persona.
+        service = self._service_factory()
+        version = service.evidence_version(profile_id)
+        results = service.list_profile_memories(
+            profile_id=profile_id, limit=100, require_published=True,
+        )
+        evidence = MemoryEvidence([PersonaMemoryItem(
+            title=item.title, summary=item.summary, type=item.type,
+            emotional_tags=item.emotional_tags,
+        ) for item in results], profile_id=profile_id,
+            verify=lambda: service.require_evidence_version(profile_id, version))
+        require_current_memory_evidence(evidence, profile_id=profile_id)
+        return evidence
 
     def retrieve(
         self,
@@ -39,6 +75,7 @@ class MemoryChatRetrievalService:
 
         try:
             vector_service = self._service_factory()
+            version = vector_service.evidence_version(clean_profile_id)
         except Exception:
             logger.warning(
                 "Profile-scoped memory retrieval unavailable; continuing without evidence."
@@ -53,6 +90,9 @@ class MemoryChatRetrievalService:
                     limit=max(10, limit),
                 )
             ).results
+        except (HTTPException, PGVectorStaleIndexError):
+            # Permission and publication fences must never become a fallback read.
+            raise
         except Exception:
             used_lexical_fallback = True
             try:
@@ -71,12 +111,16 @@ class MemoryChatRetrievalService:
                 )
                 return []
 
-        return self._rank(
+        evidence = MemoryEvidence(self._rank(
             results=results,
             query=query,
             limit=limit,
             used_lexical_fallback=used_lexical_fallback,
-        )
+        ), profile_id=clean_profile_id,
+            confirmed_address=vector_service.confirmed_profile_address(clean_profile_id),
+            verify=lambda: vector_service.require_evidence_version(clean_profile_id, version))
+        require_current_memory_evidence(evidence, profile_id=clean_profile_id)
+        return evidence
 
     def _rank(
         self,
@@ -116,6 +160,7 @@ class MemoryChatRetrievalService:
                 type=item.type,
                 emotional_tags=item.emotional_tags,
                 confidence_score=item.confidence_score,
+                confirmed_address=item.confirmed_address,
             )
             for score, item in scored
             if score >= min_similarity

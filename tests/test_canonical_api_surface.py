@@ -1,7 +1,51 @@
 from pathlib import Path
+import asyncio
+from io import BytesIO
 
-from app.main import app
+from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi.exceptions import RequestValidationError
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field
+
+from app.main import app, private_request_validation_error
 from app.routes.realtime import RealtimeAvatarSessionResponse
+
+
+def test_validation_errors_never_echo_private_request_data():
+    class PrivateRequest(BaseModel):
+        text: str = Field(max_length=3)
+
+    test_app = FastAPI()
+    test_app.add_exception_handler(RequestValidationError, private_request_validation_error)
+
+    @test_app.post("/private")
+    def private_request(payload: PrivateRequest):
+        return {"ok": True}
+
+    private_text = "PRIVATE_MEMORY_AND_TOKEN_MUST_NOT_BE_ECHOED"
+    response = TestClient(test_app).post("/private", json={"text": private_text})
+    assert response.status_code == 422
+    assert private_text not in response.text
+    assert "input" not in response.text
+    assert response.json()["detail"] == "The request contains invalid or missing fields."
+
+
+def test_invalid_speech_metadata_never_echoes_conversation_and_closes_file():
+    from app.routes.avatar_runtime import render_avatar_runtime_speech
+
+    audio = UploadFile(file=BytesIO(b"test"), filename="test.wav")
+    private_text = "PRIVATE_SPEECH_CONTENT_MUST_NOT_BE_ECHOED"
+    try:
+        asyncio.run(render_avatar_runtime_speech(
+            session_id="test", metadata='{"text":"' + private_text + '"}',
+            audio=audio, principal=None,
+        ))
+        raise AssertionError("Invalid metadata must be rejected")
+    except HTTPException as error:
+        assert error.status_code == 422
+        assert private_text not in str(error.detail)
+        assert "errors" not in error.detail
+    assert audio.file.closed
 
 
 REQUIRED_PRODUCT_PATHS = {

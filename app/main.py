@@ -2,10 +2,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
+import asyncio
+import logging
+from contextlib import asynccontextmanager, suppress
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 from app.routes.memory import router as memory_router
 from app.routes.voice import router as voice_router
@@ -29,14 +34,64 @@ from app.routes.memory_retrieval import router as memory_retrieval_router
 from app.routes.elevenlabs_voice import router as elevenlabs_voice_router
 from app.routes.auth import router as auth_router
 from app.routes.profiles import router as profiles_router
+from app.routes.profile_erasure import router as profile_erasure_router
 from app.routes.podcast import public_router as podcast_public_router, router as podcast_router
 from app.security.client_auth import require_client_key
 from app.security.user_auth import require_authenticated_principal
 
+@asynccontextmanager
+async def lifespan(_app):
+    from app.services.runtime_cleanup_service import RuntimeCleanupService
+    from app.services.erasure_recovery_service import run_erasure_recovery
+    from app.services.openai_realtime_cleanup_service import OpenAIRealtimeCleanupService
+
+    async def run_runtime_recovery():
+        while True:
+            try:
+                await RuntimeCleanupService().run()
+            except Exception:
+                logging.getLogger(__name__).error("Runtime cleanup initialization will be retried.")
+            await asyncio.sleep(5)
+
+    recovery = asyncio.create_task(run_runtime_recovery())
+    erasure_recovery = asyncio.create_task(run_erasure_recovery())
+    async def run_openai_recovery():
+        while True:
+            try:
+                await OpenAIRealtimeCleanupService().run()
+            except Exception:
+                logging.getLogger(__name__).error("OpenAI cleanup initialization will be retried.")
+            await asyncio.sleep(5)
+
+    openai_recovery = asyncio.create_task(run_openai_recovery())
+    try:
+        yield
+    finally:
+        recovery.cancel()
+        erasure_recovery.cancel()
+        openai_recovery.cancel()
+        with suppress(asyncio.CancelledError):
+            await recovery
+        with suppress(asyncio.CancelledError):
+            await erasure_recovery
+        with suppress(asyncio.CancelledError):
+            await openai_recovery
+
+
 app = FastAPI(
     title="RememberMeAI Backend",
     version="0.16.0",
+    lifespan=lifespan,
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def private_request_validation_error(_request, _error):
+    # Pydantic errors can contain the complete input, including voice text or credentials.
+    return JSONResponse(
+        status_code=422,
+        content={"detail": "The request contains invalid or missing fields."},
+    )
 
 
 def _podcast_web_origin() -> str | None:
@@ -73,6 +128,7 @@ app.include_router(
     prefix="/v1/profiles",
     tags=["profiles"],
 )
+app.include_router(profile_erasure_router, prefix="/v1/profiles", tags=["profiles"])
 
 app.include_router(memory_router, prefix="/v1/memory", tags=["memory"], dependencies=authenticated)
 app.include_router(avatar_state_router, prefix="/v1/avatar-state", dependencies=authenticated)

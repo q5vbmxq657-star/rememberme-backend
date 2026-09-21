@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
+from contextlib import nullcontext
 from uuid import uuid4
 
 from app.services.account_erasure_service import AccountErasureService
@@ -13,6 +14,9 @@ class IdentityRepository:
 
     def get_apple_refresh_credential(self, *, user_id):
         return b"encrypted"
+
+    def get_user(self, *, user_id):
+        return SimpleNamespace(user_id=user_id)
 
     def delete_user_after_profile_erasure(self, *, user_id):
         self.deleted_user_id = user_id
@@ -58,6 +62,27 @@ class AppleVerifier:
         self.revoked = token
 
 
+class ErasureJournal:
+    def __init__(self):
+        self.current = 'profiles'
+
+    def begin(self, user_id):
+        pass
+
+    def claim(self, user_id):
+        return nullcontext(True)
+
+    def stage(self, user_id):
+        return self.current
+
+    def advance(self, user_id, expected, stage):
+        assert self.current == expected
+        self.current = stage
+
+    def retry(self, user_id):
+        pass
+
+
 def test_account_erasure_orders_profiles_before_identity_deletion():
     user_id = uuid4()
     profile_ids = [uuid4(), uuid4()]
@@ -70,9 +95,10 @@ def test_account_erasure_orders_profiles_before_identity_deletion():
         profile_erasure_service=profiles,
         apple_verifier=apple,
         apple_cipher=Cipher(),
+        erasure_repository=ErasureJournal(),
     )
 
-    asyncio.run(service.erase_account(user_id=user_id))
+    assert asyncio.run(service.erase_account(user_id=user_id)) == 'completed'
 
     assert [call[0] for call in profiles.calls] == profile_ids
     assert all(str(user_id) in call[1] for call in profiles.calls)
@@ -89,13 +115,9 @@ def test_account_identity_survives_incomplete_profile_erasure():
         profile_erasure_service=FailingProfileErasure(),
         apple_verifier=AppleVerifier(),
         apple_cipher=Cipher(),
+        erasure_repository=ErasureJournal(),
     )
 
-    try:
-        asyncio.run(service.erase_account(user_id=user_id))
-    except RuntimeError:
-        pass
-    else:
-        raise AssertionError("Incomplete erasure must fail closed.")
+    assert asyncio.run(service.erase_account(user_id=user_id)) == 'deletion_pending'
 
     assert identity.deleted_user_id is None

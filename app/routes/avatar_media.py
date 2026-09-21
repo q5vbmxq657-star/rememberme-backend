@@ -35,6 +35,7 @@ from app.services.avatar_evidence_repository import (
 )
 from app.services.avatar_media_analysis_service import (
     AvatarMediaAnalysisError,
+    AvatarMediaAnalysisUnavailableError,
     AvatarMediaAnalysisService,
 )
 from app.services.avatar_media_evidence_bridge_service import (
@@ -42,6 +43,7 @@ from app.services.avatar_media_evidence_bridge_service import (
     AvatarMediaEvidenceBridgeService,
 )
 from app.services.avatar_media_storage_service import (
+    AvatarMediaAssetNotFoundError,
     AvatarMediaStorageService,
 )
 
@@ -192,7 +194,9 @@ async def upload_avatar_media(
 
         raise HTTPException(
             status_code=(
-                status.HTTP_422_UNPROCESSABLE_ENTITY
+                status.HTTP_503_SERVICE_UNAVAILABLE
+                if isinstance(error, AvatarMediaAnalysisUnavailableError)
+                else status.HTTP_422_UNPROCESSABLE_ENTITY
             ),
             detail=error.user_message,
         ) from error
@@ -444,6 +448,9 @@ def delete_avatar_media(
         return Response(status_code=status.HTTP_204_NO_CONTENT)
     except HTTPException:
         raise
+    except AvatarMediaAssetNotFoundError:
+        return Response(status_code=status.HTTP_204_NO_CONTENT,
+                        headers={"Cache-Control": "no-store"})
     except AvatarMediaEvidenceBridgeError as error:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -456,8 +463,8 @@ def delete_avatar_media(
         ) from error
     except Exception as error:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="This media no longer exists.",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="This media could not be deleted securely. Please try again.",
         ) from error
 
 @public_router.get(
@@ -467,6 +474,8 @@ def download_avatar_media(
     asset_id: str,
     expires: int,
     signature: str,
+    consent_revision: int | None = None,
+    purpose: str | None = None,
 ):
     try:
         service = (
@@ -479,6 +488,8 @@ def download_avatar_media(
                 asset_id=asset_id,
                 expires=expires,
                 signature=signature,
+                consent_revision=consent_revision,
+                purpose=purpose,
             )
         )
 
@@ -488,6 +499,7 @@ def download_avatar_media(
                 metadata.content_type
             ),
             filename=metadata.filename,
+            headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
         )
 
     except Exception as error:

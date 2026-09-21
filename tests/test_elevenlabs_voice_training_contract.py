@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from uuid import uuid4
 
 import httpx
+import pytest
+from fastapi import HTTPException
+from test_elevenlabs_voice_fallback_contract import valid_voice_consent
 
 from app.models.digital_human_profile import DigitalHumanProfile
 from app.services.elevenlabs_voice_service import (
@@ -90,6 +93,18 @@ class CloneRepository:
         self.job_updates.append((job_id, kwargs))
         return {"job_id": job_id, **kwargs}
 
+    def begin_voice_training(self, profile_id, job_id, expected_consent_revision):
+        assert profile_id == self.profile.profile_id
+        assert expected_consent_revision == 7
+        return {"submission_claimed": True}
+
+    def apply_voice_training_result(self, *, profile_id, job_id, status, voice_id=None, **kwargs):
+        job = self.update_training_job(job_id, status=status, provider_job_id=voice_id, **kwargs)
+        if status == "ready":
+            self.set_voice_training(profile_id, provider="elevenlabs", status=status,
+                provider_job_id=str(job_id), expected_job_id=str(job_id), voice_id=voice_id)
+        return {**job, "voice_activated": status == "ready"}
+
 
 class ProviderResponse:
     status_code = 200
@@ -129,10 +144,12 @@ def clone_service(repository: CloneRepository) -> ElevenLabsVoiceService:
     service.max_sample_bytes = 25 * 1024 * 1024
     service.max_total_bytes = 100 * 1024 * 1024
     service.min_total_bytes = 16
+    # State-machine tests isolate decoded-audio validation, covered separately.
+    service._validate_sample_audio = lambda samples: None
     return service
 
 
-def test_provider_rejected_job_is_reclaimed_and_submitted_once(monkeypatch):
+def test_provider_rejected_job_is_reclaimed_and_submitted_once(monkeypatch, valid_voice_consent):
     repository = CloneRepository(retryable=True)
     service = clone_service(repository)
     ProviderClient.post_count = 0
@@ -162,9 +179,10 @@ def test_provider_rejected_job_is_reclaimed_and_submitted_once(monkeypatch):
     assert result.status == "ready"
     assert repository.job_updates[-1][1]["status"] == "ready"
     assert repository.voice_updates[-1][1]["status"] == "ready"
+    assert repository.voice_updates[-1][1]["expected_job_id"] == str(repository.job_id)
 
 
-def test_ambiguous_failed_job_is_not_resubmitted(monkeypatch):
+def test_ambiguous_failed_job_is_not_resubmitted(monkeypatch, valid_voice_consent):
     repository = CloneRepository(retryable=False)
     service = clone_service(repository)
     ProviderClient.post_count = 0
@@ -242,6 +260,9 @@ class ReplacementRepository(CloneRepository):
         assert profile_id == self.profile.profile_id
         return self.profile
 
+    def get_voice_status_snapshot(self, profile_id):
+        return asdict(self.get(profile_id)), list(self.jobs.values())[-1] if self.jobs else None
+
     def create_training_job(self, **kwargs):
         key = kwargs["idempotency_key"]
         if key in self.jobs:
@@ -276,7 +297,7 @@ class ReplacementProviderClient(ProviderClient):
             type(self).samples.append(kwargs["files"][0][1][1])
             return httpx.Response(
                 200,
-                json={"voice_id": f"trained-voice-{len(type(self).samples)}"},
+                json={"voice_id": f"trained-voice-{len(type(self).samples)}", "requires_verification": False},
             )
         type(self).preview_voice_ids.append(url.rsplit("/", 1)[-1])
         return httpx.Response(200, content=b"generated-preview-audio")
@@ -305,7 +326,7 @@ def submit_sample(service, *, asset_id, audio):
     ))
 
 
-def test_uploaded_voice_is_replaced_by_recording_and_preview_uses_new_voice(monkeypatch):
+def test_uploaded_voice_is_replaced_by_recording_and_preview_uses_new_voice(monkeypatch, valid_voice_consent):
     repository, service = replacement_service(monkeypatch)
     uploaded = submit_sample(
         service, asset_id="uploaded-asset", audio=b"original-uploaded-voice",
@@ -330,7 +351,7 @@ def test_uploaded_voice_is_replaced_by_recording_and_preview_uses_new_voice(monk
     assert preview.audio_stream.getvalue() == b"generated-preview-audio"
 
 
-def test_retry_of_same_recording_reuses_real_training_job(monkeypatch):
+def test_retry_of_same_recording_reuses_real_training_job(monkeypatch, valid_voice_consent):
     repository, service = replacement_service(monkeypatch)
     first = submit_sample(service, asset_id="recording", audio=b"clear-recorded-voice")
     retry = submit_sample(service, asset_id="recording", audio=b"clear-recorded-voice")
@@ -340,22 +361,22 @@ def test_retry_of_same_recording_reuses_real_training_job(monkeypatch):
     assert ReplacementProviderClient.samples == [b"clear-recorded-voice"]
 
 
-def test_retry_of_previous_sample_does_not_restore_previous_profile_voice(monkeypatch):
+def test_retry_of_previous_sample_does_not_restore_previous_profile_voice(monkeypatch, valid_voice_consent):
     repository, service = replacement_service(monkeypatch)
     first = submit_sample(service, asset_id="upload", audio=b"original-uploaded-voice")
     latest = submit_sample(service, asset_id="recording", audio=b"new-recorded-voice")
-    replay = submit_sample(service, asset_id="upload", audio=b"original-uploaded-voice")
+    with pytest.raises(ElevenLabsVoiceConflictError):
+        submit_sample(service, asset_id="upload", audio=b"original-uploaded-voice")
     asyncio.run(service.synthesize_for_profile(
         profile_id=repository.profile.profile_id, text="Hello again.",
     ))
 
-    assert replay == first
     assert repository.profile.voice_id == latest.voice_id
     assert len(ReplacementProviderClient.samples) == 2
     assert ReplacementProviderClient.preview_voice_ids == ["trained-voice-2"]
 
 
-def test_changed_audio_is_not_deduplicated_by_profile_or_filename(monkeypatch):
+def test_changed_audio_is_not_deduplicated_by_profile_or_filename(monkeypatch, valid_voice_consent):
     repository, service = replacement_service(monkeypatch)
     first = submit_sample(service, asset_id="same-key", audio=b"first-recorded-voice")
     second = submit_sample(service, asset_id="same-key", audio=b"second-recorded-voice")
@@ -365,7 +386,7 @@ def test_changed_audio_is_not_deduplicated_by_profile_or_filename(monkeypatch):
     assert len(ReplacementProviderClient.samples) == 2
 
 
-def test_replacement_failure_does_not_report_previous_voice_as_new_success(monkeypatch):
+def test_replacement_failure_does_not_report_previous_voice_as_new_success(monkeypatch, valid_voice_consent):
     repository, service = replacement_service(monkeypatch)
     submit_sample(service, asset_id="upload", audio=b"original-uploaded-voice")
 
@@ -382,5 +403,33 @@ def test_replacement_failure_does_not_report_previous_voice_as_new_success(monke
     else:
         raise AssertionError("A failed replacement must not return the old ready voice.")
 
-    assert repository.profile.voice_training_status == "failed"
-    assert service.status_for_profile(repository.profile.profile_id)["voice_ready"] is False
+    assert repository.profile.voice_training_status == "ready"
+    assert service.status_for_profile(repository.profile.profile_id)["voice_ready"] is True
+
+
+@pytest.mark.parametrize('stage', ['denied', 'before_request', 'after_response'])
+def test_clone_permission_changes_block_disclosure_or_activation(monkeypatch, valid_voice_consent, stage):
+    repository, service = replacement_service(monkeypatch)
+    if stage == 'denied':
+        valid_voice_consent.side_effect = HTTPException(403, 'Permission required')
+    elif stage == 'before_request':
+        create = repository.create_training_job
+        def revoke(**kwargs):
+            job = create(**kwargs)
+            valid_voice_consent.side_effect = HTTPException(409, 'Permissions changed')
+            return job
+        repository.create_training_job = revoke
+    else:
+        post = ReplacementProviderClient.post
+        async def revoke_after_response(self, url, **kwargs):
+            response = await post(self, url, **kwargs)
+            valid_voice_consent.side_effect = HTTPException(409, 'Permissions changed')
+            return response
+        monkeypatch.setattr(ReplacementProviderClient, 'post', revoke_after_response)
+    with pytest.raises(HTTPException):
+        submit_sample(service, asset_id='private-sample', audio=b'private-recorded-voice')
+    assert len(ReplacementProviderClient.samples) == (1 if stage == 'after_response' else 0)
+    assert not any(update.get('status') == 'ready' for _, update in repository.voice_updates)
+    if stage == 'after_response':
+        assert next(iter(repository.jobs.values()))['provider_job_id'] == 'trained-voice-1'
+        assert repository.profile.voice_id is None

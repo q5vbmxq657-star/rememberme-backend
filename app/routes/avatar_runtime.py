@@ -105,7 +105,6 @@ async def render_avatar_runtime_speech(
                     "Avatar runtime speech metadata "
                     "is invalid."
                 ),
-                "errors": error.errors(),
             },
         ) from error
 

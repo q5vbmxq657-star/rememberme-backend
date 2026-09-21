@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import math
 
 from openai import OpenAI
 
@@ -24,5 +25,7 @@ def _bounded_timeout(raw_value: str) -> float:
     try:
         value = float(raw_value)
     except (TypeError, ValueError):
+        value = 25.0
+    if not math.isfinite(value):
         value = 25.0
     return min(max(value, 5.0), 60.0)

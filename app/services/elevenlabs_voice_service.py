@@ -1,7 +1,10 @@
 from __future__ import annotations
+from app.security.purpose_authorization import require_profile_purposes
 
 import hashlib
 import os
+import asyncio
+from tempfile import NamedTemporaryFile
 
 from dataclasses import dataclass
 from io import BytesIO
@@ -9,6 +12,12 @@ from typing import List, Optional
 from uuid import UUID, uuid4
 
 import httpx
+from app.schemas.voice_delivery import VoiceDelivery
+from app.services.avatar_media_analysis_service import (
+    AvatarMediaAnalysisError,
+    AvatarMediaAnalysisUnavailableError,
+    AvatarMediaAnalysisService,
+)
 
 from app.models.digital_human_profile import (
     DigitalHumanProfile,
@@ -17,6 +26,7 @@ from app.services.digital_human_profile_repository import (
     DigitalHumanProfileNotFoundError,
     DigitalHumanProfileRepository,
     DigitalHumanProfileRepositoryError,
+    StaleVoiceTrainingError,
 )
 
 
@@ -27,7 +37,29 @@ class ElevenLabsVoiceError(RuntimeError):
 class ElevenLabsVoiceValidationError(
     ElevenLabsVoiceError
 ):
-    pass
+    @property
+    def safe_user_message(self) -> str:
+        """Present only reviewed validation causes, never raw diagnostics."""
+        message = str(self)
+        known = {
+            "Voice cloning requires verified consent.": "Confirm permission to use this person's voice before training.",
+            "A display name is required.": "Enter a name for this voice.",
+            "An idempotency key is required.": "Please start a new voice upload and try again.",
+            "At least one voice sample is required.": "Add at least one voice recording.",
+            "Too many voice samples.": "Too many recordings. Please select fewer files.",
+            "A voice sample has no filename.": "Choose a recording with a valid filename.",
+            "A voice sample is too small.": "One recording is too short. Choose a longer recording.",
+            "Voice samples are too small.": "Add longer recordings for voice training.",
+            "A voice sample exceeds the size limit.": "One recording is too large. Choose a shorter recording.",
+            "Voice samples exceed the total size limit.": "These recordings are too large. Please use shorter recordings.",
+            "The selected file contains no audio track.": "This file has no audio track. Choose a voice recording.",
+            "The selected recording could not be decoded.": "This recording could not be read. Export it again or choose another recording.",
+            "The selected recording contains no readable audio.": "This recording contains no readable audio. Choose another voice recording.",
+            "Use a clear recording of at least three seconds without clipping.": "Use a clear recording of at least three seconds without clipping.",
+        }
+        if message.startswith("Unsupported voice sample type: "):
+            return "This recording format is not supported. Choose an audio recording in a supported format."
+        return known.get(message, "This recording cannot be used for voice training.")
 
 
 class ElevenLabsVoiceProviderError(
@@ -39,10 +71,12 @@ class ElevenLabsVoiceProviderError(
         *,
         status_code: Optional[int] = None,
         provider_code: Optional[str] = None,
+        created_voice_id: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.provider_code = provider_code
+        self.created_voice_id = created_voice_id
 
     @property
     def is_capacity_unavailable(self) -> bool:
@@ -185,6 +219,7 @@ class ElevenLabsVoiceService:
         ) as client:
             response = await client.get(
                 "https://api.elevenlabs.io/v2/voices",
+                params={"category": "premade"},
                 headers={
                     "xi-api-key": self.api_key,
                 },
@@ -195,7 +230,13 @@ class ElevenLabsVoiceService:
             operation="Voice listing",
         )
 
-        return response.json()
+        payload = response.json()
+        # The account also holds private profile clones. Never expose that catalog.
+        public_fields = {"voice_id", "name", "category", "description", "preview_url", "labels"}
+        voices = [{key: value for key, value in voice.items() if key in public_fields}
+                  for voice in payload.get("voices", [])
+                  if isinstance(voice, dict) and voice.get("category") == "premade"]
+        return {"voices": voices}
 
     async def clone_voice(
         self,
@@ -227,26 +268,27 @@ class ElevenLabsVoiceService:
                 "An idempotency key is required."
             )
 
-        validated_samples = (
-            self._validate_samples(samples)
-        )
+        validated_samples = await asyncio.to_thread(self._validate_samples, samples)
+        consent = await asyncio.to_thread(require_profile_purposes, profile_id, {"voice_synthesis"})
+        await asyncio.to_thread(self._validate_sample_audio, validated_samples)
 
-        profile = self.repository.ensure(
+        profile = await asyncio.to_thread(self.repository.ensure,
             profile_id,
             consent_verified=True,
         )
 
         # A ready profile may be replacing its voice. Only the exact training
         # request may be reused, never the profile's previously trained voice.
-        request_hash = self._request_hash(
+        request_hash = await asyncio.to_thread(self._request_hash,
             profile_id=profile_id,
             idempotency_key=clean_idempotency_key,
             samples=validated_samples,
+            remove_background_noise=remove_background_noise,
         )
 
         job_id = uuid4()
 
-        job = self.repository.create_training_job(
+        job = await asyncio.to_thread(self.repository.create_training_job,
             job_id=job_id,
             profile_id=profile_id,
             training_type="voice",
@@ -293,6 +335,13 @@ class ElevenLabsVoiceService:
             ).strip()
 
             if existing_voice_id:
+                active = await asyncio.to_thread(self.repository.get, profile_id)
+                if existing_status == "ready" and not (
+                    active and active.has_personalized_voice
+                    and active.voice_id == existing_voice_id
+                    and active.voice_training_job_id == str(resolved_job_id)
+                ):
+                    raise ElevenLabsVoiceConflictError("This voice request is no longer the active selection.")
                 return VoiceCloneResult(
                     job_id=resolved_job_id,
                     profile_id=profile_id,
@@ -305,8 +354,7 @@ class ElevenLabsVoiceService:
 
             if existing_status == "failed":
                 retry_was_claimed = (
-                    self.repository
-                    .restart_failed_voice_training_job(
+                    await asyncio.to_thread(self.repository.restart_failed_voice_training_job,
                         job_id=resolved_job_id,
                         profile_id=profile_id,
                     )
@@ -317,19 +365,17 @@ class ElevenLabsVoiceService:
                         "The previous voice request cannot be retried safely."
                     )
 
-            else:
+            elif existing_status != "created":
                 raise ElevenLabsVoiceConflictError(
                     "The same voice training request is already being submitted."
                 )
 
-        self.repository.set_voice_training(
-            profile_id,
-            provider="elevenlabs",
-            status="submitted",
-            provider_job_id=str(
-                resolved_job_id
-            ),
+        claim = await asyncio.to_thread(
+            self.repository.begin_voice_training,
+            profile_id, resolved_job_id, consent.revision,
         )
+        if not claim["submission_claimed"]:
+            raise ElevenLabsVoiceConflictError("This voice request has already been submitted.")
 
         files = [
             (
@@ -354,7 +400,9 @@ class ElevenLabsVoiceService:
             ),
         }
 
+        voice_id = None
         try:
+            await asyncio.to_thread(require_profile_purposes, profile_id, {"voice_synthesis"}, expected_revision=consent.revision)
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(
                     connect=20,
@@ -377,23 +425,7 @@ class ElevenLabsVoiceService:
                 operation="Voice cloning",
             )
 
-            payload = response.json()
-            voice_id = str(
-                payload.get("voice_id")
-                or ""
-            ).strip()
-
-            if not voice_id:
-                raise ElevenLabsVoiceProviderError(
-                    "Voice cloning response did not include voice_id."
-                )
-
-            requires_verification = bool(
-                payload.get(
-                    "requires_verification",
-                    False,
-                )
-            )
+            voice_id, requires_verification = self._clone_response(response)
 
             profile_status = (
                 "verification_required"
@@ -401,10 +433,13 @@ class ElevenLabsVoiceService:
                 else "ready"
             )
 
-            self.repository.update_training_job(
-                resolved_job_id,
+            await asyncio.to_thread(require_profile_purposes, profile_id, {"voice_synthesis"}, expected_revision=consent.revision)
+            canonical = await asyncio.to_thread(
+                self.repository.apply_voice_training_result,
+                profile_id=profile_id,
+                job_id=resolved_job_id,
                 status=profile_status,
-                provider_job_id=voice_id,
+                voice_id=voice_id,
                 provider_payload={
                     "voice_id": voice_id,
                     "requires_verification":
@@ -412,15 +447,11 @@ class ElevenLabsVoiceService:
                 },
             )
 
-            self.repository.set_voice_training(
-                profile_id,
-                provider="elevenlabs",
-                status=profile_status,
-                provider_job_id=str(
-                    resolved_job_id
-                ),
-                voice_id=voice_id,
-            )
+            await asyncio.to_thread(require_profile_purposes, profile_id, {"voice_synthesis"}, expected_revision=consent.revision)
+            if canonical["status"] != profile_status or (
+                profile_status == "ready" and not canonical["voice_activated"]
+            ):
+                raise ElevenLabsVoiceConflictError("This voice result is no longer the current authorized selection.")
 
             return VoiceCloneResult(
                 job_id=resolved_job_id,
@@ -437,20 +468,18 @@ class ElevenLabsVoiceService:
             error_message = self._training_error_message(error)
 
             try:
-                self.repository.update_training_job(
-                    resolved_job_id,
-                    status="failed",
-                    error_code=error_code,
-                    error_message=error_message,
+                known_voice_id = voice_id or getattr(error, "created_voice_id", None)
+                ambiguous = isinstance(error, httpx.HTTPError) or (
+                    isinstance(error, ElevenLabsVoiceProviderError)
+                    and (error.status_code is None or error.status_code in {408, 409} or error.status_code >= 500
+                         or 300 <= error.status_code < 400)
                 )
-
-                self.repository.set_voice_training(
-                    profile_id,
-                    provider="elevenlabs",
-                    status="failed",
-                    provider_job_id=str(
-                        resolved_job_id
-                    ),
+                await asyncio.to_thread(
+                    self.repository.apply_voice_training_result,
+                    profile_id=profile_id,
+                    job_id=resolved_job_id,
+                    status="submitted" if ambiguous else "failed",
+                    voice_id=known_voice_id,
                     error_code=error_code,
                     error_message=error_message,
                 )
@@ -466,43 +495,52 @@ class ElevenLabsVoiceService:
         *,
         profile_id: UUID,
         text: str,
+        delivery: VoiceDelivery | None = None,
     ) -> VoiceSynthesisResult:
-        profile = self.repository.get(
-            profile_id
-        )
+        profile = await asyncio.to_thread(self.repository.get, profile_id)
 
         personalized_voice_id = self._personalized_voice_id(profile)
+        purposes = {"voice_synthesis"} if personalized_voice_id else {"memory_context"}
+        consent = require_profile_purposes(profile_id, purposes)
 
         if personalized_voice_id:
             try:
-                return VoiceSynthesisResult(
+                result = VoiceSynthesisResult(
                     audio_stream=await self.synthesize(
                         text=text,
                         voice_id=personalized_voice_id,
+                        delivery=delivery,
                     ),
                     voice_mode="personalized",
                 )
+                require_profile_purposes(profile_id, purposes, expected_revision=consent.revision)
+                return result
             except ElevenLabsVoiceProviderError as error:
-                if error.status_code in {400, 404, 410}:
-                    self._mark_personalized_voice_unavailable(
+                if error.status_code in {404, 410}:
+                    await asyncio.to_thread(self._mark_personalized_voice_unavailable,
                         profile_id=profile_id,
                         profile=profile,
                         error=error,
                     )
 
-        return VoiceSynthesisResult(
+        require_profile_purposes(profile_id, purposes, expected_revision=consent.revision)
+        result = VoiceSynthesisResult(
             audio_stream=await self.synthesize(
                 text=text,
                 voice_id=self.default_voice_id,
+                delivery=delivery,
             ),
             voice_mode="warm_default",
         )
+        require_profile_purposes(profile_id, purposes, expected_revision=consent.revision)
+        return result
 
     async def synthesize(
         self,
         *,
         text: str,
         voice_id: Optional[str] = None,
+        delivery: VoiceDelivery | None = None,
     ) -> BytesIO:
         clean_text = text.strip()
 
@@ -519,12 +557,7 @@ class ElevenLabsVoiceService:
         payload = {
             "text": clean_text,
             "model_id": self.model_id,
-            "voice_settings": {
-                "stability": 0.48,
-                "similarity_boost": 0.82,
-                "style": 0.22,
-                "use_speaker_boost": True,
-            },
+            "voice_settings": self._voice_settings(delivery),
         }
 
         async with httpx.AsyncClient(
@@ -551,6 +584,28 @@ class ElevenLabsVoiceService:
 
         return BytesIO(response.content)
 
+    def _voice_settings(self, delivery: VoiceDelivery | None) -> dict:
+        if self.model_id.startswith("eleven_v3"):
+            energy = delivery.energy if delivery else 0.5
+            return {"stability": 0.0 if energy >= 0.75 else (1.0 if energy <= 0.25 else 0.5)}
+
+        if delivery is None:
+            return {
+                "stability": 0.48, "similarity_boost": 0.82,
+                "style": 0.22, "use_speaker_boost": True,
+            }
+
+        # Modulate delivery without changing the clone, pitch or accent.
+        # Style exaggeration is disabled to avoid extra latency and artifacts.
+        return {
+            "stability": round(0.62 - 0.30 * delivery.energy, 3),
+            "similarity_boost": 0.82,
+            "style": 0.0,
+            "use_speaker_boost": True,
+            "speed": round(0.9 + 0.2 * delivery.speaking_speed
+                           + 0.04 * (0.5 - delivery.pause_length), 3),
+        }
+
     async def delete_profile_voice(
         self,
         *,
@@ -562,20 +617,19 @@ class ElevenLabsVoiceService:
 
         voice_id = profile.voice_id
 
-        if (
-            profile.voice_provider
-            != "elevenlabs"
-            or not voice_id
-        ):
-            self.repository.set_voice_training(
-                profile_id,
-                provider="elevenlabs",
-                status="deleted",
-                provider_job_id=None,
-                voice_id=None,
-            )
+        if voice_id and profile.voice_provider != "elevenlabs":
+            raise ElevenLabsVoiceError("The voice provider does not support this deletion path.")
+
+        if not voice_id:
+            self._clear_deleted_voice(profile)
             return
 
+        await self.delete_voice_resource(voice_id=voice_id)
+        self._clear_deleted_voice(profile)
+
+    async def delete_voice_resource(self, *, voice_id: str) -> None:
+        if not voice_id or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in voice_id):
+            raise ElevenLabsVoiceValidationError("Invalid voice resource identifier.")
         async with httpx.AsyncClient(
             timeout=30
         ) as client:
@@ -599,17 +653,24 @@ class ElevenLabsVoiceService:
                 operation="Voice deletion",
             )
 
-        self.repository.clear_voice_identity(
-            profile_id
-        )
+    def _clear_deleted_voice(self, profile: DigitalHumanProfile) -> None:
+        try:
+            self.repository.clear_voice_identity(
+                profile.profile_id,
+                expected_voice_id=profile.voice_id,
+                expected_job_id=profile.voice_training_job_id,
+                expected_provider=profile.voice_provider,
+            )
+        except StaleVoiceTrainingError as error:
+            raise ElevenLabsVoiceConflictError(
+                "The voice changed during deletion. Refresh before trying again."
+            ) from error
 
     def status_for_profile(
         self,
         profile_id: UUID,
     ) -> dict:
-        profile = self.repository.get(
-            profile_id
-        )
+        profile, latest_job = self.repository.get_voice_status_snapshot(profile_id)
 
         if profile is None:
             return {
@@ -617,27 +678,41 @@ class ElevenLabsVoiceService:
                 "status": "not_started",
                 "voice_mode": "warm_default",
                 "voice_ready": False,
+                "active_voice_version": None,
+                "pending_training": None,
             }
 
+        voice_ready = bool(profile["consent_verified"] and profile["voice_training_status"] == "ready"
+                           and profile["voice_provider"] and profile["voice_id"])
+        pending = None
+        if latest_job and str(latest_job["job_id"]) != profile["voice_training_job_id"]:
+            pending_status = latest_job["status"]
+            if pending_status == "ready":
+                pending_status = "superseded"
+            pending = {
+                "job_id": str(latest_job["job_id"]),
+                "status": pending_status,
+                "requires_verification": pending_status == "verification_required",
+                "error_code": latest_job.get("error_code"),
+                "error_message": latest_job.get("error_message"),
+            }
         return {
             "profile_id":
-                str(profile.profile_id),
+                str(profile["profile_id"]),
             "status":
-                profile.voice_training_status,
+                profile["voice_training_status"],
             "voice_mode": (
                 "personalized"
-                if profile.has_personalized_voice
+                if voice_ready
                 else "warm_default"
             ),
             "voice_ready":
-                profile.has_personalized_voice,
+                voice_ready,
             "provider":
-                profile.voice_provider,
-            "updated_at": (
-                profile.updated_at.isoformat()
-                if profile.updated_at
-                else None
-            ),
+                profile["voice_provider"],
+            "updated_at": profile.get("updated_at"),
+            "active_voice_version": (profile["voice_training_job_id"] or profile.get("voice_ready_at")) if voice_ready else None,
+            "pending_training": pending,
         }
 
     def _personalized_voice_id(
@@ -673,6 +748,8 @@ class ElevenLabsVoiceService:
                 provider="elevenlabs",
                 status="failed",
                 provider_job_id=profile.voice_training_job_id,
+                expected_job_id=profile.voice_training_job_id,
+                expected_voice_id=profile.voice_id,
                 error_code=type(error).__name__,
                 error_message="The personalized voice is unavailable at the provider.",
             )
@@ -748,12 +825,29 @@ class ElevenLabsVoiceService:
 
         return validated
 
+    @staticmethod
+    def _validate_sample_audio(samples: List[VoiceCloneSample]) -> None:
+        analyzer = AvatarMediaAnalysisService()
+        for sample in samples:
+            try:
+                with NamedTemporaryFile(prefix="stay-voice-check-", suffix=".audio") as temporary:
+                    temporary.write(sample.data)
+                    temporary.flush()
+                    analyzer.analyze(storage_path=temporary.name, asset_type="voice", content_type=sample.content_type)
+            except AvatarMediaAnalysisUnavailableError:
+                raise
+            except AvatarMediaAnalysisError as error:
+                raise ElevenLabsVoiceValidationError(str(error)) from error
+            except OSError as error:
+                raise AvatarMediaAnalysisUnavailableError("Voice sample validation is temporarily unavailable.") from error
+
     def _request_hash(
         self,
         *,
         profile_id: UUID,
         idempotency_key: str,
         samples: List[VoiceCloneSample],
+        remove_background_noise: bool = False,
     ) -> str:
         digest = hashlib.sha256()
         digest.update(
@@ -779,6 +873,10 @@ class ElevenLabsVoiceService:
                 ).digest()
             )
 
+        # Preserve existing default-operation keys while separating audio isolation.
+        if remove_background_noise:
+            digest.update(b"\x00remove_background_noise=true")
+
         return digest.hexdigest()
 
     def _raise_provider_error(
@@ -787,7 +885,7 @@ class ElevenLabsVoiceService:
         *,
         operation: str,
     ) -> None:
-        if response.status_code < 400:
+        if 200 <= response.status_code < 300:
             return
 
         raise ElevenLabsVoiceProviderError(
@@ -796,6 +894,31 @@ class ElevenLabsVoiceService:
             status_code=response.status_code,
             provider_code=self._provider_error_code(response),
         )
+
+    @staticmethod
+    def _clone_response(response: httpx.Response) -> tuple[str, bool]:
+        try:
+            payload = response.json()
+        except (TypeError, ValueError) as error:
+            raise ElevenLabsVoiceProviderError(
+                "Voice creation returned an unverified response."
+            ) from error
+        if not isinstance(payload, dict):
+            raise ElevenLabsVoiceProviderError(
+                "Voice creation returned an unverified response."
+            )
+        voice_id = payload.get("voice_id")
+        requires_verification = payload.get("requires_verification")
+        if not isinstance(voice_id, str) or not voice_id.strip():
+            raise ElevenLabsVoiceProviderError(
+                "Voice creation returned no verified voice identity."
+            )
+        if not isinstance(requires_verification, bool):
+            raise ElevenLabsVoiceProviderError(
+                "Voice creation returned no verified verification state.",
+                created_voice_id=voice_id.strip(),
+            )
+        return voice_id.strip(), requires_verification
 
     def _provider_error_code(
         self,

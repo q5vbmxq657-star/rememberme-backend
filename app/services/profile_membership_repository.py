@@ -47,6 +47,7 @@ class ProfileMembershipRepository:
         *,
         user_id: UUID,
         profile_id: UUID,
+        session_id: UUID | None = None,
     ) -> ProfileMembership | None:
         with psycopg.connect(
             self.database_url,
@@ -64,14 +65,35 @@ class ProfileMembershipRepository:
                         status,
                         created_at,
                         updated_at
-                    FROM profile_memberships
+                    FROM profile_memberships AS membership
                     WHERE
                         user_id = %s
                         AND profile_id = %s
+                        AND EXISTS (
+                            SELECT 1 FROM users
+                            WHERE users.user_id = membership.user_id
+                              AND users.status = 'active'
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM digital_human_profile_erasure_requests AS erasure
+                            WHERE erasure.profile_id = membership.profile_id
+                        )
+                        AND (
+                            %s::uuid IS NULL OR EXISTS (
+                                SELECT 1 FROM user_sessions AS session
+                                WHERE session.session_id = %s::uuid
+                                  AND session.user_id = membership.user_id
+                                  AND session.revoked_at IS NULL
+                                  AND session.access_expires_at > NOW()
+                                  AND session.refresh_expires_at > NOW()
+                            )
+                        )
                     """,
                     (
                         user_id,
                         profile_id,
+                        session_id,
+                        session_id,
                     ),
                 )
 

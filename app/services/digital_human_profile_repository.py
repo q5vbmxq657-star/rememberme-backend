@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import nullcontext
 
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -23,6 +24,14 @@ class DigitalHumanProfileRepositoryError(RuntimeError):
 class DigitalHumanProfileNotFoundError(
     DigitalHumanProfileRepositoryError
 ):
+    pass
+
+
+class StaleVoiceTrainingError(DigitalHumanProfileRepositoryError):
+    pass
+
+
+class StaleAvatarTrainingError(DigitalHumanProfileRepositoryError):
     pass
 
 
@@ -198,18 +207,59 @@ class DigitalHumanProfileRepository:
         error_code: Optional[str] = None,
         error_message: Optional[str] = None,
         expected_provider_job_id: Optional[str] = None,
+        training_job_id: Optional[UUID] = None,
+        _connection=None,
     ) -> DigitalHumanProfile:
+        if provider == 'tavus' and replica_id and provider_job_id != f'tavus:{replica_id}':
+            raise StaleAvatarTrainingError('Avatar provider identity does not match.')
         ready = (
             status == "ready"
             and bool(replica_id)
         )
 
-        with psycopg.connect(
+        with (nullcontext(_connection) if _connection is not None else psycopg.connect(
             self.database_url,
             connect_timeout=10,
             row_factory=dict_row,
-        ) as connection:
+        )) as connection:
             with connection.cursor() as cursor:
+                # Consent changes and erasure take this same profile lock.
+                cursor.execute('SELECT * FROM digital_human_profiles WHERE profile_id=%s FOR UPDATE', (profile_id,))
+                current = cursor.fetchone()
+                if current is None:
+                    raise DigitalHumanProfileNotFoundError('Avatar profile was not found.')
+                cursor.execute('SELECT 1 FROM digital_human_profile_erasure_requests WHERE profile_id=%s LIMIT 1', (profile_id,))
+                if cursor.fetchone():
+                    raise StaleAvatarTrainingError('Avatar profile is being erased.')
+                cursor.execute("""SELECT * FROM digital_human_training_jobs
+                    WHERE profile_id=%s AND provider=%s AND training_type='avatar'
+                    ORDER BY created_at DESC, job_id DESC LIMIT 1 FOR UPDATE""", (profile_id, provider))
+                job = cursor.fetchone()
+                if (not job or (training_job_id is not None and job['job_id'] != training_job_id)
+                        or job['provider_job_id'] != provider_job_id
+                        or (training_job_id is None and (not provider_job_id or job['provider_job_id'] != provider_job_id))
+                        or (expected_provider_job_id is not None and current['avatar_training_job_id'] != expected_provider_job_id)):
+                    raise StaleAvatarTrainingError('Avatar training is no longer current.')
+                if (job.get('status') in {'cancelled', 'deleted'}
+                        or not self._avatar_status_allows(job.get('status', 'training'), status)
+                        or (current['avatar_training_job_id'] == provider_job_id
+                            and not self._avatar_status_allows(current.get('avatar_training_status', 'training'), status))):
+                    raise StaleAvatarTrainingError('Avatar training result is superseded.')
+                payload = job['request_payload'] or {}
+                revision = payload.get('_stay_consent_revision')
+                photo, video = bool(payload.get('train_image_url')), bool(payload.get('train_video_url'))
+                if type(revision) is not int or revision < 1 or photo == video:
+                    raise StaleAvatarTrainingError('Avatar training permission provenance is unavailable.')
+                from app.schemas.profile_consent import CONSENT_POLICY_VERSION
+                cursor.execute('SELECT revision, policy_version, purposes FROM profile_purpose_consents WHERE profile_id=%s', (profile_id,))
+                consent = cursor.fetchone()
+                required = {'provider_processing', 'photo_likeness' if photo else 'video_motion'}
+                if video:
+                    required.add('voice_synthesis')
+                if (not consent or consent['revision'] != revision
+                        or consent['policy_version'] != CONSENT_POLICY_VERSION
+                        or not required.issubset(consent['purposes'])):
+                    raise StaleAvatarTrainingError('Avatar training permission changed.')
                 cursor.execute(
                     """
                     UPDATE digital_human_profiles
@@ -226,8 +276,14 @@ class DigitalHumanProfileRepository:
                             avatar_persona_id
                         ),
                         avatar_ready_at = CASE
-                            WHEN %s THEN NOW()
-                            ELSE avatar_ready_at
+                            WHEN %s THEN CASE
+                                WHEN avatar_training_job_id IS NOT DISTINCT FROM %s
+                                THEN COALESCE(avatar_ready_at, NOW()) ELSE NOW() END
+                            ELSE NULL
+                        END,
+                        runtime_verified_at = CASE
+                            WHEN avatar_training_job_id IS NOT DISTINCT FROM %s AND %s
+                            THEN runtime_verified_at ELSE NULL
                         END,
                         last_error_code = %s,
                         last_error_message = %s
@@ -241,6 +297,9 @@ class DigitalHumanProfileRepository:
                         provider_job_id,
                         replica_id,
                         persona_id,
+                        ready,
+                        provider_job_id,
+                        provider_job_id,
                         ready,
                         error_code,
                         error_message,
@@ -259,7 +318,8 @@ class DigitalHumanProfileRepository:
                     )
                     row = cursor.fetchone()
 
-            connection.commit()
+            if _connection is None:
+                connection.commit()
 
         if row is None:
             raise DigitalHumanProfileNotFoundError(
@@ -278,6 +338,8 @@ class DigitalHumanProfileRepository:
         voice_id: Optional[str] = None,
         error_code: Optional[str] = None,
         error_message: Optional[str] = None,
+        expected_job_id: Optional[str] = None,
+        expected_voice_id: Optional[str] = None,
     ) -> DigitalHumanProfile:
         ready = (
             status == "ready"
@@ -290,6 +352,12 @@ class DigitalHumanProfileRepository:
             row_factory=dict_row,
         ) as connection:
             with connection.cursor() as cursor:
+                if expected_job_id is not None or expected_voice_id is not None:
+                    # Serialize with erasure before taking the authorization snapshot.
+                    cursor.execute(
+                        "SELECT profile_id FROM digital_human_profiles WHERE profile_id = %s FOR UPDATE",
+                        (profile_id,),
+                    )
                 cursor.execute(
                     """
                     UPDATE digital_human_profiles
@@ -308,6 +376,12 @@ class DigitalHumanProfileRepository:
                         last_error_code = %s,
                         last_error_message = %s
                     WHERE profile_id = %s
+                      AND (%s::text IS NULL OR voice_training_job_id = %s::text)
+                      AND (%s::text IS NULL OR voice_id = %s::text)
+                      AND ((%s::text IS NULL AND %s::text IS NULL) OR NOT EXISTS (
+                          SELECT 1 FROM digital_human_profile_erasure_requests AS erasure
+                          WHERE erasure.profile_id = digital_human_profiles.profile_id
+                      ))
                     RETURNING *
                     """,
                     (
@@ -319,6 +393,12 @@ class DigitalHumanProfileRepository:
                         error_code,
                         error_message,
                         profile_id,
+                        expected_job_id,
+                        expected_job_id,
+                        expected_voice_id,
+                        expected_voice_id,
+                        expected_job_id,
+                        expected_voice_id,
                     ),
                 )
 
@@ -327,11 +407,166 @@ class DigitalHumanProfileRepository:
             connection.commit()
 
         if row is None:
+            if expected_job_id is not None or expected_voice_id is not None:
+                raise StaleVoiceTrainingError("Voice training is no longer current.")
             raise DigitalHumanProfileNotFoundError(
                 f"Digital human profile not found: {profile_id}"
             )
 
         return self._profile_from_row(row)
+
+    @staticmethod
+    def _voice_activation_snapshot(profile: Dict[str, Any]) -> Dict[str, Any]:
+        fields = ('voice_provider', 'voice_id', 'voice_training_job_id', 'voice_training_status', 'voice_ready_at')
+        return {key: value.isoformat() if isinstance(value, datetime) else value
+                for key in fields for value in (profile[key],)}
+
+    def _lock_voice_job(self, cursor, profile_id: UUID, job_id: UUID):
+        self._lock_profile_scope(cursor, profile_id)
+        cursor.execute('SELECT * FROM digital_human_profiles WHERE profile_id=%s FOR UPDATE', (profile_id,))
+        profile = cursor.fetchone()
+        if profile is None:
+            raise DigitalHumanProfileNotFoundError('Voice profile was not found.')
+        cursor.execute("""SELECT * FROM digital_human_training_jobs
+            WHERE job_id=%s AND profile_id=%s AND training_type='voice'
+              AND provider='elevenlabs' FOR UPDATE""", (job_id, profile_id))
+        job = cursor.fetchone()
+        if job is None:
+            raise StaleVoiceTrainingError('Voice job does not belong to this profile.')
+        return profile, job
+
+    @staticmethod
+    def _voice_consent_matches(cursor, profile_id: UUID, revision: int) -> bool:
+        from app.schemas.profile_consent import CONSENT_POLICY_VERSION
+        cursor.execute('SELECT revision,policy_version,purposes FROM profile_purpose_consents WHERE profile_id=%s', (profile_id,))
+        grant = cursor.fetchone()
+        return bool(type(revision) is int and revision > 0 and grant
+            and grant['revision'] == revision and grant['policy_version'] == CONSENT_POLICY_VERSION
+            and {'voice_synthesis','provider_processing'}.issubset(grant['purposes']))
+
+    def begin_voice_training(self, profile_id: UUID, job_id: UUID, expected_consent_revision: int) -> Dict[str, Any]:
+        """Claim submission while preserving the active voice; no provider work here.
+
+        submission_claimed is True only for the caller that changed created to
+        submitted. Other callers must not replay the external create request.
+        """
+        with psycopg.connect(self.database_url, connect_timeout=10, row_factory=dict_row) as connection:
+            with connection.cursor() as cursor:
+                profile, job = self._lock_voice_job(cursor, profile_id, job_id)
+                self._require_profile_write_allowed_with_cursor(cursor, profile_id)
+                if not self._voice_consent_matches(cursor, profile_id, expected_consent_revision):
+                    raise StaleVoiceTrainingError('Voice permission changed.')
+                cursor.execute("""SELECT job_id FROM digital_human_training_jobs
+                    WHERE profile_id=%s AND training_type='voice' AND provider='elevenlabs'
+                    ORDER BY created_at DESC,job_id DESC LIMIT 1""", (profile_id,))
+                if cursor.fetchone()['job_id'] != job_id:
+                    raise StaleVoiceTrainingError('A newer voice request was selected.')
+                payload = dict(job['request_payload'] or {})
+                snapshot = self._voice_activation_snapshot(profile)
+                if '_stay_voice_selection' in payload and (
+                        payload['_stay_voice_selection'] != snapshot
+                        or payload.get('_stay_consent_revision') != expected_consent_revision):
+                    raise StaleVoiceTrainingError('The selected voice request is obsolete.')
+                if job['status'] != 'created' or job['provider_job_id'] is not None:
+                    return {**dict(job), 'submission_claimed': False}
+                payload.update(_stay_voice_selection=snapshot, _stay_consent_revision=expected_consent_revision)
+                cursor.execute("""UPDATE digital_human_training_jobs SET status='submitted',
+                    request_payload=%s::jsonb, submitted_at=COALESCE(submitted_at,NOW())
+                    WHERE job_id=%s RETURNING *""", (json.dumps(payload), job_id))
+                return {**dict(cursor.fetchone()), 'submission_claimed': True}
+
+    def apply_voice_training_result(self, *, profile_id: UUID, job_id: UUID, status: str,
+                                    voice_id: Optional[str] = None, provider_payload: Optional[Dict[str, Any]] = None,
+                                    error_code: Optional[str] = None,
+                                    error_message: Optional[str] = None) -> Dict[str, Any]:
+        """Store provider evidence; activate only the latest authorized selection.
+
+        voice_activated describes profile projection, never merely provider success.
+        A failed/pending replacement leaves the last active voice untouched.
+        """
+        if status not in {'submitted','training','verification_required','ready','failed'}:
+            raise DigitalHumanProfileRepositoryError('Invalid voice result status.')
+        if status in {'ready','verification_required'} and not voice_id:
+            raise StaleVoiceTrainingError('Provider voice identity is missing.')
+        evidence = dict(provider_payload or {})
+        if evidence.get('voice_id') and evidence['voice_id'] != voice_id:
+            raise StaleVoiceTrainingError('Provider voice identity does not match.')
+        with psycopg.connect(self.database_url, connect_timeout=10, row_factory=dict_row) as connection:
+            with connection.cursor() as cursor:
+                profile, job = self._lock_voice_job(cursor, profile_id, job_id)
+                if voice_id and job['provider_job_id'] and voice_id != job['provider_job_id']:
+                    raise StaleVoiceTrainingError('Provider voice identity changed.')
+                ranks = {'created':0, 'submitted':1, 'training':2, 'verification_required':3, 'ready':4, 'failed':4}
+                terminal = job['status'] in {'cancelled','deleted','failed','ready'}
+                accepted = (status == job['status'] if terminal else
+                    status in ranks and ranks[status] >= ranks.get(job['status'], 100))
+                if not accepted:
+                    if voice_id and not job['provider_job_id']:
+                        cursor.execute("""UPDATE digital_human_training_jobs SET provider_job_id=%s,
+                            provider_payload=provider_payload || %s::jsonb WHERE job_id=%s RETURNING *""",
+                            (voice_id, json.dumps(evidence), job_id))
+                        job = cursor.fetchone()
+                    return {**dict(job), 'voice_activated': False}
+                cursor.execute("""UPDATE digital_human_training_jobs SET status=%s,
+                    provider_job_id=COALESCE(%s,provider_job_id), provider_payload=provider_payload || %s::jsonb,
+                    error_code=%s,error_message=%s, completed_at=CASE WHEN %s IN ('ready','failed')
+                        THEN COALESCE(completed_at,NOW()) ELSE completed_at END
+                    WHERE job_id=%s RETURNING *""",
+                    (status,voice_id,json.dumps(evidence),error_code,error_message,status,job_id))
+                job = cursor.fetchone()
+                if status != 'ready':
+                    return {**dict(job), 'voice_activated': False}
+                payload = dict(job['request_payload'] or {})
+                cursor.execute('SELECT 1 FROM digital_human_profile_erasure_requests WHERE profile_id=%s LIMIT 1', (profile_id,))
+                erased = cursor.fetchone() is not None
+                cursor.execute("""SELECT job_id FROM digital_human_training_jobs
+                    WHERE profile_id=%s AND training_type='voice' AND provider='elevenlabs'
+                    ORDER BY created_at DESC,job_id DESC LIMIT 1""", (profile_id,))
+                latest = cursor.fetchone()['job_id'] == job_id
+                authorized = self._voice_consent_matches(cursor, profile_id, payload.get('_stay_consent_revision'))
+                already_active = (profile['voice_id'] == voice_id and profile['voice_training_job_id'] == str(job_id)
+                                  and profile['voice_training_status'] == 'ready' and profile['voice_provider'] == 'elevenlabs')
+                if not profile['consent_verified'] or erased or not latest or not authorized or (
+                        not already_active and payload.get('_stay_voice_selection') != self._voice_activation_snapshot(profile)):
+                    return {**dict(job), 'voice_activated': False}
+                if not already_active:
+                    cursor.execute("""UPDATE digital_human_profiles SET voice_provider='elevenlabs',
+                        voice_id=%s, voice_training_job_id=%s, voice_training_status='ready', voice_ready_at=NOW()
+                        WHERE profile_id=%s""", (voice_id,str(job_id),profile_id))
+                return {**dict(job), 'voice_activated': True}
+
+    def get_voice_status_snapshot(self, profile_id: UUID):
+        """Read active voice and latest request from the same MVCC snapshot."""
+        with psycopg.connect(self.database_url, connect_timeout=10, row_factory=dict_row) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("""SELECT row_to_json(p) AS profile,
+                    (SELECT row_to_json(j) FROM digital_human_training_jobs j
+                     WHERE j.profile_id=p.profile_id AND j.training_type='voice'
+                       AND j.provider='elevenlabs'
+                     ORDER BY j.created_at DESC,j.job_id DESC LIMIT 1) AS latest_job
+                    FROM digital_human_profiles p WHERE p.profile_id=%s""", (profile_id,))
+                row = cursor.fetchone()
+                return (row['profile'], row['latest_job']) if row else (None, None)
+
+    def claim_avatar_submission(self, job_id: UUID, profile_id: UUID) -> bool:
+        """Claim exactly one unattempted Tavus creation; never replay submitted work.
+
+        Returns False for a nonmatching/already claimed job or missing profile.
+        Active erasure and database failures propagate through the repository contract.
+        """
+        with psycopg.connect(self.database_url, connect_timeout=10, row_factory=dict_row) as connection:
+            with connection.cursor() as cursor:
+                self._lock_profile_scope(cursor, profile_id)
+                cursor.execute('SELECT profile_id FROM digital_human_profiles WHERE profile_id=%s FOR UPDATE', (profile_id,))
+                if cursor.fetchone() is None:
+                    return False
+                self._require_profile_write_allowed_with_cursor(cursor, profile_id)
+                cursor.execute("""UPDATE digital_human_training_jobs
+                    SET status='submitted', submitted_at=COALESCE(submitted_at, NOW())
+                    WHERE job_id=%s AND profile_id=%s AND training_type='avatar'
+                      AND provider='tavus' AND provider_job_id IS NULL AND status='created'
+                    RETURNING job_id""", (job_id, profile_id))
+                return cursor.fetchone() is not None
 
     def create_training_job(
         self,
@@ -359,6 +594,14 @@ class DigitalHumanProfileRepository:
             row_factory=dict_row,
         ) as connection:
             with connection.cursor() as cursor:
+                self._lock_profile_scope(cursor, profile_id)
+                cursor.execute(
+                    "SELECT profile_id FROM digital_human_profiles WHERE profile_id=%s FOR UPDATE",
+                    (profile_id,),
+                )
+                if cursor.fetchone() is None:
+                    raise DigitalHumanProfileNotFoundError("Training profile was not found.")
+                self._require_profile_write_allowed_with_cursor(cursor, profile_id)
                 cursor.execute(
                     """
                     WITH inserted AS (
@@ -429,6 +672,7 @@ class DigitalHumanProfileRepository:
         ] = None,
         error_code: Optional[str] = None,
         error_message: Optional[str] = None,
+        _connection=None,
     ) -> Dict[str, Any]:
         payload_json = json.dumps(
             provider_payload or {},
@@ -436,12 +680,35 @@ class DigitalHumanProfileRepository:
             sort_keys=True,
         )
 
-        with psycopg.connect(
+        with (nullcontext(_connection) if _connection is not None else psycopg.connect(
             self.database_url,
             connect_timeout=10,
             row_factory=dict_row,
-        ) as connection:
+        )) as connection:
             with connection.cursor() as cursor:
+                cursor.execute('SELECT * FROM digital_human_training_jobs WHERE job_id=%s FOR UPDATE', (job_id,))
+                existing = cursor.fetchone()
+                if existing is None:
+                    raise DigitalHumanProfileNotFoundError('Training job was not found.')
+                if existing['training_type'] == 'avatar':
+                    if (provider_job_id is not None and existing['provider_job_id'] is not None
+                            and existing['provider_job_id'] != provider_job_id):
+                        raise StaleAvatarTrainingError('Avatar provider identity changed.')
+                    identity = provider_job_id or existing['provider_job_id']
+                    if existing['provider'] == 'tavus' and identity:
+                        for payload in (existing['provider_payload'] or {}, provider_payload or {}):
+                            for key in ('face_id', 'faceId', 'replica_id'):
+                                if payload.get(key) and identity != f"tavus:{payload[key]}":
+                                    raise StaleAvatarTrainingError('Avatar result identity changed.')
+                    if not self._avatar_status_allows(existing['status'], status):
+                        if existing['provider_job_id'] is None and provider_job_id is not None:
+                            # A cancelled create can still finish remotely. Retain its
+                            # identity for erasure without reviving the terminal job.
+                            cursor.execute("""UPDATE digital_human_training_jobs
+                                SET provider_job_id=%s, provider_payload=provider_payload || %s::jsonb
+                                WHERE job_id=%s RETURNING *""", (provider_job_id, payload_json, job_id))
+                            return dict(cursor.fetchone())
+                        return dict(existing)
                 cursor.execute(
                     """
                     UPDATE digital_human_training_jobs
@@ -474,7 +741,8 @@ class DigitalHumanProfileRepository:
                                 'cancelled',
                                 'deleted'
                             )
-                            THEN NOW()
+                            THEN CASE WHEN training_type = 'avatar'
+                                THEN COALESCE(completed_at, NOW()) ELSE NOW() END
                             ELSE completed_at
                         END
                     WHERE job_id = %s
@@ -494,7 +762,8 @@ class DigitalHumanProfileRepository:
 
                 row = cursor.fetchone()
 
-            connection.commit()
+            if _connection is None:
+                connection.commit()
 
         if row is None:
             raise DigitalHumanProfileRepositoryError(
@@ -502,6 +771,68 @@ class DigitalHumanProfileRepository:
             )
 
         return dict(row)
+
+    @staticmethod
+    def _avatar_status_allows(current: str, incoming: str) -> bool:
+        if incoming == 'deleted':
+            return True
+        if current == 'deleted':
+            return False
+        if incoming == 'cancelled':
+            return True
+        if current == 'cancelled':
+            return False
+        if current in {'ready', 'failed'}:
+            return incoming == current
+        ranks = {'not_started': 0, 'created': 0, 'collecting': 0, 'validating': 1,
+                 'submitted': 1, 'training': 2, 'ready': 3, 'failed': 3}
+        return incoming in ranks and current in ranks and ranks[incoming] >= ranks[current]
+
+    def apply_avatar_training_result(self, *, profile_id: UUID, job_id: UUID,
+                                    provider: str, provider_job_id: str, status: str,
+                                    replica_id: Optional[str], provider_payload: Dict[str, Any],
+                                    error_code: Optional[str] = None,
+                                    error_message: Optional[str] = None) -> Dict[str, Any]:
+        """Atomically persist a callback/poll and project it when still authorized.
+
+        Returns the canonical job plus profile_updated. Callers must use its status,
+        not the incoming event status, when a late event was ignored.
+        """
+        if status not in {'submitted', 'training', 'ready', 'failed'}:
+            raise DigitalHumanProfileRepositoryError('Invalid avatar provider status.')
+        if provider != 'tavus' or (replica_id and provider_job_id != f'tavus:{replica_id}'):
+            raise StaleAvatarTrainingError('Avatar provider identity does not match.')
+        if status == 'ready' and not replica_id:
+            raise StaleAvatarTrainingError('Ready avatar identity is missing.')
+        for key in ('face_id', 'faceId', 'replica_id'):
+            if provider_payload.get(key) and provider_job_id != f"tavus:{provider_payload[key]}":
+                raise StaleAvatarTrainingError('Avatar result contains a different provider identity.')
+        with psycopg.connect(self.database_url, connect_timeout=10, row_factory=dict_row) as connection:
+            with connection.cursor() as cursor:
+                self._lock_profile_scope(cursor, profile_id)
+                cursor.execute('SELECT profile_id FROM digital_human_profiles WHERE profile_id=%s FOR UPDATE', (profile_id,))
+                if cursor.fetchone() is None:
+                    raise DigitalHumanProfileNotFoundError('Avatar profile was not found.')
+                self._require_profile_write_allowed_with_cursor(cursor, profile_id)
+                cursor.execute('SELECT * FROM digital_human_training_jobs WHERE job_id=%s FOR UPDATE', (job_id,))
+                job = cursor.fetchone()
+                if (not job or job['profile_id'] != profile_id or job['provider'] != provider
+                        or job['training_type'] != 'avatar' or job['provider_job_id'] != provider_job_id):
+                    raise StaleAvatarTrainingError('Avatar job does not match the requested profile.')
+                if not self._avatar_status_allows(job['status'], status):
+                    return {**dict(job), 'profile_updated': False}
+            job = self.update_training_job(job_id, status=status, provider_job_id=provider_job_id,
+                provider_payload=provider_payload, error_code=error_code, error_message=error_message,
+                _connection=connection)
+            try:
+                self.set_avatar_training(profile_id, provider=provider, status=job['status'],
+                    provider_job_id=provider_job_id, replica_id=replica_id, training_job_id=job_id,
+                    expected_provider_job_id=provider_job_id, error_code=error_code,
+                    error_message=error_message, _connection=connection)
+            except StaleAvatarTrainingError:
+                # Keep provider evidence for cleanup without reviving obsolete state.
+                return {**job, 'profile_updated': False}
+            return {**job, 'profile_updated': True}
 
     def restart_failed_voice_training_job(
         self,
@@ -523,6 +854,8 @@ class DigitalHumanProfileRepository:
             row_factory=dict_row,
         ) as connection:
             with connection.cursor() as cursor:
+                self._lock_voice_job(cursor, profile_id, job_id)
+                self._require_profile_write_allowed_with_cursor(cursor, profile_id)
                 cursor.execute(
                     """
                     UPDATE digital_human_training_jobs
@@ -540,7 +873,7 @@ class DigitalHumanProfileRepository:
                       AND provider = 'elevenlabs'
                       AND status = 'failed'
                       AND provider_job_id IS NULL
-                      AND error_code LIKE 'provider_http_%%'
+                      AND error_code ~ '^provider_http_(400|401|403|404|413|415|422|429)(_[[:alnum:]_-]{1,64})?$'
                     RETURNING *
                     """,
                     (
@@ -558,6 +891,36 @@ class DigitalHumanProfileRepository:
             if row is not None
             else None
         )
+
+    def adopt_reconciled_avatar(self, *, job_id: UUID, correlation_name: str,
+                               face_id: str, provider_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Record a recovered create result without overwriting a newer job outcome."""
+        if provider_payload.get('face_name') != correlation_name or provider_payload.get('face_id') != face_id:
+            raise DigitalHumanProfileRepositoryError('Recovered avatar identity does not match.')
+        with psycopg.connect(self.database_url, connect_timeout=10, row_factory=dict_row) as connection:
+            row = connection.execute(
+                "SELECT * FROM digital_human_training_jobs WHERE job_id=%s FOR UPDATE", (job_id,)
+            ).fetchone()
+            if not row or row['provider'] != 'tavus' or row['training_type'] != 'avatar':
+                raise DigitalHumanProfileNotFoundError('Avatar job was not found.')
+            if (row['request_payload'] or {}).get('_stay_face_name') != correlation_name:
+                raise DigitalHumanProfileRepositoryError('Avatar creation identity changed.')
+            if row['provider_job_id'] or row['status'] not in {'created', 'submitted'}:
+                return dict(row)
+            row = connection.execute("""UPDATE digital_human_training_jobs
+                SET provider_job_id=%s, provider_payload=%s::jsonb, status='training',
+                    submitted_at=COALESCE(submitted_at,NOW()), error_code=NULL, error_message=NULL
+                WHERE job_id=%s RETURNING *""",
+                (f'tavus:{face_id}', json.dumps(provider_payload), job_id)).fetchone()
+            return dict(row)
+
+    def get_avatar_training_request(self, profile_id: UUID, idempotency_key: str) -> Optional[Dict[str, Any]]:
+        """Read the exact profile-owned Tavus request without inspecting its media."""
+        with psycopg.connect(self.database_url, connect_timeout=10, row_factory=dict_row) as connection:
+            row = connection.execute("""SELECT * FROM digital_human_training_jobs
+                WHERE profile_id=%s AND provider='tavus' AND training_type='avatar'
+                  AND idempotency_key=%s""", (profile_id, idempotency_key)).fetchone()
+        return dict(row) if row is not None else None
 
     def get_training_job(
         self,
@@ -1368,6 +1731,10 @@ class DigitalHumanProfileRepository:
     def clear_voice_identity(
         self,
         profile_id: UUID,
+        *,
+        expected_voice_id: Optional[str],
+        expected_job_id: Optional[str],
+        expected_provider: Optional[str],
     ) -> DigitalHumanProfile:
         with psycopg.connect(
             self.database_url,
@@ -1387,9 +1754,12 @@ class DigitalHumanProfileRepository:
                         last_error_code = NULL,
                         last_error_message = NULL
                     WHERE profile_id = %s
+                      AND voice_id IS NOT DISTINCT FROM %s::text
+                      AND voice_training_job_id IS NOT DISTINCT FROM %s::text
+                      AND voice_provider IS NOT DISTINCT FROM %s::text
                     RETURNING *
                     """,
-                    (profile_id,),
+                    (profile_id, expected_voice_id, expected_job_id, expected_provider),
                 )
 
                 row = cursor.fetchone()
@@ -1397,8 +1767,8 @@ class DigitalHumanProfileRepository:
             connection.commit()
 
         if row is None:
-            raise DigitalHumanProfileNotFoundError(
-                f"Digital human profile not found: {profile_id}"
+            raise StaleVoiceTrainingError(
+                "Voice changed while deletion was in progress."
             )
 
         return self._profile_from_row(row)
@@ -1406,21 +1776,39 @@ class DigitalHumanProfileRepository:
     def mark_runtime_verified(
         self,
         profile_id: UUID,
+        *,
+        expected_profile: DigitalHumanProfile,
     ) -> DigitalHumanProfile:
+        if expected_profile.profile_id != profile_id or not expected_profile.has_runtime_avatar:
+            raise StaleAvatarTrainingError('Avatar runtime binding is not ready.')
         with psycopg.connect(
             self.database_url,
             connect_timeout=10,
             row_factory=dict_row,
         ) as connection:
             with connection.cursor() as cursor:
+                self._lock_profile_scope(cursor, profile_id)
+                cursor.execute('SELECT profile_id FROM digital_human_profiles WHERE profile_id=%s FOR UPDATE', (profile_id,))
+                if cursor.fetchone() is None:
+                    raise DigitalHumanProfileNotFoundError('Avatar profile was not found.')
+                self._require_profile_write_allowed_with_cursor(cursor, profile_id)
                 cursor.execute(
                     """
                     UPDATE digital_human_profiles
                     SET runtime_verified_at = NOW()
                     WHERE profile_id = %s
+                      AND avatar_provider IS NOT DISTINCT FROM %s
+                      AND avatar_replica_id IS NOT DISTINCT FROM %s
+                      AND avatar_persona_id IS NOT DISTINCT FROM %s
+                      AND avatar_training_job_id IS NOT DISTINCT FROM %s
+                      AND training_version = %s
+                      AND avatar_training_status = 'ready'
+                      AND consent_verified = TRUE
                     RETURNING *
                     """,
-                    (profile_id,),
+                    (profile_id, expected_profile.avatar_provider, expected_profile.avatar_replica_id,
+                     expected_profile.avatar_persona_id, expected_profile.avatar_training_job_id,
+                     expected_profile.training_version),
                 )
 
                 row = cursor.fetchone()
@@ -1428,9 +1816,7 @@ class DigitalHumanProfileRepository:
             connection.commit()
 
         if row is None:
-            raise DigitalHumanProfileNotFoundError(
-                f"Digital human profile not found: {profile_id}"
-            )
+            raise StaleAvatarTrainingError('Avatar material changed during runtime verification.')
 
         return self._profile_from_row(row)
 
@@ -1631,6 +2017,8 @@ class DigitalHumanProfileRepository:
                         )
                         DO UPDATE SET
                             updated_at = NOW()
+                        WHERE digital_human_profile_erasure_requests.profile_id = EXCLUDED.profile_id
+                          AND digital_human_profile_erasure_requests.status <> 'completed'
                         RETURNING *
                         """,
                         (
@@ -1646,23 +2034,22 @@ class DigitalHumanProfileRepository:
 
                     row = cursor.fetchone()
 
+                if row is None or row["profile_id"] is None or UUID(str(row["profile_id"])) != profile_id:
+                    raise DigitalHumanProfileRepositoryError(
+                        "Could not create a profile-bound erasure request."
+                    )
+                cursor.execute(
+                    """
+                    UPDATE memory_index_generations
+                    SET generation = generation + 1,
+                        operation_id = %s::uuid,
+                        updated_at = NOW()
+                    WHERE profile_id = %s::uuid
+                    """,
+                    (row["request_id"], profile_id),
+                )
+
             connection.commit()
-
-        if row is None:
-            raise DigitalHumanProfileRepositoryError(
-                "Could not create profile "
-                "erasure request."
-            )
-
-        if (
-            row["profile_id"] is not None
-            and UUID(str(row["profile_id"]))
-            != profile_id
-        ):
-            raise DigitalHumanProfileRepositoryError(
-                "Erasure idempotency key belongs "
-                "to another profile."
-            )
 
         return dict(row)
 
@@ -2131,6 +2518,20 @@ class DigitalHumanProfileRepository:
             row_factory=dict_row,
         ) as connection:
             with connection.cursor() as cursor:
+                # Fence both new generation reservations and already-running publishers.
+                cursor.execute(
+                    "SELECT profile_id FROM digital_human_profiles WHERE profile_id = %s FOR UPDATE",
+                    (profile_id,),
+                )
+                cursor.execute(
+                    "SELECT profile_id FROM memory_index_generations WHERE profile_id = %s FOR UPDATE",
+                    (profile_id,),
+                )
+                cursor.execute(
+                    "DELETE FROM memory_embeddings WHERE lower(profile_id) = lower(%s::text)",
+                    (str(profile_id),),
+                )
+                deleted_memories = cursor.rowcount
                 cursor.execute(
                     """
                     SELECT
@@ -2186,6 +2587,7 @@ class DigitalHumanProfileRepository:
             connection.commit()
 
         return {
+            "memory_embeddings": deleted_memories,
             "profile_deleted":
                 1
                 if deleted is not None

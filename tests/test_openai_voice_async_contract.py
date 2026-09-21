@@ -47,7 +47,7 @@ def test_transcription_yields_and_does_not_force_a_language(monkeypatch):
         monkeypatch.setattr(voice_module, "AsyncOpenAI", factory)
         upload = Upload()
         service = OpenAIVoiceService()
-        task = asyncio.create_task(service.transcribe(upload))
+        task = asyncio.create_task(service.transcribe(upload, authorize=Mock()))
         await asyncio.wait_for(started.wait(), timeout=1)
         assert not task.done()
         release.set()
@@ -57,7 +57,7 @@ def test_transcription_yields_and_does_not_force_a_language(monkeypatch):
         assert create.call_args.kwargs["file"] == ("recording.webm", b"recorded audio")
         upload.read.assert_awaited_once_with(service.MAX_RECORDING_BYTES + 1)
         assert factory.call_args.kwargs["timeout"] == 45.0
-        assert factory.call_args.kwargs["max_retries"] == 1
+        assert factory.call_args.kwargs["max_retries"] == 0
         assert client.closed
 
     asyncio.run(scenario())
@@ -69,7 +69,7 @@ def test_oversize_recording_is_rejected_before_provider_call(monkeypatch):
     factory = Mock()
     monkeypatch.setattr(voice_module, "AsyncOpenAI", factory)
     with pytest.raises(VoiceRecordingTooLargeError):
-        asyncio.run(OpenAIVoiceService().transcribe(Upload(b"12345")))
+        asyncio.run(OpenAIVoiceService().transcribe(Upload(b"12345"), authorize=Mock()))
     factory.assert_not_called()
 
 
@@ -77,7 +77,7 @@ def test_empty_recording_preserves_empty_transcript_contract(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-only")
     factory = Mock()
     monkeypatch.setattr(voice_module, "AsyncOpenAI", factory)
-    result = asyncio.run(OpenAIVoiceService().transcribe(Upload(b"")))
+    result = asyncio.run(OpenAIVoiceService().transcribe(Upload(b""), authorize=Mock()))
     assert result["text"] == ""
     assert result["diagnostic"]["reason"] == "empty_upload"
     factory.assert_not_called()
@@ -95,7 +95,7 @@ def test_cancellation_closes_provider_client(monkeypatch):
 
         client = FakeClient(AsyncMock(side_effect=transcribe))
         monkeypatch.setattr(voice_module, "AsyncOpenAI", Mock(return_value=client))
-        task = asyncio.create_task(OpenAIVoiceService().transcribe(Upload()))
+        task = asyncio.create_task(OpenAIVoiceService().transcribe(Upload(), authorize=Mock()))
         await asyncio.wait_for(started.wait(), timeout=1)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -106,6 +106,8 @@ def test_cancellation_closes_provider_client(monkeypatch):
 
 
 def test_upload_limit_returns_413_and_closes_file(monkeypatch):
+    monkeypatch.setattr(voice_routes, "require_profile_purposes", Mock(return_value=SimpleNamespace(revision=1)))
+    monkeypatch.setattr(voice_routes, "require_profile_access", Mock())
     monkeypatch.setenv("OPENAI_API_KEY", "test-only")
     monkeypatch.setattr(OpenAIVoiceService, "MAX_RECORDING_BYTES", 4)
     upload = Upload(b"12345")
@@ -116,6 +118,8 @@ def test_upload_limit_returns_413_and_closes_file(monkeypatch):
 
 
 def test_provider_error_closes_client_and_returns_safe_503(monkeypatch):
+    monkeypatch.setattr(voice_routes, "require_profile_purposes", Mock(return_value=SimpleNamespace(revision=1)))
+    monkeypatch.setattr(voice_routes, "require_profile_access", Mock())
     monkeypatch.setenv("OPENAI_API_KEY", "test-only")
     client = FakeClient(AsyncMock(side_effect=RuntimeError("private provider detail")))
     monkeypatch.setattr(voice_module, "AsyncOpenAI", Mock(return_value=client))

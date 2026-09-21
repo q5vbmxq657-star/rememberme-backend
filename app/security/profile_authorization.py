@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import lru_cache
 from uuid import UUID
+import psycopg
 
 from fastapi import HTTPException, status
 
@@ -47,6 +49,7 @@ class ProfileAuthorizationService:
         *,
         user: UserIdentity,
         profile_id: UUID,
+        session_id: UUID | None = None,
     ) -> AuthorizedProfileAccess:
         if not user.is_active:
             raise ProfileAuthorizationError(
@@ -56,6 +59,7 @@ class ProfileAuthorizationService:
         membership = self.repository.get(
             user_id=user.user_id,
             profile_id=profile_id,
+            session_id=session_id,
         )
 
         if (
@@ -92,6 +96,8 @@ def require_profile_access(
 ) -> AuthorizedProfileAccess:
     """Authorize one canonical profile without revealing its existence."""
     try:
+        if principal.access_expires_at <= datetime.now(timezone.utc):
+            raise ProfileAuthorizationError("Profile access denied.")
         normalized_profile_id = (
             profile_id
             if isinstance(profile_id, UUID)
@@ -101,6 +107,7 @@ def require_profile_access(
         return get_profile_authorization_service().require_access(
             user=principal.user,
             profile_id=normalized_profile_id,
+            session_id=principal.session_id,
         )
 
     except (ValueError, ProfileAuthorizationError) as error:
@@ -109,7 +116,7 @@ def require_profile_access(
             detail="Profile not found.",
         ) from error
 
-    except ProfileMembershipRepositoryError as error:
+    except (ProfileMembershipRepositoryError, psycopg.Error) as error:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Profile authorization is unavailable.",

@@ -1,3 +1,5 @@
+from collections.abc import Callable
+
 from app.schemas.memory import MemoryChatRequest, MemoryChatResponse
 from app.services.ai_orchestration_service import AIOrchestrationService, AITaskType
 from app.services.memory_chat_openai_client import make_memory_chat_openai_client
@@ -9,17 +11,31 @@ class OpenAIMemoryService:
         self.client = make_memory_chat_openai_client()
         self.orchestration = AIOrchestrationService()
 
-    def generate_response(self, request: MemoryChatRequest) -> MemoryChatResponse:
+    def generate_response(
+        self, request: MemoryChatRequest, *, authorize: Callable[[], None]
+    ) -> MemoryChatResponse:
+        try:
+            authorize()
+            response = self._generate_response(request, authorize=authorize)
+            authorize()
+            return response
+        finally:
+            self.client.close()
+
+    def _generate_response(
+        self, request: MemoryChatRequest, *, authorize: Callable[[], None]
+    ) -> MemoryChatResponse:
         grounded_memories = request.memories[:8]
         system_prompt = MemoryConversationPromptBuilder.build(
             profile_name=request.profile_name,
             relationship=request.relationship,
             persona_context=request.persona_context,
-            memories=grounded_memories,
+            memories=request.memories,
             recent_messages=request.recent_messages,
         )
         route = self.orchestration.route(AITaskType.MEMORY_CHAT)
 
+        authorize()
         try:
             text = self._call_model(
                 model=route.model,
@@ -31,6 +47,8 @@ class OpenAIMemoryService:
         except Exception:
             if not route.fallback_model or route.fallback_model == route.model:
                 raise
+            # A fallback is another disclosure, not a continuation of the first request.
+            authorize()
             text = self._call_model(
                 model=route.fallback_model,
                 system_prompt=system_prompt,
@@ -51,6 +69,7 @@ class OpenAIMemoryService:
         max_output_tokens: int | None = None,
     ) -> str:
         request_payload = {
+            "store": False,
             "model": model,
             "input": [
                 {"role": "system", "content": system_prompt},

@@ -125,6 +125,20 @@ def test_legacy_migrations_are_exactly_frozen():
         "014_podcast_invitation_authority",
         "015_podcast_story_session_and_voice_consent",
         "016_voice_verification_status",
+        "017_memory_index_generations",
+        "018_memory_profile_lookup",
+        "019_memory_usage_decisions",
+        "020_profile_purpose_consents",
+        "021_runtime_session_registry",
+        "022_deletion_retention_contract",
+        "023_memory_conversation_history",
+        "024_account_erasure_recovery",
+        "025_runtime_creation_correlation",
+        "026_openai_realtime_calls",
+        "027_memory_deletion_tombstones",
+        "028_profile_erasure_receipts",
+        "029_runtime_conversation_deletion",
+        "030_memory_confirmed_address",
     ]
 
     for migration in migrations[:6]:
@@ -644,6 +658,20 @@ def test_fresh_plan_bootstraps_through_008():
         "014_podcast_invitation_authority",
         "015_podcast_story_session_and_voice_consent",
         "016_voice_verification_status",
+        "017_memory_index_generations",
+        "018_memory_profile_lookup",
+        "019_memory_usage_decisions",
+        "020_profile_purpose_consents",
+        "021_runtime_session_registry",
+        "022_deletion_retention_contract",
+        "023_memory_conversation_history",
+        "024_account_erasure_recovery",
+        "025_runtime_creation_correlation",
+        "026_openai_realtime_calls",
+        "027_memory_deletion_tombstones",
+        "028_profile_erasure_receipts",
+        "029_runtime_conversation_deletion",
+        "030_memory_confirmed_address",
     ]
 
 

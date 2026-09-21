@@ -1,4 +1,5 @@
 import os
+from collections.abc import Callable
 from openai import AsyncOpenAI
 
 
@@ -18,7 +19,7 @@ class OpenAIVoiceService:
         self.api_key = api_key
         self.transcribe_model = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
 
-    async def transcribe(self, file):
+    async def transcribe(self, file, *, authorize: Callable[[], None]):
         original_filename = getattr(file, "filename", "") or "recording.m4a"
         raw_suffix = os.path.splitext(original_filename)[1].lower().strip()
         rememberme_stt_suffix = raw_suffix if raw_suffix in {
@@ -52,13 +53,15 @@ class OpenAIVoiceService:
         async with AsyncOpenAI(
             api_key=self.api_key,
             timeout=45.0,
-            max_retries=1,
+            max_retries=0,
         ) as client:
+            authorize()
             transcript = await client.audio.transcriptions.create(
                 model=self.transcribe_model,
                 file=(f"recording{rememberme_stt_suffix}", content),
             )
 
+        authorize()
         return {
             "text": transcript.text,
             "diagnostic": {

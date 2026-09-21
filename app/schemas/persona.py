@@ -1,5 +1,6 @@
 from pydantic import BaseModel, Field
 from typing import List
+from uuid import UUID
 
 
 class PersonaMemoryItem(BaseModel):
@@ -10,6 +11,7 @@ class PersonaMemoryItem(BaseModel):
 
 
 class PersonaExtractionRequest(BaseModel):
+    profile_id: UUID
     profile_name: str
     relationship: str
     biography: str = ""

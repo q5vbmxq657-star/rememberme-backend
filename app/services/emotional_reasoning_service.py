@@ -1,6 +1,5 @@
 import json
-import os
-from openai import OpenAI
+from app.services.memory_chat_openai_client import make_memory_chat_openai_client
 
 from app.schemas.emotional_reasoning import (
     EmotionalReasoningRequest,
@@ -11,13 +10,15 @@ from app.services.ai_orchestration_service import AIOrchestrationService, AITask
 
 class EmotionalReasoningService:
     def __init__(self):
-        api_key = os.getenv("OPENAI_API_KEY")
+        self.client = make_memory_chat_openai_client()
+        try:
+            self.orchestration = AIOrchestrationService()
+        except BaseException:
+            self.client.close()
+            raise
 
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is missing.")
-
-        self.client = OpenAI(api_key=api_key)
-        self.orchestration = AIOrchestrationService()
+    def close(self) -> None:
+        self.client.close()
 
     def assess(self, request: EmotionalReasoningRequest) -> EmotionalReasoningResponse:
         route = self.orchestration.route(AITaskType.EMOTIONAL_REASONING)
@@ -32,8 +33,8 @@ class EmotionalReasoningService:
 
         try:
             data = json.loads(self._clean_json(raw))
-        except Exception:
-            raise RuntimeError(f"Emotional reasoning JSON parse failed: {raw}")
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("Emotional safety assessment could not be validated.") from error
 
         return EmotionalReasoningResponse(**data)
 
@@ -45,6 +46,7 @@ class EmotionalReasoningService:
         max_output_tokens=None
     ) -> str:
         payload = {
+            "store": False,
             "model": model,
             "input": [
                 {

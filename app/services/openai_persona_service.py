@@ -1,5 +1,6 @@
 import os
 import json
+from collections.abc import Callable
 from openai import OpenAI
 
 from app.schemas.persona import PersonaExtractionRequest, PersonaExtractionResponse
@@ -13,10 +14,19 @@ class OpenAIPersonaService:
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is missing.")
 
-        self.client = OpenAI(api_key=api_key)
+        self.client = OpenAI(api_key=api_key, max_retries=0, timeout=25)
         self.orchestration = AIOrchestrationService()
 
-    def extract(self, request: PersonaExtractionRequest) -> PersonaExtractionResponse:
+    def extract(self, request: PersonaExtractionRequest, *, authorize: Callable[[], None]) -> PersonaExtractionResponse:
+        try:
+            authorize()
+            result = self._extract(request, authorize=authorize)
+            authorize()
+            return result
+        finally:
+            self.client.close()
+
+    def _extract(self, request: PersonaExtractionRequest, *, authorize: Callable[[], None]) -> PersonaExtractionResponse:
         memory_context = self._build_memory_context(request)
         prompt = self._build_prompt(
             request=request,
@@ -25,6 +35,7 @@ class OpenAIPersonaService:
 
         route = self.orchestration.route(AITaskType.PERSONA_EXTRACTION)
 
+        authorize()
         try:
             raw = self._call_model(
                 model=route.model,
@@ -36,6 +47,7 @@ class OpenAIPersonaService:
             if not route.fallback_model or route.fallback_model == route.model:
                 raise
 
+            authorize()
             raw = self._call_model(
                 model=route.fallback_model,
                 prompt=prompt,
@@ -54,6 +66,7 @@ class OpenAIPersonaService:
         max_output_tokens=None
     ) -> str:
         request_payload = {
+            "store": False,
             "model": model,
             "input": [
                 {

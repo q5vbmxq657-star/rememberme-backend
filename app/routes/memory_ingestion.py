@@ -26,6 +26,8 @@ def ingest_memory(
         service = MemoryIngestionService()
         return service.ingest(request)
 
+    except HTTPException:
+        raise
     except Exception as error:
         raise HTTPException(
             status_code=503,

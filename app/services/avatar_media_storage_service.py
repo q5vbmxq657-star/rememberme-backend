@@ -21,6 +21,7 @@ from urllib.parse import urljoin
 
 from fastapi import UploadFile
 from starlette.datastructures import Headers
+from app.security.purpose_authorization import require_profile_purposes
 
 from app.schemas.avatar_media import (
     AvatarMediaListResponse,
@@ -31,6 +32,10 @@ from app.schemas.avatar_media import (
 )
 
 
+class AvatarMediaAssetNotFoundError(RuntimeError):
+    """The metadata scan completed and the requested asset does not exist."""
+
+
 class AvatarMediaStorageConfigurationError(
     RuntimeError
 ):
@@ -38,6 +43,8 @@ class AvatarMediaStorageConfigurationError(
 
 
 class AvatarMediaStorageService:
+
+    avatar_video_provider_max_bytes = 750_000_000
 
     development_signing_secret = (
         "rememberme-dev-media-secret-change-me"
@@ -130,6 +137,11 @@ class AvatarMediaStorageService:
                 "52428800",
             )
         )
+        self.avatar_video_max_file_size_bytes = int(os.getenv(
+            "AVATAR_VIDEO_MAX_FILE_SIZE_BYTES", str(self.avatar_video_provider_max_bytes)
+        ))
+        if not 1 <= self.avatar_video_max_file_size_bytes <= self.avatar_video_provider_max_bytes:
+            raise ValueError("AVATAR_VIDEO_MAX_FILE_SIZE_BYTES must be between 1 and 750000000 bytes.")
 
         self.allowed_asset_types = {
             "image",
@@ -264,6 +276,11 @@ class AvatarMediaStorageService:
 
         size_bytes = 0
         created_new_file = False
+        upload_limit = (
+            self.avatar_video_max_file_size_bytes
+            if asset_type in {"video", "training_sample"} and normalized_content_type.startswith("video/")
+            else self.max_file_size_bytes
+        )
 
         try:
             with temporary_file_path.open(
@@ -283,11 +300,11 @@ class AvatarMediaStorageService:
 
                     if (
                         size_bytes
-                        > self.max_file_size_bytes
+                        > upload_limit
                     ):
                         raise RuntimeError(
-                            "Uploaded media exceeds "
-                            "maximum file size."
+                            f"Uploaded media exceeds the {upload_limit / 1_000_000:g} MB "
+                            f"limit ({upload_limit} bytes). Choose a smaller file."
                         )
 
                     output.write(
@@ -814,11 +831,15 @@ class AvatarMediaStorageService:
                 "Training media does not belong to the requested profile."
             )
 
+        purpose = self._training_purpose(metadata)
+        consent = require_profile_purposes(uuid.UUID(profile_id), {purpose})
         return self._sign_download_url(
             asset_id=asset_id,
             base_url=base_url,
             expires_in_seconds=24 * 60 * 60,
             maximum_lifetime_seconds=24 * 60 * 60,
+            consent_revision=consent.revision,
+            purpose=purpose,
         )
 
     def _sign_download_url(
@@ -828,6 +849,8 @@ class AvatarMediaStorageService:
         base_url: Optional[str],
         expires_in_seconds: int,
         maximum_lifetime_seconds: int,
+        consent_revision: int | None = None,
+        purpose: str | None = None,
     ) -> AvatarMediaSignResponse:
         metadata = self.get_metadata(
             asset_id
@@ -857,6 +880,8 @@ class AvatarMediaStorageService:
         signature = self._signature(
             asset_id=asset_id,
             expires_at=expires_at,
+            consent_revision=consent_revision,
+            purpose=purpose,
         )
 
         signed_url = (
@@ -866,6 +891,8 @@ class AvatarMediaStorageService:
             f"?expires={expires_at}"
             f"&signature={signature}"
         )
+        if consent_revision is not None:
+            signed_url += f"&consent_revision={consent_revision}&purpose={purpose}"
 
         return AvatarMediaSignResponse(
             asset_id=metadata.asset_id,
@@ -907,6 +934,8 @@ class AvatarMediaStorageService:
         asset_id: str,
         expires: int,
         signature: str,
+        consent_revision: int | None = None,
+        purpose: str | None = None,
     ) -> AvatarMediaMetadata:
         if expires < int(
             time.time()
@@ -918,6 +947,8 @@ class AvatarMediaStorageService:
         expected = self._signature(
             asset_id=asset_id,
             expires_at=expires,
+            consent_revision=consent_revision,
+            purpose=purpose,
         )
 
         if not hmac.compare_digest(
@@ -928,9 +959,26 @@ class AvatarMediaStorageService:
                 "Invalid signed media URL."
             )
 
-        return self.get_metadata(
-            asset_id
-        )
+        metadata = self.get_metadata(asset_id)
+        if consent_revision is not None:
+            if purpose != self._training_purpose(metadata):
+                raise RuntimeError("Training media purpose does not match.")
+            require_profile_purposes(
+                uuid.UUID(metadata.profile_id), {purpose},
+                expected_revision=consent_revision,
+            )
+        return metadata
+
+    @staticmethod
+    def _training_purpose(metadata: AvatarMediaMetadata) -> str:
+        for prefix, purpose in (
+            ("image/", "photo_likeness"),
+            ("video/", "video_motion"),
+            ("audio/", "voice_synthesis"),
+        ):
+            if metadata.content_type.startswith(prefix):
+                return purpose
+        raise RuntimeError("This media cannot be used for avatar training.")
 
     def get_metadata(
         self,
@@ -964,7 +1012,7 @@ class AvatarMediaStorageService:
                     data
                 )
 
-        raise RuntimeError(
+        raise AvatarMediaAssetNotFoundError(
             "Media asset not found."
         )
 
@@ -1534,9 +1582,14 @@ class AvatarMediaStorageService:
         self,
         asset_id: str,
         expires_at: int,
+        consent_revision: int | None = None,
+        purpose: str | None = None,
     ) -> str:
+        if (consent_revision is None) != (purpose is None):
+            raise RuntimeError("Incomplete training media authorization.")
         payload = (
-            f"{asset_id}:{expires_at}"
+            (f"{asset_id}:{expires_at}" if consent_revision is None else
+             f"provider-v1:{asset_id}:{expires_at}:{purpose}:{consent_revision}")
             .encode(
                 "utf-8"
             )

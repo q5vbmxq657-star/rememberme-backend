@@ -1,19 +1,27 @@
 import asyncio
 import os
-from urllib.parse import urlsplit
+import re
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 import uuid
-from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, Callable
 from uuid import UUID
 
 import httpx
-from app.services.avatar_media_storage_service import AvatarMediaStorageService
+from psycopg import Error as DatabaseError
+from app.security.purpose_authorization import require_profile_purposes
+from app.services.avatar_media_storage_service import AvatarMediaStorageService, AvatarMediaAssetNotFoundError
+from app.services.avatar_media_analysis_service import (
+    AvatarMediaAnalysisService, AvatarMediaAnalysisError, AvatarMediaAnalysisUnavailableError,
+)
 from app.services.avatar_evidence_repository import AvatarEvidenceRepository, AvatarEvidenceRepositoryError
 
 from app.services.digital_human_profile_repository import (
     DigitalHumanProfileNotFoundError,
     DigitalHumanProfileRepository,
     DigitalHumanProfileRepositoryError,
+    StaleAvatarTrainingError,
 )
 
 
@@ -24,6 +32,8 @@ class AvatarProviderJobState:
     status: str
     preview_url: Optional[str]
     error_message: Optional[str] = None
+    current_stage: Optional[str] = None
+    provider_detail_message: Optional[str] = None
 
 
 class AvatarProviderStatusUnavailableError(RuntimeError):
@@ -79,18 +89,98 @@ class AvatarProviderService:
         if not api_key:
             raise RuntimeError("Tavus deletion is unavailable.")
 
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
             for resource, raw_identifier in identifiers:
                 identifier = (raw_identifier or "").strip()
                 if not identifier:
                     continue
 
                 response = await client.delete(
-                    f"https://tavusapi.com/v2/{resource}/{identifier}",
+                    f"https://tavusapi.com/v2/{resource}/{quote(identifier, safe='')}",
+                    params={"hard": "true"} if resource == "replicas" else {},
                     headers={"x-api-key": api_key},
                 )
                 if response.status_code not in {200, 204, 404}:
                     raise RuntimeError("Tavus deletion could not be verified.")
+
+    async def delete_tavus_face(self, *, face_id: str) -> None:
+        """Delete the face and its training assets, independently of active consent."""
+        identifier = face_id.strip()
+        if not identifier or any(
+            character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+            for character in identifier
+        ):
+            raise ValueError("Invalid Tavus face identity.")
+        api_key = (os.getenv("TAVUS_API_KEY") or "").strip()
+        if not api_key:
+            raise RuntimeError("Tavus deletion is unavailable.")
+        async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
+            response = await client.delete(
+                f"https://tavusapi.com/v2/faces/{identifier}",
+                params={"hard": "true"},
+                headers={"x-api-key": api_key},
+            )
+        if response.status_code not in {200, 404}:
+            raise RuntimeError("Tavus face deletion could not be verified.")
+
+    async def delete_tavus_conversation(self, *, conversation_id: str) -> None:
+        """Hard-delete an ended conversation and verify absence before acknowledgement."""
+        identifier = conversation_id.strip()
+        if not identifier or any(character not in
+                'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-'
+                for character in identifier):
+            raise ValueError('Invalid Tavus conversation identity.')
+        api_key = (os.getenv('TAVUS_API_KEY') or '').strip()
+        if not api_key:
+            raise RuntimeError('Tavus conversation deletion is unavailable.')
+        url = f'https://tavusapi.com/v2/conversations/{identifier}'
+        headers = {'x-api-key': api_key}
+        try:
+            async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
+                response = await client.delete(url, params={'hard': 'true'}, headers=headers)
+                if response.status_code not in {204, 404}:
+                    raise RuntimeError('Tavus conversation deletion remains unverified.')
+                verification = await client.get(url, headers=headers)
+                if verification.status_code != 404:
+                    raise RuntimeError('Tavus conversation absence remains unverified.')
+        except httpx.HTTPError:
+            raise RuntimeError('Tavus conversation deletion is temporarily unavailable.') from None
+
+    async def end_tavus_conversation(self, *, conversation_id: str) -> None:
+        """End the exact provider conversation and verify its terminal status."""
+        identifier = conversation_id.strip()
+        api_key = (os.getenv("TAVUS_API_KEY") or "").strip()
+        if not identifier or not api_key:
+            raise RuntimeError("Tavus conversation cleanup is unavailable.")
+        url = f"https://tavusapi.com/v2/conversations/{quote(identifier, safe='')}"
+        headers = {"x-api-key": api_key}
+
+        async def observe(client: httpx.AsyncClient) -> str:
+            response = await client.get(url, headers=headers)
+            if response.status_code != 200:
+                raise RuntimeError("Tavus conversation status could not be verified.")
+            try:
+                payload = response.json()
+            except ValueError as error:
+                raise RuntimeError("Tavus conversation status could not be verified.") from error
+            if not isinstance(payload, dict) or payload.get("conversation_id") != identifier:
+                raise RuntimeError("Tavus conversation identity could not be verified.")
+            state = payload.get("status")
+            if state not in {"active", "ended"}:
+                raise RuntimeError("Tavus conversation status could not be verified.")
+            return state
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                if await observe(client) == "ended":
+                    return
+                response = await client.post(f"{url}/end", headers=headers)
+                if response.status_code != 200:
+                    raise RuntimeError("Tavus conversation cleanup could not be verified.")
+                if await observe(client) != "ended":
+                    raise RuntimeError("Tavus conversation is not yet confirmed ended.")
+        except httpx.HTTPError as error:
+            raise RuntimeError("Tavus conversation cleanup is temporarily unavailable.") from error
 
     async def submit(
         self,
@@ -125,6 +215,9 @@ class AvatarProviderService:
     ) -> AvatarProviderJobState:
         cached = self._jobs.get(external_job_id)
 
+        if external_job_id.startswith("tavus:pending:"):
+            return await self._pending_tavus_status(external_job_id)
+
         if external_job_id.startswith(("tavus:video:", "tavus-video:")):
             return await self.fetch_tavus_video_status(external_job_id)
 
@@ -142,6 +235,9 @@ class AvatarProviderService:
                     preview_url=None,
                     error_message="Tavus provider job was not found in durable training state.",
                 )
+            if durable.status in {'failed', 'cancelled', 'deleted'}:
+                return replace(durable, status='failed', external_avatar_id=None,
+                    error_message=durable.error_message or 'This avatar request is no longer active.')
 
             return await self._fetch_tavus_status(durable)
 
@@ -162,6 +258,39 @@ class AvatarProviderService:
         package_record_id: str,
         package: Dict[str, Any],
     ) -> AvatarProviderJobState:
+        profile_uuid = self._parse_profile_id(profile_id)
+        if profile_uuid is None:
+            return AvatarProviderJobState(
+                external_job_id=f"tavus:{uuid.uuid4()}",
+                external_avatar_id=None,
+                status="failed",
+                preview_url=None,
+                error_message="profile_id must be a valid UUID for Tavus avatar training.",
+            )
+
+        # Upload metadata uses canonical UUIDs; Swift UUID.uuidString is uppercase.
+        # Normalize before checking ownership or creating the provider media lease.
+        profile_id = str(profile_uuid)
+        idempotency_key = f"avatar:tavus:{profile_id}:{package_record_id}"
+        try:
+            existing_request = await asyncio.to_thread(
+                self._repository().get_avatar_training_request,
+                profile_id=profile_uuid, idempotency_key=idempotency_key,
+            )
+        except (DigitalHumanProfileRepositoryError, DatabaseError) as error:
+            raise AvatarProviderStatusUnavailableError('Avatar job storage is unavailable.') from error
+        if existing_request:
+            if existing_request.get('status') in {'failed', 'cancelled', 'deleted'}:
+                return self._pending_training_state(existing_request)
+            provider_job_id = existing_request.get('provider_job_id')
+            if provider_job_id:
+                existing_state = await asyncio.to_thread(
+                    self._load_tavus_training_state, external_job_id=provider_job_id,
+                )
+                if existing_state is not None:
+                    return existing_state
+            if existing_request.get('status') != 'created':
+                return self._pending_training_state(existing_request)
         api_key = os.getenv("TAVUS_API_KEY")
 
         if not api_key:
@@ -173,10 +302,23 @@ class AvatarProviderService:
                 error_message="TAVUS_API_KEY is not configured.",
             )
 
-        training_source = self._extract_tavus_training_source(
-            package,
-            profile_id=profile_id,
-        )
+        try:
+            training_source = await asyncio.to_thread(
+                self._extract_tavus_training_source, package, profile_id=profile_id,
+            )
+        except AvatarMediaAnalysisUnavailableError as error:
+            raise AvatarProviderStatusUnavailableError(
+                "Your media is saved. Its training requirements could not be checked. Try again shortly."
+            ) from error
+        except AvatarMediaAnalysisError as error:
+            return AvatarProviderJobState(
+                external_job_id=f"tavus:{uuid.uuid4()}", external_avatar_id=None,
+                status="failed", preview_url=None, error_message=error.user_message,
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            raise AvatarProviderStatusUnavailableError(
+                "Your media is saved. Avatar preparation is temporarily unavailable. Try again shortly."
+            ) from error
 
         if training_source is None:
             return AvatarProviderJobState(
@@ -185,31 +327,23 @@ class AvatarProviderService:
                 status="failed",
                 preview_url=None,
                 error_message=(
-                    "No Tavus training source URL found in avatar package. "
-                    "The package must contain one public HTTPS training image "
-                    "or training video URL."
+                    "The selected photo or video is not available for this profile. "
+                    "Choose a saved avatar source or upload it again."
                 ),
             )
 
-        profile_uuid = self._parse_profile_id(profile_id)
-
-        if profile_uuid is None:
-            return AvatarProviderJobState(
-                external_job_id=f"tavus:{uuid.uuid4()}",
-                external_avatar_id=None,
-                status="failed",
-                preview_url=None,
-                error_message="profile_id must be a valid UUID for Tavus avatar training.",
-            )
-
         source_kind, source_url = training_source
-        idempotency_key = f"avatar:tavus:{profile_id}:{package_record_id}"
-
+        purposes = ({"photo_likeness"} if source_kind == "train_image_url"
+                    else {"video_motion", "voice_synthesis"})
+        consent = await asyncio.to_thread(require_profile_purposes, profile_uuid, purposes)
         request_payload: Dict[str, Any] = {
             "package_record_id": package_record_id,
+            "_stay_consent_revision": consent.revision,
             source_kind: source_url,
             "model_name": "phoenix-4",
         }
+        job_id = uuid.uuid4()
+        request_payload['_stay_face_name'] = f'stay_face_{job_id.hex}'
 
         if source_kind == "train_image_url":
             voice_name = self._extract_tavus_image_voice_name(package)
@@ -224,15 +358,30 @@ class AvatarProviderService:
                     ),
                 )
             request_payload["voice_name"] = voice_name
-            request_payload["auto_fix_training_image"] = bool(
-                package.get("auto_fix_training_image", True)
-            )
+            # Generative image alteration has no qualified, separately consented
+            # product flow yet. A client package must not enable it implicitly.
+            request_payload["auto_fix_training_image"] = False
+
+        callback_url = os.getenv("TAVUS_CALLBACK_URL")
+        webhook_secret = os.getenv("TAVUS_WEBHOOK_SECRET")
+        verified_callback_url = None
+        if callback_url and webhook_secret:
+            try:
+                callback = urlsplit(callback_url)
+                if callback.scheme != 'https' or not callback.netloc or callback.username:
+                    raise ValueError('Invalid callback URL')
+                query = [(key, value) for key, value in parse_qsl(callback.query, keep_blank_values=True)
+                         if key != 'secret']
+                query.append(('secret', webhook_secret))
+                verified_callback_url = urlunsplit(callback._replace(query=urlencode(query), fragment=''))
+            except ValueError as error:
+                raise AvatarProviderStatusUnavailableError('Avatar callback configuration is unavailable.') from error
 
         try:
             repository = self._repository()
-            repository.ensure(profile_uuid)
-            training_job = repository.create_training_job(
-                job_id=uuid.uuid4(),
+            await asyncio.to_thread(repository.ensure, profile_uuid)
+            training_job = await asyncio.to_thread(repository.create_training_job,
+                job_id=job_id,
                 profile_id=profile_uuid,
                 training_type="avatar",
                 provider="tavus",
@@ -241,37 +390,43 @@ class AvatarProviderService:
                 idempotency_key=idempotency_key,
                 request_payload=request_payload,
             )
-        except DigitalHumanProfileRepositoryError as error:
-            return AvatarProviderJobState(
-                external_job_id=f"tavus:{uuid.uuid4()}",
-                external_avatar_id=None,
-                status="failed",
-                preview_url=None,
-                error_message="Avatar training is temporarily unavailable.",
-            )
+        except (DigitalHumanProfileRepositoryError, DatabaseError) as error:
+            raise AvatarProviderStatusUnavailableError(
+                "Avatar preparation is temporarily unavailable. Please try again shortly."
+            ) from error
 
         if not bool(training_job.get("was_created", False)):
+            if training_job.get('status') in {'failed', 'cancelled', 'deleted'}:
+                return self._pending_training_state(training_job)
             existing_external_job_id = str(
                 training_job.get("provider_job_id") or ""
             ).strip()
 
             if existing_external_job_id:
-                existing_state = self._load_tavus_training_state(
+                existing_state = await asyncio.to_thread(self._load_tavus_training_state,
                     external_job_id=existing_external_job_id,
                 )
                 if existing_state is not None:
                     return existing_state
 
-            return AvatarProviderJobState(
-                external_job_id=f"tavus:pending:{training_job['job_id']}",
-                external_avatar_id=None,
-                status="failed",
-                preview_url=None,
-                error_message="This avatar training request is already being submitted.",
-            )
+            if training_job.get('status') != 'created':
+                return self._pending_training_state(training_job)
+            saved_request = dict(training_job.get('request_payload') or {})
+            saved_source = saved_request.get(source_kind)
+            if (saved_request.get('_stay_consent_revision') != consent.revision
+                    or not isinstance(saved_source, str)
+                    or urlsplit(saved_source).path != urlsplit(source_url).path
+                    or not re.fullmatch(r'stay_face_[0-9a-f]{32}', str(saved_request.get('_stay_face_name') or ''))):
+                raise AvatarProviderStatusUnavailableError(
+                    'The saved avatar request could not be resumed with this material. Review your avatar setup.'
+                )
+            # A created job has never claimed its one external POST. Keep its
+            # original correlation and settings, but renew the owned media lease.
+            request_payload = saved_request
+            request_payload[source_kind] = source_url
 
         payload: Dict[str, Any] = {
-            "face_name": f"RememberMe-{profile_id[:8]}",
+            "face_name": request_payload['_stay_face_name'],
             "model_name": "phoenix-4",
             source_kind: source_url,
         }
@@ -282,25 +437,32 @@ class AvatarProviderService:
                 "auto_fix_training_image"
             ]
 
-        callback_url = os.getenv("TAVUS_CALLBACK_URL")
-        webhook_secret = os.getenv("TAVUS_WEBHOOK_SECRET")
+        if verified_callback_url:
+            payload["callback_url"] = verified_callback_url
 
-        if callback_url:
-            if webhook_secret and "secret=" not in callback_url:
-                separator = "&" if "?" in callback_url else "?"
-                callback_url = f"{callback_url}{separator}secret={webhook_secret}"
+        await asyncio.to_thread(require_profile_purposes, profile_uuid, purposes, expected_revision=consent.revision)
+        claimed = await asyncio.to_thread(repository.claim_avatar_submission,
+            job_id=training_job['job_id'], profile_id=profile_uuid)
+        if not claimed:
+            return await self._pending_tavus_status(f"tavus:pending:{training_job['job_id']}")
+        try:
+            async with httpx.AsyncClient(timeout=90, follow_redirects=False) as client:
+                response = await asyncio.wait_for(
+                    client.post(
+                        "https://tavusapi.com/v2/faces",
+                        headers={
+                            "Content-Type": "application/json",
+                            "x-api-key": api_key,
+                        },
+                        json=payload,
+                    ),
+                    timeout=90,
+                )
+        except (httpx.RequestError, TimeoutError):
+            return self._pending_training_state(training_job)
 
-            payload["callback_url"] = callback_url
-
-        async with httpx.AsyncClient(timeout=90) as client:
-            response = await client.post(
-                "https://tavusapi.com/v2/faces",
-                headers={
-                    "Content-Type": "application/json",
-                    "x-api-key": api_key,
-                },
-                json=payload,
-            )
+        if response.status_code in {408, 409, 429} or response.status_code >= 500:
+            return self._pending_training_state(training_job)
 
         if response.status_code >= 400:
             normalized_error = self._normalize_tavus_error(
@@ -308,7 +470,7 @@ class AvatarProviderService:
                 response_text=response.text,
             )
 
-            self._mark_tavus_training_failed(
+            await asyncio.to_thread(self._mark_tavus_training_failed,
                 job_id=training_job["job_id"],
                 profile_id=profile_uuid,
                 provider_job_id=None,
@@ -319,47 +481,41 @@ class AvatarProviderService:
             )
 
             return AvatarProviderJobState(
-                external_job_id=f"tavus:{uuid.uuid4()}",
+                external_job_id=f"tavus:pending:{training_job['job_id']}",
                 external_avatar_id=None,
                 status="failed",
                 preview_url=None,
                 error_message=normalized_error,
             )
 
-        data = response.json()
+        if response.status_code not in {200, 201}:
+            return self._pending_training_state(training_job)
+        try:
+            data = response.json()
+        except ValueError:
+            return self._pending_training_state(training_job)
+        if not isinstance(data, dict):
+            return self._pending_training_state(training_job)
         replica_id = (
             data.get("face_id")
             or data.get("replica_id")
             or data.get("id")
         )
 
-        if not replica_id:
-            error_message = "Tavus response did not include face_id."
-
-            self._mark_tavus_training_failed(
-                job_id=training_job["job_id"],
-                profile_id=profile_uuid,
-                provider_job_id=None,
-                error_message=error_message,
-                provider_payload=data,
-            )
-
-            return AvatarProviderJobState(
-                external_job_id=f"tavus:{uuid.uuid4()}",
-                external_avatar_id=None,
-                status="failed",
-                preview_url=None,
-                error_message=error_message,
-            )
+        if not isinstance(replica_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,200}', replica_id):
+            return self._pending_training_state(training_job)
 
         external_job_id = f"tavus:{replica_id}"
 
-        self._mark_tavus_training_submitted(
+        await asyncio.to_thread(self._mark_tavus_training_submitted,
             job_id=training_job["job_id"],
             profile_id=profile_uuid,
             provider_job_id=external_job_id,
             replica_id=replica_id,
             provider_payload=data,
+            authorize=lambda: require_profile_purposes(
+                profile_uuid, purposes, expected_revision=consent.revision
+            ),
         )
 
         state = AvatarProviderJobState(
@@ -400,7 +556,7 @@ class AvatarProviderService:
                 "Avatar training status is temporarily unavailable."
             ) from error
 
-        if response.status_code >= 400:
+        if response.status_code != 200:
             raise AvatarProviderStatusUnavailableError(
                 "Avatar training status is temporarily unavailable."
             )
@@ -415,6 +571,11 @@ class AvatarProviderService:
             raise AvatarProviderStatusUnavailableError(
                 "Avatar training status is temporarily unavailable."
             )
+        returned_id = data.get('face_id') or data.get('replica_id')
+        if returned_id != replica_id:
+            raise AvatarProviderStatusUnavailableError(
+                "Avatar training status could not be verified."
+            )
         tavus_status = data["status"].strip().lower()
 
         if tavus_status in {"ready", "completed", "complete"}:
@@ -423,10 +584,14 @@ class AvatarProviderService:
             existing.error_message = None
         elif tavus_status in {"failed", "error"}:
             existing.status = "failed"
-            existing.error_message = "Avatar training did not complete."
-        else:
+            existing.error_message = self._normalize_tavus_error(
+                422, self._extract_tavus_error_from_payload(data) or ''
+            )
+        elif tavus_status in {'started', 'training', 'processing', 'queued', 'pending'}:
             existing.status = "training"
             existing.error_message = None
+        else:
+            raise AvatarProviderStatusUnavailableError('Avatar training status is not recognized.')
 
         await asyncio.to_thread(
             self._sync_tavus_status_to_profile,
@@ -443,6 +608,7 @@ class AvatarProviderService:
         replica_id: str,
         script: str,
     ) -> AvatarProviderJobState:
+        consent = require_profile_purposes(profile_id, {"video_motion", "memory_context"})
         normalized_replica_id = (
             replica_id.strip()
         )
@@ -623,6 +789,7 @@ class AvatarProviderService:
                 ),
             )
 
+        require_profile_purposes(profile_id, {"video_motion", "memory_context"}, expected_revision=consent.revision)
         try:
             async with httpx.AsyncClient(
                 timeout=90
@@ -1555,12 +1722,78 @@ class AvatarProviderService:
 
         return self._profile_repository
 
+    @staticmethod
+    def _pending_training_state(job: Dict[str, Any]) -> AvatarProviderJobState:
+        failed = job.get('status') in {'failed', 'cancelled', 'deleted'}
+        return AvatarProviderJobState(
+            external_job_id=f"tavus:pending:{job['job_id']}",
+            external_avatar_id=None, status='failed' if failed else 'uploading', preview_url=None,
+            error_message=(job.get('error_message') or 'This avatar request is no longer active.') if failed else None,
+            current_stage=None if failed else 'Confirming avatar creation',
+            provider_detail_message=None if failed else (
+                'Your request is saved. We are checking whether avatar creation has started. '
+                'No new upload is needed.'
+            ),
+        )
+
+    def _pending_training_job(self, external_job_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            job_id = UUID(external_job_id.removeprefix('tavus:pending:'))
+        except ValueError:
+            return None
+        job = self._repository().get_training_job(job_id)
+        if not job or job.get('provider') != 'tavus' or job.get('training_type') != 'avatar':
+            return None
+        return job
+
+    async def _pending_tavus_status(self, external_job_id: str) -> AvatarProviderJobState:
+        job = await asyncio.to_thread(self._pending_training_job, external_job_id)
+        if not job:
+            raise DigitalHumanProfileNotFoundError('Avatar job was not found.')
+        if job.get('status') in {'failed', 'cancelled', 'deleted'}:
+            return self._pending_training_state(job)
+        provider_id = job.get('provider_job_id')
+        if not provider_id:
+            correlation = (job.get('request_payload') or {}).get('_stay_face_name')
+            started = job.get('submitted_at') or job.get('created_at')
+            if (correlation and isinstance(started, datetime) and started.tzinfo is not None
+                    and (datetime.now(timezone.utc) - started).total_seconds() >= 120):
+                from app.services.tavus_training_reconciliation import find_training_face
+                try:
+                    face = await find_training_face(correlation)
+                except Exception as error:
+                    raise AvatarProviderStatusUnavailableError('Avatar creation confirmation is unavailable.') from error
+                if face is not None:
+                    job = await asyncio.to_thread(self._repository().adopt_reconciled_avatar,
+                        job_id=job['job_id'], correlation_name=correlation,
+                        face_id=face['face_id'], provider_payload=face)
+                    provider_id = job.get('provider_job_id')
+                    if job.get('status') in {'failed', 'cancelled', 'deleted'}:
+                        return self._pending_training_state(job)
+            if not provider_id:
+                return self._pending_training_state(job)
+        durable = await asyncio.to_thread(self._load_tavus_training_state, external_job_id=provider_id)
+        if durable is None:
+            raise AvatarProviderStatusUnavailableError('Avatar creation confirmation is unavailable.')
+        try:
+            await asyncio.to_thread(self._repository().set_avatar_training,
+                job['profile_id'], provider='tavus', status=durable.status,
+                provider_job_id=provider_id, replica_id=durable.external_avatar_id,
+                training_job_id=job['job_id'])
+        except StaleAvatarTrainingError:
+            pass
+        state = await self._fetch_tavus_status(durable)
+        # Keep the durable client handle stable; its resolved provider ID remains server-owned.
+        return replace(state, external_job_id=external_job_id)
+
     def require_training_job_profile_id(self, external_job_id: str) -> UUID:
         if external_job_id.startswith(("tavus:video:", "tavus-video:")):
             job = self._repository().get_generated_preview_job_by_external_id(
                 provider="tavus",
                 external_job_id=external_job_id,
             )
+        elif external_job_id.startswith('tavus:pending:'):
+            job = self._pending_training_job(external_job_id)
         elif external_job_id.startswith("tavus:"):
             job = self._repository().get_training_job_by_provider_job_id(
                 provider="tavus",
@@ -1590,8 +1823,8 @@ class AvatarProviderService:
                 provider="tavus",
                 provider_job_id=external_job_id,
             )
-        except DigitalHumanProfileRepositoryError:
-            return None
+        except (DigitalHumanProfileRepositoryError, DatabaseError) as error:
+            raise AvatarProviderStatusUnavailableError('Avatar job storage is unavailable.') from error
 
         if not job:
             return None
@@ -1621,6 +1854,7 @@ class AvatarProviderService:
         provider_job_id: str,
         replica_id: str,
         provider_payload: Dict[str, Any],
+        authorize: Callable[[], object],
     ) -> None:
         repository = self._repository()
 
@@ -1631,8 +1865,11 @@ class AvatarProviderService:
             provider_payload=provider_payload,
         )
 
+        # Keep the external ID for erasure even if consent changed during creation.
+        authorize()
         repository.set_avatar_training(
             profile_id,
+            training_job_id=job_id,
             provider="tavus",
             status="training",
             provider_job_id=provider_job_id,
@@ -1664,6 +1901,7 @@ class AvatarProviderService:
 
             repository.set_avatar_training(
                 profile_id,
+                training_job_id=job_id,
                 provider="tavus",
                 status="failed",
                 provider_job_id=provider_job_id,
@@ -1694,34 +1932,35 @@ class AvatarProviderService:
             )
 
             if not job:
-                return
+                raise DigitalHumanProfileNotFoundError('Avatar training job was not found.')
 
-            profile_id = job["profile_id"]
-
-            repository.update_training_job(
-                job["job_id"],
-                status=state.status,
-                provider_job_id=state.external_job_id,
-                provider_payload=provider_payload,
-                error_code="tavus_provider_failed" if state.status == "failed" else None,
-                error_message=state.error_message,
-            )
-
-            repository.set_avatar_training(
-                profile_id,
+            canonical = repository.apply_avatar_training_result(
+                profile_id=job["profile_id"],
+                job_id=job["job_id"],
                 provider="tavus",
                 status=state.status,
                 provider_job_id=state.external_job_id,
                 replica_id=state.external_avatar_id,
+                provider_payload=provider_payload,
                 error_code="tavus_provider_failed" if state.status == "failed" else None,
                 error_message=state.error_message,
-                expected_provider_job_id=state.external_job_id,
             )
+            state.status = canonical['status']
+            state.error_message = canonical.get('error_message')
+            if state.status in {'cancelled', 'deleted'}:
+                state.status = 'failed'
+                state.external_avatar_id = None
+                state.error_message = 'This avatar request is no longer active.'
+            elif state.status == 'ready':
+                state.error_message = None
         except (
             DigitalHumanProfileRepositoryError,
             DigitalHumanProfileNotFoundError,
-        ):
-            return
+            DatabaseError,
+        ) as error:
+            raise AvatarProviderStatusUnavailableError(
+                'Avatar training status could not be saved. Please try again shortly.'
+            ) from error
 
     def apply_tavus_webhook(
         self,
@@ -1769,7 +2008,7 @@ class AvatarProviderService:
                 external_avatar_id=replica_id,
                 status="failed",
                 preview_url=None,
-                error_message=error_message or "Tavus replica training failed.",
+                error_message=self._normalize_tavus_error(422, error_message or ''),
             )
         else:
             state = AvatarProviderJobState(
@@ -1851,7 +2090,9 @@ class AvatarProviderService:
         if normalized in {"failed", "error", "cancelled", "canceled"}:
             return "failed"
 
-        return "training"
+        if normalized in {'started', 'training', 'processing', 'queued', 'pending'}:
+            return "training"
+        raise AvatarProviderStatusUnavailableError('Avatar training status is not recognized.')
 
     def _extract_tavus_error_from_payload(
         self,
@@ -1905,18 +2146,28 @@ class AvatarProviderService:
 
         if status_code == 402 or "payment required" in lower:
             return (
-                "Avatar training is temporarily unavailable."
+                "The animation service has reached its usage limit. "
+                "Your photo or video is saved. Please try again later."
             )
 
-        if status_code == 401 or "unauthorized" in lower:
+        if status_code in {401, 403} or "unauthorized" in lower or "forbidden" in lower:
             return (
-                "Avatar training is temporarily unavailable."
+                "The animation service is not configured to accept this request. "
+                "Your photo or video is saved; uploading it again will not help."
             )
 
-        if status_code == 403 or "forbidden" in lower:
-            return (
-                "Avatar training is temporarily unavailable."
-            )
+        if status_code == 413:
+            return "This photo or video exceeds the animation service's upload limit. Choose a smaller file."
+        if 'voice' in lower and any(term in lower for term in ('invalid', 'unknown', 'not found', 'required')):
+            return "The animation service is not configured for this request. Your media is saved. Please try again later."
+        if 'multiple faces' in lower or 'more than one face' in lower:
+            return "The animation service reported more than one face. Review the crop so only this person is visible."
+        if 'no face' in lower or 'face not detected' in lower:
+            return "The animation service could not identify a face. Review a clear, front-facing photo or video."
+        if any(term in lower for term in ('url', 'download', 'fetch')) and any(
+            term in lower for term in ('invalid', 'expired', 'failed', 'unable', 'cannot')
+        ):
+            return "The animation service could not download the saved media. Your file is still saved. Retry preparation."
 
         if ("video" in lower or "image" in lower) and (
             "url" in lower or "invalid" in lower
@@ -1925,7 +2176,7 @@ class AvatarProviderService:
                 "This media could not be used for avatar training."
             )
 
-        return "Avatar training could not be started. Please try again."
+        return "Avatar creation could not be completed. Your media is saved. Please try again later."
 
     def _extract_tavus_training_video_url(
         self,
@@ -1941,11 +2192,6 @@ class AvatarProviderService:
             "videoURL",
             "remoteVideoURL",
         ]
-
-        for key in direct_keys:
-            value = package.get(key)
-            if isinstance(value, str) and value.startswith("https://"):
-                return value
 
         asset_collections = [
             package.get("motionVideos"),
@@ -1966,10 +2212,21 @@ class AvatarProviderService:
                 url = self._provider_training_url_from_asset(
                     asset,
                     profile_id=profile_id,
+                    expected_kind="video",
                 )
                 if url:
                     return url
 
+        # Legacy links identify an owned asset; they are never forwarded as leases.
+        if any(isinstance(assets, list) and assets for assets in asset_collections):
+            return None
+        for key in direct_keys:
+            url = self._provider_training_url_from_asset(
+                {"remoteURL": package.get(key)}, profile_id=profile_id,
+                expected_kind="video",
+            )
+            if url:
+                return url
         return None
 
     def _extract_tavus_training_image_url(
@@ -1986,11 +2243,6 @@ class AvatarProviderService:
             "imageURL",
             "remoteImageURL",
         ]
-
-        for key in direct_keys:
-            value = package.get(key)
-            if isinstance(value, str) and value.startswith("https://"):
-                return value
 
         asset_collections = [
             package.get("identityPhotos"),
@@ -2019,9 +2271,19 @@ class AvatarProviderService:
                 url = self._provider_training_url_from_asset(
                     asset,
                     profile_id=profile_id,
+                    expected_kind="image",
                 )
                 if url:
                     return url
+        if any(isinstance(assets, list) and assets for assets in asset_collections):
+            return None
+        for key in direct_keys:
+            url = self._provider_training_url_from_asset(
+                {"remoteURL": package.get(key)}, profile_id=profile_id,
+                expected_kind="image",
+            )
+            if url:
+                return url
         return None
 
     def _extract_tavus_training_source(
@@ -2035,21 +2297,23 @@ class AvatarProviderService:
             or package.get("tavusTrainingMode")
             or ""
         ).strip().lower()
-        image_url = self._extract_tavus_training_image_url(
-            package,
-            profile_id=profile_id,
-        )
-        video_url = self._extract_tavus_training_video_url(
-            package,
-            profile_id=profile_id,
-        )
-
         if requested_mode == "image":
+            image_url = self._extract_tavus_training_image_url(package, profile_id=profile_id)
             return ("train_image_url", image_url) if image_url else None
         if requested_mode == "video":
+            video_url = self._extract_tavus_training_video_url(package, profile_id=profile_id)
             return ("train_video_url", video_url) if video_url else None
+        video_url = self._extract_tavus_training_video_url(package, profile_id=profile_id)
         if video_url:
             return "train_video_url", video_url
+        if (package.get('motionVideos') or package.get('motion_videos')
+                or any(package.get(key) for key in ('train_video_url', 'trainVideoURL',
+                    'motionVideoURL', 'primaryMotionVideoURL', 'videoURL', 'remoteVideoURL'))
+                or any(isinstance(asset, dict) and 'video' in str(
+                    asset.get('type') or asset.get('kind') or asset.get('assetType') or '').lower()
+                    for asset in (package.get('assets') if isinstance(package.get('assets'), list) else []))):
+            return None
+        image_url = self._extract_tavus_training_image_url(package, profile_id=profile_id)
         if image_url:
             return "train_image_url", image_url
         return None
@@ -2059,7 +2323,10 @@ class AvatarProviderService:
         asset: Dict[str, Any],
         *,
         profile_id: Optional[str],
+        expected_kind: str,
     ) -> Optional[str]:
+        if not profile_id:
+            return None
         remote_asset_id = (
             asset.get("remoteAssetID")
             or asset.get("remoteAssetId")
@@ -2069,17 +2336,6 @@ class AvatarProviderService:
             or asset.get("asset_id")
         )
 
-        if profile_id and isinstance(remote_asset_id, str):
-            normalized_asset_id = remote_asset_id.strip()
-            if normalized_asset_id:
-                try:
-                    return self._media_storage().sign_provider_training_url(
-                        asset_id=normalized_asset_id,
-                        profile_id=profile_id,
-                    ).signed_url
-                except (RuntimeError, ValueError, FileNotFoundError):
-                    return None
-
         remote_url = (
             asset.get("remoteURL")
             or asset.get("remoteUrl")
@@ -2088,9 +2344,48 @@ class AvatarProviderService:
             or asset.get("downloadURL")
             or asset.get("downloadUrl")
         )
-        if isinstance(remote_url, str) and remote_url.startswith("https://"):
-            return remote_url
-        return None
+        if not remote_asset_id and not isinstance(remote_url, str):
+            return None
+        storage = self._media_storage()
+        if not isinstance(remote_asset_id, str) or not remote_asset_id.strip():
+            if not isinstance(remote_url, str):
+                return None
+            try:
+                parsed = urlsplit(remote_url)
+                base = urlsplit(storage.resolve_external_base_url(request_base_url=None))
+            except ValueError:
+                return None
+            prefix = base.path.rstrip('/') + '/v1/avatar-media/public/assets/'
+            if (parsed.scheme != 'https' or parsed.netloc != base.netloc
+                    or not parsed.path.startswith(prefix) or parsed.fragment):
+                return None
+            remote_asset_id = parsed.path[len(prefix):]
+            if not remote_asset_id or '/' in remote_asset_id or '%' in remote_asset_id:
+                return None
+        try:
+            metadata = storage.get_metadata(remote_asset_id.strip())
+            if (metadata.profile_id != profile_id
+                    or metadata.asset_type not in {expected_kind, 'reference', 'training_sample'}
+                    or not metadata.content_type.startswith(expected_kind + '/')):
+                return None
+            self._validate_training_asset(metadata, expected_kind)
+            return storage.sign_provider_training_url(
+                asset_id=remote_asset_id.strip(), profile_id=profile_id,
+            ).signed_url
+        except (FileNotFoundError, AvatarMediaAssetNotFoundError):
+            return None
+
+    @staticmethod
+    def _validate_training_asset(metadata: Any, expected_kind: str) -> None:
+        # Recheck stored sources too: older upload approvals are not a provider contract.
+        analysis = AvatarMediaAnalysisService().analyze(
+            storage_path=metadata.storage_path, asset_type=expected_kind,
+            content_type=metadata.content_type,
+        )
+        if not analysis.recommended_for_avatar:
+            raise AvatarMediaAnalysisError(
+                analysis.rejection_reason or 'This media does not meet the avatar training requirements.'
+            )
 
     @staticmethod
     def _extract_tavus_image_voice_name(

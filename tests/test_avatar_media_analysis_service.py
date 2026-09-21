@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import wave
+import asyncio
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+from uuid import uuid4
 
 import cv2
 import numpy as np
@@ -9,9 +13,23 @@ import pytest
 
 from app.services.avatar_media_analysis_service import (
     AvatarMediaAnalysisError,
+    AvatarMediaAnalysisUnavailableError,
     AvatarMediaAnalysisService,
     _VisualFrameAnalysis,
 )
+
+
+def test_small_portrait_is_rejected_before_face_inference(tmp_path: Path, monkeypatch):
+    path = tmp_path / "small.jpg"
+    assert cv2.imwrite(str(path), np.full((295, 316, 3), 180, dtype=np.uint8))
+    service = AvatarMediaAnalysisService()
+    detector = Mock(side_effect=AssertionError("Small source must fail before inference"))
+    monkeypatch.setattr(service, "_analyze_visual_frame", detector)
+    with pytest.raises(AvatarMediaAnalysisError, match="316 x 295.*512 x 512"):
+        service.analyze(storage_path=str(path), asset_type="image", content_type="image/jpeg")
+    detector.assert_not_called()
+    gallery = service.analyze(storage_path=str(path), asset_type="memory_image", content_type="image/jpeg")
+    assert gallery.recommended_for_avatar is False
 
 
 def test_blank_image_is_rejected(
@@ -144,7 +162,7 @@ def test_visual_analysis_recovers_portrait_video_rotation():
     service = AvatarMediaAnalysisService.__new__(
         AvatarMediaAnalysisService
     )
-    service._face_detector = PortraitOnlyFaceDetector()
+    service._detect_faces = PortraitOnlyFaceDetector().detectMultiScale
 
     horizontal_gradient = np.tile(
         np.linspace(60, 200, 640, dtype=np.uint8),
@@ -177,7 +195,7 @@ def test_visual_lighting_is_measured_on_face_not_dark_background():
     service = AvatarMediaAnalysisService.__new__(
         AvatarMediaAnalysisService
     )
-    service._face_detector = CenterFaceDetector()
+    service._detect_faces = CenterFaceDetector().detectMultiScale
 
     image = np.full((360, 480, 3), 8, dtype=np.uint8)
     face_gradient = np.tile(
@@ -277,15 +295,74 @@ def test_video_summary_keeps_uneven_lighting_as_quality_signal():
     assert summary.motion_usable is True
 
 
-def test_face_detector_results_are_deduplicated_across_cascades():
-    merged = AvatarMediaAnalysisService._merge_overlapping_faces(
-        [
-            (100, 80, 180, 200),
-            (108, 86, 172, 194),
-            (360, 90, 150, 180),
-        ],
-        frame_width=640,
-        frame_height=480,
-    )
+def _portrait() -> np.ndarray:
+    image = cv2.imread(str(Path(__file__).parent / "fixtures/astronaut.png"))
+    assert image is not None
+    return image
 
-    assert len(merged) == 2
+
+@pytest.mark.parametrize("rotation", [None, cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_180])
+def test_yunet_single_person_is_not_counted_twice(rotation):
+    image = _portrait()
+    if rotation is not None:
+        image = cv2.rotate(image, rotation)
+    analysis = AvatarMediaAnalysisService()._analyze_visual_frame(image)
+    assert analysis.has_face
+    assert not analysis.multiple_faces
+
+
+def test_yunet_close_portrait_and_high_resolution_are_accepted():
+    image = _portrait()[45:200, 170:285]
+    image = cv2.resize(image, (1150, 1550))
+    analysis = AvatarMediaAnalysisService()._analyze_visual_frame(image)
+    assert analysis.has_face
+    assert not analysis.multiple_faces
+
+
+def test_yunet_still_detects_two_people():
+    image = _portrait()
+    analysis = AvatarMediaAnalysisService()._analyze_visual_frame(np.hstack([image, image]))
+    assert analysis.has_face
+    assert analysis.multiple_faces
+
+
+def test_missing_model_is_service_failure_not_bad_photo(tmp_path):
+    service = AvatarMediaAnalysisService()
+    service.FACE_MODEL_PATH = tmp_path / "missing.onnx"
+    with pytest.raises(AvatarMediaAnalysisUnavailableError):
+        service._analyze_visual_frame(_portrait())
+
+
+def test_tampered_model_is_not_loaded(tmp_path):
+    service = AvatarMediaAnalysisService()
+    service.FACE_MODEL_PATH = tmp_path / "model.onnx"
+    service.FACE_MODEL_PATH.write_bytes(b"invalid model")
+    with pytest.raises(AvatarMediaAnalysisUnavailableError):
+        service._analyze_visual_frame(_portrait())
+
+
+@pytest.mark.parametrize("unavailable,expected_status", [(True, 503), (False, 422)])
+@pytest.mark.parametrize("was_existing", [True, False])
+def test_upload_distinguishes_analysis_outage_from_invalid_source(monkeypatch, unavailable, expected_status, was_existing):
+    from fastapi import HTTPException
+    from app.routes import avatar_media
+
+    response = SimpleNamespace(asset_id="asset", was_existing=was_existing, content_type="image/png")
+    storage = Mock()
+    storage.upload = AsyncMock(return_value=response)
+    storage.get_metadata.return_value = SimpleNamespace(storage_path="/unused")
+    analyzer = Mock()
+    error_type = AvatarMediaAnalysisUnavailableError if unavailable else AvatarMediaAnalysisError
+    analyzer.analyze.side_effect = error_type("Photo check unavailable" if unavailable else "No clear face")
+    monkeypatch.setattr(avatar_media, "AvatarMediaStorageService", lambda: storage)
+    monkeypatch.setattr(avatar_media, "AvatarMediaAnalysisService", lambda: analyzer)
+    monkeypatch.setattr(avatar_media, "AvatarMediaEvidenceBridgeService", Mock())
+    monkeypatch.setattr(avatar_media, "require_profile_access", Mock())
+    with pytest.raises(HTTPException) as raised:
+        asyncio.run(avatar_media.upload_avatar_media(
+            request=SimpleNamespace(base_url="https://stay.test"),
+            profile_id=str(uuid4()), asset_type="image", title="Photo",
+            upload_id=None, file=Mock(), principal=Mock(),
+        ))
+    assert raised.value.status_code == expected_status
+    assert storage.delete_asset.call_count == (0 if was_existing else 1)

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import math
+import hashlib
+from threading import Lock
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Iterable, Sequence
 
 import av
 import cv2
@@ -19,6 +21,10 @@ class AvatarMediaAnalysisError(RuntimeError):
     def __init__(self, user_message: str) -> None:
         self.user_message = user_message
         super().__init__(user_message)
+
+
+class AvatarMediaAnalysisUnavailableError(AvatarMediaAnalysisError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -87,46 +93,28 @@ class AvatarMediaAnalysisService:
     owned by the separately licensed identity-verification boundary.
     """
 
-    ANALYSIS_VERSION = "server-media-technical-v2"
+    ANALYSIS_VERSION = "server-media-technical-v5-phoenix4-video"
     MIN_VISUAL_EDGE = 384
     MIN_AUDIO_SECONDS = 3.0
-    MIN_VIDEO_SECONDS = 3.0
-    MAX_VIDEO_SECONDS = 45.5
+    MIN_VIDEO_SECONDS = 60.0
+    MIN_VIDEO_FPS = 25.0
+    MIN_VIDEO_SHORT_EDGE = 1080
+    MIN_VIDEO_LONG_EDGE = 1920
     MAX_VIDEO_SAMPLE_FRAMES = 12
     MIN_VIDEO_FACE_FRAME_RATIO = 0.45
     MULTIPLE_PEOPLE_FRAME_RATIO = 0.25
 
+    FACE_MODEL_PATH = (
+        Path(__file__).resolve().parents[1]
+        / "assets/face_detection/face_detection_yunet_2023mar.onnx"
+    )
+    FACE_MODEL_SHA256 = "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
+    FACE_SCORE_THRESHOLD = 0.9
+    FACE_INPUT_EDGE = 320
+
     def __init__(self) -> None:
-        cascade_specs = (
-            ("haarcascade_frontalface_default.xml", False),
-            ("haarcascade_frontalface_alt2.xml", False),
-            ("haarcascade_profileface.xml", True),
-        )
-        detectors = []
-        mirrored_detector_ids: set[int] = set()
-        for cascade_name, requires_mirror in cascade_specs:
-            detector = cv2.CascadeClassifier(
-                str(
-                    Path(cv2.data.haarcascades)
-                    / cascade_name
-                )
-            )
-            if not detector.empty():
-                detectors.append(detector)
-                if requires_mirror:
-                    mirrored_detector_ids.add(id(detector))
-
-        if not detectors:
-            raise AvatarMediaAnalysisError(
-                "The server face detector is unavailable."
-            )
-
-        self._face_detectors = tuple(detectors)
-        self._mirrored_face_detector_ids = frozenset(
-            mirrored_detector_ids
-        )
-        # Kept as a compatibility alias for focused tests and diagnostics.
-        self._face_detector = self._face_detectors[0]
+        self._face_detector = None
+        self._face_detector_lock = Lock()
 
     def analyze(
         self,
@@ -137,7 +125,7 @@ class AvatarMediaAnalysisService:
     ) -> AvatarMediaEvidenceAnalysis:
         path = Path(storage_path).expanduser().resolve()
         if not path.is_file():
-            raise AvatarMediaAnalysisError(
+            raise AvatarMediaAnalysisUnavailableError(
                 "Uploaded media is unavailable for analysis."
             )
 
@@ -222,6 +210,10 @@ class AvatarMediaAnalysisService:
                 )
         except AvatarMediaAnalysisError:
             raise
+        except (FileNotFoundError, PermissionError, MemoryError) as error:
+            raise AvatarMediaAnalysisUnavailableError(
+                "Video checks are temporarily unavailable. Please try again shortly."
+            ) from error
         except Exception as error:
             raise AvatarMediaAnalysisError(
                 "The selected video could not be decoded."
@@ -235,6 +227,13 @@ class AvatarMediaAnalysisService:
         if image is None or image.size == 0:
             raise AvatarMediaAnalysisError(
                 "The selected image could not be decoded."
+            )
+
+        height, width = image.shape[:2]
+        if width < 512 or height < 512:
+            raise AvatarMediaAnalysisError(
+                f"This photo is {width} x {height} pixels. Video avatars need at least "
+                "512 x 512 pixels. Choose the original photo or a larger portrait."
             )
 
         frame = self._analyze_visual_frame(image)
@@ -291,38 +290,88 @@ class AvatarMediaAnalysisService:
                     stream,
                     container.duration,
                 )
-                if duration < self.MIN_VIDEO_SECONDS:
-                    raise AvatarMediaAnalysisError(
-                        "The video is too short for motion training."
+                rate = getattr(stream, "average_rate", None)
+                if rate is None or not math.isfinite(float(rate)) or float(rate) <= 0:
+                    raise AvatarMediaAnalysisUnavailableError(
+                        "The video's frame rate could not be verified. Export the original video and try again."
                     )
-                if duration > self.MAX_VIDEO_SECONDS:
+                fps = float(rate)
+                if fps < self.MIN_VIDEO_FPS:
                     raise AvatarMediaAnalysisError(
-                        "The video must be prepared to 45 seconds or less."
+                        f"This video is {fps:.2f} FPS. Avatar training requires at least 25 FPS."
+                    )
+                width, height = int(stream.codec_context.width), int(stream.codec_context.height)
+                if min(width, height) < self.MIN_VIDEO_SHORT_EDGE or max(width, height) < self.MIN_VIDEO_LONG_EDGE:
+                    raise AvatarMediaAnalysisError(
+                        f"This video is {width} x {height} pixels. Avatar training requires at least "
+                        "1920 x 1080 pixels, or 1080 x 1920 in portrait. Choose the original recording."
+                    )
+                if not math.isfinite(duration) or duration <= 0:
+                    raise AvatarMediaAnalysisUnavailableError(
+                        "The video's duration could not be verified. Export the original video and try again."
+                    )
+                # Some containers report the final frame's timestamp, excluding its duration.
+                # Allow at most one frame at the measured rate, never a multi-second shortfall.
+                duration_tolerance = 1.0 / fps
+                if duration + duration_tolerance + 1e-6 < self.MIN_VIDEO_SECONDS:
+                    raise AvatarMediaAnalysisError(
+                        "Avatar training needs a continuous video of at least 60 seconds: "
+                        "speak naturally for 30 seconds, then stay still with lips closed for 30 seconds."
+                    )
+                audio_stream = next((candidate for candidate in container.streams if candidate.type == "audio"), None)
+                if audio_stream is None:
+                    raise AvatarMediaAnalysisError(
+                        "This video has no audio track. Include 30 seconds of clear speech, "
+                        "followed by 30 seconds staying still with lips closed."
+                    )
+                format_names = set(container.format.name.split(","))
+                if not format_names.intersection({"mp4", "webm"}):
+                    raise AvatarMediaAnalysisError(
+                        "Avatar training requires an MP4 or WebM video with H.264 video and AAC audio."
+                    )
+                # FFmpeg shares this demuxer with QuickTime and 3GP. Its name
+                # is not evidence of an MP4 file; inspect the parsed ftyp brand.
+                if "mp4" in format_names:
+                    major_brand = (container.metadata.get("major_brand") or "").strip()
+                    if major_brand not in {
+                        "isom", "iso2", "iso3", "iso4", "iso5", "iso6",
+                        "iso7", "iso8", "iso9", "mp41", "mp42", "avc1",
+                    }:
+                        raise AvatarMediaAnalysisError(
+                            "This video's container needs preparation before avatar training. "
+                            "Export it as MP4 with H.264 video and AAC audio, then upload it again. "
+                            "Renaming the file does not convert it."
+                        )
+                if stream.codec_context.name != "h264":
+                    raise AvatarMediaAnalysisError(
+                        "This video uses an unsupported video codec. Export it as MP4 with H.264 video and AAC audio."
+                    )
+                if audio_stream.codec_context.name != "aac":
+                    raise AvatarMediaAnalysisError(
+                        "This video's audio format is unsupported. Export it as MP4 with H.264 video and AAC audio."
                     )
 
-                frames = list(
-                    self._sample_video_frames(
-                        container,
-                        stream,
-                        duration,
-                    )
-                )
+                analyses = []
+                for frame in self._sample_video_frames(container, stream, duration):
+                    analyses.append(self._analyze_visual_frame(frame))
+                    # Release the full-resolution sample before decoding the next.
+                    del frame
         except AvatarMediaAnalysisError:
             raise
+        except (FileNotFoundError, PermissionError, MemoryError) as error:
+            raise AvatarMediaAnalysisUnavailableError(
+                "Video checks are temporarily unavailable. Please try again shortly."
+            ) from error
         except Exception as error:
             raise AvatarMediaAnalysisError(
                 "The selected video could not be decoded."
             ) from error
 
-        if len(frames) < 3:
+        if len(analyses) < 3:
             raise AvatarMediaAnalysisError(
                 "The video does not contain enough readable frames."
             )
 
-        analyses = [
-            self._analyze_visual_frame(frame)
-            for frame in frames
-        ]
         summary = self._summarize_video_frames(
             analyses
         )
@@ -363,6 +412,17 @@ class AvatarMediaAnalysisService:
                 "pixel_analysis_performed": True,
                 "biometric_analysis_performed": False,
                 "duration_seconds": round(duration, 3),
+                "duration_tolerance_seconds": duration_tolerance,
+                "frame_rate": fps,
+                "width": width,
+                "height": height,
+                "audio_track_present": True,
+                "video_codec": "h264",
+                "audio_codec": "aac",
+                "speaking_segment_verified": False,
+                "still_segment_verified": False,
+                "continuous_shot_verified": False,
+                "recording_guidance": "One continuous shot: 30 seconds speaking, then 30 seconds still with lips closed.",
                 "sampled_frames": len(analyses),
                 "face_frame_ratio": round(summary.face_ratio, 3),
                 "frontal_face_frame_ratio": round(
@@ -387,9 +447,13 @@ class AvatarMediaAnalysisService:
         self,
         path: Path,
     ) -> AvatarMediaEvidenceAnalysis:
-        sample_arrays: list[np.ndarray] = []
         sample_rate = 0
-        decoded_samples = 0
+        duration = 0.0
+        value_count = 0
+        square_sum = 0.0
+        clipped_count = 0
+        sample_rates: set[int] = set()
+        channel_counts: set[int] = set()
 
         try:
             with av.open(str(path)) as container:
@@ -406,34 +470,59 @@ class AvatarMediaAnalysisService:
                         "The selected file contains no audio track."
                     )
 
-                sample_rate = int(
-                    stream.codec_context.sample_rate or 0
-                )
                 for frame in container.decode(stream):
+                    sample_rate = int(frame.sample_rate or 0)
+                    channels = len(frame.layout.channels)
+                    samples = int(frame.samples)
+                    if sample_rate <= 0 or channels <= 0 or samples < 0:
+                        raise AvatarMediaAnalysisUnavailableError(
+                            "The recording's audio timing could not be verified. Please try again."
+                        )
                     values = frame.to_ndarray()
-                    if values.size == 0:
+                    if samples == 0 and values.size == 0:
                         continue
-                    normalized = self._normalized_audio(values)
-                    sample_arrays.append(normalized.reshape(-1))
-                    decoded_samples += normalized.size
-                    if decoded_samples >= max(sample_rate, 48_000) * 120:
+                    if values.size != samples * channels:
+                        raise AvatarMediaAnalysisUnavailableError(
+                            "The recording's audio layout could not be verified. Please try again."
+                        )
+                    # PyAV sample counts are per channel, for packed and planar audio.
+                    take = min(samples, max(0, int(round((120.0 - duration) * sample_rate))))
+                    if take == 0:
+                        break
+                    if frame.format.is_planar:
+                        selected = values.reshape(channels, samples)[:, :take]
+                    else:
+                        selected = values.reshape(samples, channels)[:take, :]
+                    normalized = self._normalized_audio(selected)
+                    if not np.isfinite(normalized).all():
+                        raise AvatarMediaAnalysisError("The recording contains invalid audio samples.")
+                    square_sum += float(np.sum(np.square(normalized), dtype=np.float64))
+                    clipped_count += int(np.count_nonzero(np.abs(normalized) >= 0.985))
+                    value_count += normalized.size
+                    duration += take / float(sample_rate)
+                    sample_rates.add(sample_rate)
+                    channel_counts.add(channels)
+                    del normalized, selected, values
+                    if duration >= 120.0 - 1e-9:
                         break
         except AvatarMediaAnalysisError:
             raise
-        except Exception as error:
+        except av.error.InvalidDataError as error:
             raise AvatarMediaAnalysisError(
                 "The selected recording could not be decoded."
             ) from error
+        except Exception as error:
+            raise AvatarMediaAnalysisUnavailableError(
+                "Recording checks are temporarily unavailable. Please try again shortly."
+            ) from error
 
-        if sample_rate <= 0 or not sample_arrays:
+        if not value_count:
             raise AvatarMediaAnalysisError(
                 "The selected recording contains no readable audio."
             )
 
-        samples = np.concatenate(sample_arrays)
-        duration = samples.size / float(sample_rate)
-        rms = float(np.sqrt(np.mean(np.square(samples))))
-        clipping_ratio = float(np.mean(np.abs(samples) >= 0.985))
+        rms = math.sqrt(square_sum / value_count)
+        clipping_ratio = clipped_count / float(value_count)
 
         voice_usable = (
             duration >= self.MIN_AUDIO_SECONDS
@@ -465,7 +554,10 @@ class AvatarMediaAnalysisService:
                 "signal_analysis_performed": True,
                 "speaker_identity_verified": False,
                 "duration_seconds": round(duration, 3),
-                "sample_rate": sample_rate,
+                "sample_rate": next(iter(sample_rates)) if len(sample_rates) == 1 else None,
+                "sample_rates": sorted(sample_rates),
+                "channel_counts": sorted(channel_counts),
+                "analysis_window_limit_seconds": 120,
                 "rms": round(rms, 6),
                 "clipping_ratio": round(clipping_ratio, 6),
             },
@@ -483,9 +575,18 @@ class AvatarMediaAnalysisService:
         )
         next_time = 0.0
         emitted = 0
+        origin = None
 
         for frame in container.decode(stream):
-            frame_time = float(frame.time or 0.0)
+            timestamp = frame.time
+            if timestamp is None or not math.isfinite(float(timestamp)):
+                raise AvatarMediaAnalysisUnavailableError(
+                    "The video's timing could not be verified. Try exporting it again from Photos."
+                )
+            # Presentation timestamps need not start at zero (for example, edited MOV files).
+            if origin is None:
+                origin = float(timestamp)
+            frame_time = float(timestamp) - origin
             if frame_time + 0.001 < next_time:
                 continue
             yield frame.to_ndarray(format="bgr24")
@@ -534,9 +635,8 @@ class AvatarMediaAnalysisService:
     ) -> _VisualFrameAnalysis:
         height, width = image.shape[:2]
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        equalized = cv2.equalizeHist(gray)
         faces = self._detect_faces(
-            equalized
+            image
         )
 
         has_face = len(faces) > 0
@@ -620,161 +720,52 @@ class AvatarMediaAnalysisService:
 
     def _detect_faces(
         self,
-        equalized: np.ndarray,
+        image: np.ndarray,
     ) -> list[tuple[int, int, int, int]]:
-        detectors = getattr(
-            self,
-            "_face_detectors",
-            None,
-        )
-        if not detectors:
-            detector = getattr(
-                self,
-                "_face_detector",
-                None,
-            )
-            detectors = (detector,) if detector is not None else ()
+        height, width = image.shape[:2]
+        scale = min(self.FACE_INPUT_EDGE / max(height, width), 1.0)
+        input_width = max(1, round(width * scale))
+        input_height = max(1, round(height * scale))
+        resized = cv2.resize(
+            image, (input_width, input_height), interpolation=cv2.INTER_AREA
+        ) if scale < 1.0 else image
 
-        height, width = equalized.shape[:2]
-        flipped = cv2.flip(equalized, 1)
-        candidates: list[tuple[int, int, int, int]] = []
-        mirrored_detector_ids = getattr(
-            self,
-            "_mirrored_face_detector_ids",
-            frozenset(),
-        )
-
-        for detector in detectors:
-            sources = [(equalized, False)]
-            if id(detector) in mirrored_detector_ids:
-                sources.append((flipped, True))
-
-            for source, is_flipped in sources:
-                detected = detector.detectMultiScale(
-                    source,
-                    scaleFactor=1.08,
-                    minNeighbors=4,
-                    minSize=(48, 48),
-                )
-                for raw_face in detected:
-                    x, y, face_width, face_height = (
-                        int(value) for value in raw_face
+        try:
+            # The native detector mutates input dimensions, so calls on one
+            # service instance must not race. No per-upload model download.
+            with self._face_detector_lock:
+                if self._face_detector is None:
+                    if hashlib.sha256(self.FACE_MODEL_PATH.read_bytes()).hexdigest() != self.FACE_MODEL_SHA256:
+                        raise OSError("Face detector model integrity check failed")
+                    self._face_detector = cv2.FaceDetectorYN.create(
+                        str(self.FACE_MODEL_PATH), "", (input_width, input_height),
+                        self.FACE_SCORE_THRESHOLD, 0.3, 5000,
+                        cv2.dnn.DNN_BACKEND_OPENCV, cv2.dnn.DNN_TARGET_CPU,
                     )
-                    if is_flipped:
-                        x = width - x - face_width
-                    candidates.append(
-                        (x, y, face_width, face_height)
-                    )
+                self._face_detector.setInputSize((input_width, input_height))
+                _, detected = self._face_detector.detect(resized)
+        except (OSError, cv2.error) as error:
+            raise AvatarMediaAnalysisUnavailableError(
+                "Photo and video checks are temporarily unavailable. Please try again shortly."
+            ) from error
 
-        return self._merge_overlapping_faces(
-            candidates,
-            frame_width=width,
-            frame_height=height,
-        )
+        if detected is None:
+            return []
 
-    @classmethod
-    def _merge_overlapping_faces(
-        cls,
-        faces: Sequence[tuple[int, int, int, int]],
-        *,
-        frame_width: int,
-        frame_height: int,
-    ) -> list[tuple[int, int, int, int]]:
-        normalized = [
-            (
-                max(0, min(x, frame_width - 1)),
-                max(0, min(y, frame_height - 1)),
-                max(
-                    1,
-                    min(
-                        face_width,
-                        frame_width - max(0, min(x, frame_width - 1)),
-                    ),
-                ),
-                max(
-                    1,
-                    min(
-                        face_height,
-                        frame_height - max(0, min(y, frame_height - 1)),
-                    ),
-                ),
-            )
-            for x, y, face_width, face_height in faces
-            if face_width > 0 and face_height > 0
-        ]
-        normalized.sort(
-            key=lambda face: face[2] * face[3],
-            reverse=True,
-        )
-
-        merged: list[tuple[int, int, int, int]] = []
-        for candidate in normalized:
-            if any(
-                cls._same_face(candidate, existing)
-                for existing in merged
-            ):
+        # YuNet applies confidence filtering and non-maximum suppression
+        # before returning faces. Map its boxes back to the original pixels.
+        faces = []
+        for detection in detected:
+            if not np.isfinite(detection).all() or detection[-1] < self.FACE_SCORE_THRESHOLD:
                 continue
-            merged.append(candidate)
-
-        return merged
-
-    @staticmethod
-    def _same_face(
-        first: tuple[int, int, int, int],
-        second: tuple[int, int, int, int],
-    ) -> bool:
-        first_x, first_y, first_width, first_height = first
-        second_x, second_y, second_width, second_height = second
-
-        intersection_left = max(first_x, second_x)
-        intersection_top = max(first_y, second_y)
-        intersection_right = min(
-            first_x + first_width,
-            second_x + second_width,
-        )
-        intersection_bottom = min(
-            first_y + first_height,
-            second_y + second_height,
-        )
-        intersection_width = max(
-            intersection_right - intersection_left,
-            0,
-        )
-        intersection_height = max(
-            intersection_bottom - intersection_top,
-            0,
-        )
-        intersection = intersection_width * intersection_height
-        union = (
-            first_width * first_height
-            + second_width * second_height
-            - intersection
-        )
-        overlap = intersection / max(union, 1)
-
-        first_center = (
-            first_x + first_width / 2.0,
-            first_y + first_height / 2.0,
-        )
-        second_center = (
-            second_x + second_width / 2.0,
-            second_y + second_height / 2.0,
-        )
-        center_distance = math.hypot(
-            first_center[0] - second_center[0],
-            first_center[1] - second_center[1],
-        )
-        shared_scale = max(
-            min(
-                first_width,
-                first_height,
-                second_width,
-                second_height,
-            ),
-            1,
-        )
-
-        return overlap >= 0.3 or center_distance <= shared_scale * 0.35
+            x, y, face_width, face_height = detection[:4]
+            left = max(0, min(width, round(float(x) * width / input_width)))
+            top = max(0, min(height, round(float(y) * height / input_height)))
+            right = max(0, min(width, round(float(x + face_width) * width / input_width)))
+            bottom = max(0, min(height, round(float(y + face_height) * height / input_height)))
+            if right > left and bottom > top:
+                faces.append((left, top, right - left, bottom - top))
+        return faces
 
     @classmethod
     def _summarize_video_frames(

@@ -15,6 +15,7 @@ from app.schemas.podcast import (
     PodcastUploadResponse,
 )
 from app.security.profile_authorization import require_profile_access
+from app.security.purpose_authorization import require_profile_purposes
 from app.security.user_auth import AuthenticatedSessionPrincipal, require_authenticated_principal
 from app.services.podcast_repository import PodcastInvitationNotFound
 from app.services.podcast_service import PodcastService, PodcastServiceError
@@ -32,6 +33,7 @@ async def create_invitation(
     principal: AuthenticatedSessionPrincipal = Depends(require_authenticated_principal),
 ) -> PodcastInvitationCreateResponse:
     require_profile_access(principal=principal, profile_id=body.profile_id)
+    require_profile_purposes(body.profile_id, {"memory_context"})
     profile = DigitalHumanProfileRepository().require(body.profile_id)
     if not profile.consent_verified:
         raise HTTPException(
