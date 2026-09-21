@@ -1,9 +1,17 @@
+import json
 from pathlib import Path
 
 from packaging.requirements import Requirement
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_build_copies_constraints_before_installation():
+    config = json.loads((ROOT / "railpack.json").read_text())
+    inputs = config["steps"]["install"]["inputs"]
+    assert inputs[0] == "..."
+    assert {"local": True, "include": ["requirements-python312.lock.txt"]} in inputs
 
 
 def requirements(path):
