@@ -147,10 +147,11 @@ def test_invalid_generic_video_does_not_silently_train_photo(authority):
     storage.sign_provider_training_url.assert_not_called()
 
 
-def test_explicit_photo_mode_never_accesses_unselected_video(authority):
+@pytest.mark.parametrize('mode_key', ['tavus_training_mode', 'tavusTrainingMode'])
+def test_explicit_photo_mode_never_accesses_unselected_video(authority, mode_key):
     service, storage, profile, photo, _, _ = authority
     assert service._extract_tavus_training_source({
-        'tavus_training_mode': 'image',
+        mode_key: 'image',
         'motionVideos': [{'remoteAssetID': str(uuid4())}],
         'identityPhotos': [{'remoteAssetID': photo}],
     }, profile_id=profile)[0] == 'train_image_url'

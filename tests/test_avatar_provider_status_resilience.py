@@ -46,6 +46,35 @@ def state(status="training"):
     )
 
 
+@pytest.mark.parametrize("code,action", [
+    ("avatar_invalid_material", "review_source"),
+    ("avatar_source_unavailable", "review_source"),
+    ("avatar_provider_unavailable", "try_later"),
+    ("avatar_provider_configuration", "review_setup"),
+    ("future_error", "review_setup"),
+    (None, "review_setup"),
+])
+def test_failure_recovery_is_structured_and_never_blindly_retries(code, action):
+    current = state("failed")
+    current.error_code = code
+    assert current.recovery_action == action
+    current.status = "training"
+    assert current.recovery_action is None
+    current.status = "ready"
+    assert current.recovery_action is None
+
+
+@pytest.mark.parametrize("http_status,code", [
+    (401, "avatar_provider_configuration"),
+    (403, "avatar_provider_configuration"),
+    (413, "avatar_invalid_material"),
+    (422, "tavus_provider_failed"),
+    (None, "tavus_provider_failed"),
+])
+def test_submission_error_classification_does_not_guess_material_fault(http_status, code):
+    assert AvatarProviderService._submission_error_code(http_status) == code
+
+
 @pytest.mark.parametrize("http_status", [401, 404, 429, 500, 503])
 @pytest.mark.parametrize("training_status", ["training", "ready"])
 def test_http_errors_never_overwrite_training_state(monkeypatch, http_status, training_status):

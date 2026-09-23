@@ -14,6 +14,10 @@ from app.services.elevenlabs_voice_service import (
     {"voice_id": "voice", "requires_verification": "false"},
     {"voice_id": "voice", "requires_verification": 0},
     {"voice_id": "voice", "requires_verification": None},
+    {"voice_id": "../foreign", "requires_verification": False},
+    {"voice_id": "voice?query=private", "requires_verification": False},
+    {"voice_id": "voice/foreign", "requires_verification": False},
+    {"voice_id": "voice\nheader", "requires_verification": False},
 ])
 def test_incomplete_provider_response_cannot_activate_voice(payload):
     with pytest.raises(ElevenLabsVoiceProviderError):

@@ -490,18 +490,52 @@ class ElevenLabsVoiceService:
 
             raise
 
+    async def refresh_voice_verification(self, profile_id: UUID) -> None:
+        _, job = await asyncio.to_thread(self.repository.get_voice_status_snapshot, profile_id)
+        if not job or job.get("status") != "verification_required":
+            return
+        voice_id = job.get("provider_job_id")
+        revision = (job.get("request_payload") or {}).get("_stay_consent_revision")
+        if (str(job.get("profile_id")) != str(profile_id) or job.get("provider") != "elevenlabs"
+                or job.get("training_type") != "voice" or type(revision) is not int or revision <= 0
+                or not isinstance(voice_id, str) or not voice_id
+                or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in voice_id)):
+            raise ElevenLabsVoiceConflictError("Voice verification cannot be confirmed for this request.")
+        await asyncio.to_thread(require_profile_purposes, profile_id, {"voice_synthesis"}, expected_revision=revision)
+        async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
+            response = await client.get(f"https://api.elevenlabs.io/v1/voices/{voice_id}",
+                headers={"xi-api-key": self.api_key})
+        self._raise_provider_error(response, operation="Voice verification")
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise ElevenLabsVoiceProviderError("Voice verification could not be confirmed.") from error
+        if not isinstance(payload, dict) or payload.get("voice_id") != voice_id:
+            raise ElevenLabsVoiceProviderError("Voice verification identity could not be confirmed.")
+        verification = payload.get("voice_verification")
+        if (not isinstance(verification, dict) or verification.get("is_verified") is not True
+                or verification.get("requires_verification") is not False
+                or payload.get("safety_control") not in (None, "NONE")):
+            return
+        await asyncio.to_thread(require_profile_purposes, profile_id, {"voice_synthesis"}, expected_revision=revision)
+        await asyncio.to_thread(self.repository.apply_voice_training_result,
+            profile_id=profile_id, job_id=job["job_id"], status="ready", voice_id=voice_id,
+            provider_payload={"voice_id": voice_id, "requires_verification": False, "verification_confirmed": True})
+
     async def synthesize_for_profile(
         self,
         *,
         profile_id: UUID,
         text: str,
         delivery: VoiceDelivery | None = None,
+        voice_version: str | None = None,
     ) -> VoiceSynthesisResult:
         profile = await asyncio.to_thread(self.repository.get, profile_id)
 
-        personalized_voice_id = self._personalized_voice_id(profile)
+        personalized_voice_id = await asyncio.to_thread(
+            self._voice_for_version, profile_id, profile, voice_version)
         purposes = {"voice_synthesis"} if personalized_voice_id else {"memory_context"}
-        consent = require_profile_purposes(profile_id, purposes)
+        consent = await asyncio.to_thread(require_profile_purposes, profile_id, purposes)
 
         if personalized_voice_id:
             try:
@@ -513,9 +547,19 @@ class ElevenLabsVoiceService:
                     ),
                     voice_mode="personalized",
                 )
-                require_profile_purposes(profile_id, purposes, expected_revision=consent.revision)
+                await asyncio.to_thread(require_profile_purposes, profile_id, purposes, expected_revision=consent.revision)
+                if voice_version is not None:
+                    current = await asyncio.to_thread(self.repository.get, profile_id)
+                    resolved = await asyncio.to_thread(self._voice_for_version, profile_id, current, voice_version)
+                    if resolved != personalized_voice_id:
+                        raise ElevenLabsVoiceConflictError("The selected call voice is no longer available.")
                 return result
             except ElevenLabsVoiceProviderError as error:
+                if voice_version is not None:
+                    if error.status_code in {404, 410} and personalized_voice_id == self._personalized_voice_id(profile):
+                        await asyncio.to_thread(self._mark_personalized_voice_unavailable,
+                            profile_id=profile_id, profile=profile, error=error)
+                    raise
                 if error.status_code in {404, 410}:
                     await asyncio.to_thread(self._mark_personalized_voice_unavailable,
                         profile_id=profile_id,
@@ -523,7 +567,7 @@ class ElevenLabsVoiceService:
                         error=error,
                     )
 
-        require_profile_purposes(profile_id, purposes, expected_revision=consent.revision)
+        await asyncio.to_thread(require_profile_purposes, profile_id, purposes, expected_revision=consent.revision)
         result = VoiceSynthesisResult(
             audio_stream=await self.synthesize(
                 text=text,
@@ -532,8 +576,37 @@ class ElevenLabsVoiceService:
             ),
             voice_mode="warm_default",
         )
-        require_profile_purposes(profile_id, purposes, expected_revision=consent.revision)
+        await asyncio.to_thread(require_profile_purposes, profile_id, purposes, expected_revision=consent.revision)
         return result
+
+    def _voice_for_version(self, profile_id: UUID, profile, version: str | None) -> str | None:
+        if profile is not None and profile.profile_id != profile_id:
+            raise ElevenLabsVoiceConflictError("The selected call voice is no longer available.")
+        current = self._personalized_voice_id(profile)
+        if version is None:
+            return current
+        if version == "generic":
+            return None
+        if not current:
+            raise ElevenLabsVoiceConflictError("The selected call voice is no longer available.")
+        current_version = str(profile.voice_training_job_id or profile.voice_ready_at or "")
+        if version == current_version:
+            return current
+        try:
+            job_id = UUID(version)
+        except (ValueError, TypeError) as error:
+            raise ElevenLabsVoiceConflictError("The selected call voice is no longer available.") from error
+        job = self.repository.get_training_job(job_id)
+        if (not job or str(job.get("profile_id")) != str(profile_id)
+                or job.get("training_type") != "voice" or job.get("provider") != "elevenlabs"
+                or job.get("status") != "ready" or not job.get("provider_job_id")
+                or (job.get("provider_payload") or {}).get("_stay_activated") is not True):
+            raise ElevenLabsVoiceConflictError("The selected call voice is no longer available.")
+        revision = (job.get("request_payload") or {}).get("_stay_consent_revision")
+        if type(revision) is not int or revision <= 0:
+            raise ElevenLabsVoiceConflictError("The selected call voice is no longer available.")
+        require_profile_purposes(profile_id, {"voice_synthesis"}, expected_revision=revision)
+        return job["provider_job_id"]
 
     async def synthesize(
         self,
@@ -693,6 +766,7 @@ class ElevenLabsVoiceService:
                 "job_id": str(latest_job["job_id"]),
                 "status": pending_status,
                 "requires_verification": pending_status == "verification_required",
+                "retry_allowed": DigitalHumanProfileRepository.voice_training_retry_allowed(latest_job),
                 "error_code": latest_job.get("error_code"),
                 "error_message": latest_job.get("error_message"),
             }
@@ -909,7 +983,8 @@ class ElevenLabsVoiceService:
             )
         voice_id = payload.get("voice_id")
         requires_verification = payload.get("requires_verification")
-        if not isinstance(voice_id, str) or not voice_id.strip():
+        if (not isinstance(voice_id, str) or not voice_id.strip()
+                or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in voice_id.strip())):
             raise ElevenLabsVoiceProviderError(
                 "Voice creation returned no verified voice identity."
             )

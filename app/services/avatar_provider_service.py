@@ -34,6 +34,17 @@ class AvatarProviderJobState:
     error_message: Optional[str] = None
     current_stage: Optional[str] = None
     provider_detail_message: Optional[str] = None
+    error_code: Optional[str] = None
+
+    @property
+    def recovery_action(self) -> Optional[str]:
+        if self.status not in {'failed', 'cancelled', 'stale', 'deleted'}:
+            return None
+        if self.error_code in {'avatar_invalid_material', 'avatar_source_unavailable'}:
+            return 'review_source'
+        if self.error_code == 'avatar_provider_unavailable':
+            return 'try_later'
+        return 'review_setup'
 
 
 class AvatarProviderStatusUnavailableError(RuntimeError):
@@ -300,6 +311,7 @@ class AvatarProviderService:
                 status="failed",
                 preview_url=None,
                 error_message="TAVUS_API_KEY is not configured.",
+                error_code="avatar_provider_configuration",
             )
 
         try:
@@ -314,6 +326,7 @@ class AvatarProviderService:
             return AvatarProviderJobState(
                 external_job_id=f"tavus:{uuid.uuid4()}", external_avatar_id=None,
                 status="failed", preview_url=None, error_message=error.user_message,
+                error_code="avatar_invalid_material",
             )
         except (OSError, RuntimeError, ValueError) as error:
             raise AvatarProviderStatusUnavailableError(
@@ -330,6 +343,7 @@ class AvatarProviderService:
                     "The selected photo or video is not available for this profile. "
                     "Choose a saved avatar source or upload it again."
                 ),
+                error_code="avatar_source_unavailable",
             )
 
         source_kind, source_url = training_source
@@ -356,6 +370,7 @@ class AvatarProviderService:
                     error_message=(
                         "Tavus image training requires a validated stock voice_name."
                     ),
+                    error_code="avatar_provider_configuration",
                 )
             request_payload["voice_name"] = voice_name
             # Generative image alteration has no qualified, separately consented
@@ -486,6 +501,7 @@ class AvatarProviderService:
                 status="failed",
                 preview_url=None,
                 error_message=normalized_error,
+                error_code=self._submission_error_code(response.status_code),
             )
 
         if response.status_code not in {200, 201}:
@@ -1729,6 +1745,7 @@ class AvatarProviderService:
             external_job_id=f"tavus:pending:{job['job_id']}",
             external_avatar_id=None, status='failed' if failed else 'uploading', preview_url=None,
             error_message=(job.get('error_message') or 'This avatar request is no longer active.') if failed else None,
+            error_code=job.get('error_code') if failed else None,
             current_stage=None if failed else 'Confirming avatar creation',
             provider_detail_message=None if failed else (
                 'Your request is saved. We are checking whether avatar creation has started. '
@@ -1844,6 +1861,7 @@ class AvatarProviderService:
             status=str(job["status"]),
             preview_url=None,
             error_message=job.get("error_message"),
+            error_code=job.get("error_code"),
         )
 
     def _mark_tavus_training_submitted(
@@ -1887,6 +1905,7 @@ class AvatarProviderService:
         error_message: str,
         provider_payload: Dict[str, Any],
     ) -> None:
+        error_code = self._submission_error_code(provider_payload.get('status_code'))
         try:
             repository = self._repository()
 
@@ -1895,7 +1914,7 @@ class AvatarProviderService:
                 status="failed",
                 provider_job_id=provider_job_id,
                 provider_payload=provider_payload,
-                error_code="tavus_provider_failed",
+                error_code=error_code,
                 error_message=error_message,
             )
 
@@ -1906,7 +1925,7 @@ class AvatarProviderService:
                 status="failed",
                 provider_job_id=provider_job_id,
                 replica_id=None,
-                error_code="tavus_provider_failed",
+                error_code=error_code,
                 error_message=error_message,
             )
         except (
@@ -1914,6 +1933,14 @@ class AvatarProviderService:
             DigitalHumanProfileNotFoundError,
         ):
             return
+
+    @staticmethod
+    def _submission_error_code(status_code: Optional[int]) -> str:
+        if status_code in {401, 403}:
+            return 'avatar_provider_configuration'
+        if status_code == 413:
+            return 'avatar_invalid_material'
+        return 'tavus_provider_failed'
 
     def _sync_tavus_status_to_profile(
         self,
@@ -1947,12 +1974,14 @@ class AvatarProviderService:
             )
             state.status = canonical['status']
             state.error_message = canonical.get('error_message')
+            state.error_code = canonical.get('error_code')
             if state.status in {'cancelled', 'deleted'}:
                 state.status = 'failed'
                 state.external_avatar_id = None
                 state.error_message = 'This avatar request is no longer active.'
             elif state.status == 'ready':
                 state.error_message = None
+                state.error_code = None
         except (
             DigitalHumanProfileRepositoryError,
             DigitalHumanProfileNotFoundError,

@@ -74,7 +74,30 @@ def test_latest_selection_wins_over_delayed_b(voice_scope, c_status):
     repo.begin_voice_training(profile, c, 1)
     result(voice_scope, c, c_status, 'voice-C')
     assert not result(voice_scope, b)['voice_activated']
+    assert repo.get_training_job(b)['provider_payload'].get('_stay_activated') is not True
     assert repo.require(profile).voice_id == ('voice-C' if c_status == 'ready' else 'voice-A')
+
+
+def test_actual_activation_history_is_retained_for_running_calls(voice_scope):
+    repo, profile, _ = voice_scope
+    first = create(voice_scope)
+    repo.begin_voice_training(profile, first, 1)
+    assert result(voice_scope, first, voice_id='voice-first')['voice_activated']
+    second = create(voice_scope)
+    repo.begin_voice_training(profile, second, 1)
+    assert result(voice_scope, second, voice_id='voice-second')['voice_activated']
+    assert repo.get_training_job(first)['provider_payload']['_stay_activated'] is True
+    assert repo.get_training_job(second)['provider_payload']['_stay_activated'] is True
+
+
+@pytest.mark.parametrize('code,allowed', [('provider_http_429', True), ('provider_http_422_invalid_sample', True),
+    ('provider_http_503', False), ('provider_http_200', False), ('transport_timeout', False), ('', False)])
+def test_retry_ui_contract_matches_safe_provider_rejection(code, allowed):
+    job = {'training_type': 'voice', 'provider': 'elevenlabs', 'status': 'failed',
+        'provider_job_id': None, 'error_code': code}
+    assert DigitalHumanProfileRepository.voice_training_retry_allowed(job) is allowed
+    job['provider_job_id'] = 'known-voice'
+    assert not DigitalHumanProfileRepository.voice_training_retry_allowed(job)
 
 
 @pytest.mark.parametrize('mutation', ['revision', 'scope', 'erasure', 'selection', 'legacy', 'profile_consent'])

@@ -116,6 +116,17 @@ def test_canonical_states_preserved(setup,kind,status):
     assert response.error_message==state.error_message
 
 
+@pytest.mark.parametrize('kind', ['submit', 'status'])
+@pytest.mark.parametrize('job_status', ['failed', 'training', 'ready'])
+def test_recovery_contract_is_exposed_only_for_failed_jobs(setup, kind, job_status):
+    service, guard, state, invoke = setup
+    state.status = job_status
+    state.error_code = 'avatar_invalid_material'
+    response = invoke(kind)
+    assert response.error_code == ('avatar_invalid_material' if job_status == 'failed' else None)
+    assert response.recovery_action == ('review_source' if job_status == 'failed' else None)
+
+
 @pytest.mark.parametrize('error_type', [psycopg.OperationalError, psycopg.DatabaseError])
 @pytest.mark.parametrize('boundary', ['submit', 'status', 'submit_owner', 'status_owner_before',
                                      'status_owner_after', 'status_resolved_owner'])

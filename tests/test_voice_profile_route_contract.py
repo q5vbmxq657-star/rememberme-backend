@@ -2,7 +2,8 @@ import asyncio
 import json
 import threading
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, AsyncMock
+from io import BytesIO
 from uuid import uuid4
 
 import httpx
@@ -14,6 +15,46 @@ import app.routes.elevenlabs_voice as routes
 from app.services.avatar_media_analysis_service import AvatarMediaAnalysisUnavailableError
 from app.services.digital_human_profile_repository import DigitalHumanProfileRepositoryError, StaleVoiceTrainingError
 from test_voice_clone_upload_limits import configure, submit, upload
+
+
+def test_tts_version_is_forwarded_and_confirmed_without_exposing_provider_id(monkeypatch):
+    profile = uuid4()
+    version = str(uuid4())
+    service = SimpleNamespace(synthesize_for_profile=AsyncMock(return_value=SimpleNamespace(
+        audio_stream=BytesIO(b"audio"), voice_mode="personalized")))
+    authorization = Mock()
+    monkeypatch.setattr(routes, "require_profile_access", authorization)
+    monkeypatch.setattr(routes, "ElevenLabsVoiceService", lambda: service)
+    response = asyncio.run(routes.synthesize_profile_voice(
+        routes.ProfileVoiceTTSRequest(profile_id=profile, text="Hello", voice_version=version), principal=object()))
+    assert response.headers["x-stay-voice-version"] == version
+    assert response.headers["x-stay-voice-mode"] == "personalized"
+    assert response.headers["cache-control"] == "no-store"
+    assert "voice_id" not in response.headers
+    assert authorization.call_count == 2
+    service.synthesize_for_profile.assert_awaited_once_with(profile_id=profile, text="Hello", delivery=None, voice_version=version)
+
+
+@pytest.mark.parametrize("error", [httpx.ConnectError("private"), psycopg.OperationalError("private"),
+    DigitalHumanProfileRepositoryError("private"), TimeoutError("private")])
+def test_tts_dependency_failures_are_sanitized(monkeypatch, error):
+    service = SimpleNamespace(synthesize_for_profile=AsyncMock(side_effect=error))
+    monkeypatch.setattr(routes, "require_profile_access", Mock())
+    monkeypatch.setattr(routes, "ElevenLabsVoiceService", lambda: service)
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(routes.synthesize_profile_voice(routes.ProfileVoiceTTSRequest(profile_id=uuid4(), text="Hello"), principal=object()))
+    assert caught.value.status_code == 503
+    assert "private" not in caught.value.detail
+
+
+def test_tts_late_profile_revocation_blocks_audio_delivery(monkeypatch):
+    service = SimpleNamespace(synthesize_for_profile=AsyncMock(return_value=SimpleNamespace(
+        audio_stream=BytesIO(b"audio"), voice_mode="personalized")))
+    monkeypatch.setattr(routes, "require_profile_access", Mock(side_effect=[None, HTTPException(404, "Profile not found")]))
+    monkeypatch.setattr(routes, "ElevenLabsVoiceService", lambda: service)
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(routes.synthesize_profile_voice(routes.ProfileVoiceTTSRequest(profile_id=uuid4(), text="Hello"), principal=object()))
+    assert caught.value.status_code == 404
 
 
 @pytest.mark.parametrize("error", [httpx.ConnectError("private transport"),

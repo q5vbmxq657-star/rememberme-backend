@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from contextlib import nullcontext
 
 from datetime import datetime
@@ -15,6 +16,8 @@ from psycopg.rows import dict_row
 from app.models.digital_human_profile import (
     DigitalHumanProfile,
 )
+
+VOICE_RETRY_ERROR_PATTERN = r'^provider_http_(400|401|403|404|413|415|422|429)(_[A-Za-z0-9_-]{1,64})?$'
 
 
 class DigitalHumanProfileRepositoryError(RuntimeError):
@@ -530,9 +533,19 @@ class DigitalHumanProfileRepository:
                         not already_active and payload.get('_stay_voice_selection') != self._voice_activation_snapshot(profile)):
                     return {**dict(job), 'voice_activated': False}
                 if not already_active:
+                    # Record actual activation, not merely provider completion. A
+                    # running call may retain only a voice that was really active.
+                    cursor.execute("""UPDATE digital_human_training_jobs
+                        SET provider_payload=provider_payload || '{"_stay_activated":true}'::jsonb
+                        WHERE profile_id=%s AND training_type='voice' AND provider='elevenlabs'
+                          AND status='ready' AND job_id::text=%s AND provider_job_id=%s""",
+                        (profile_id, profile['voice_training_job_id'], profile['voice_id']))
                     cursor.execute("""UPDATE digital_human_profiles SET voice_provider='elevenlabs',
                         voice_id=%s, voice_training_job_id=%s, voice_training_status='ready', voice_ready_at=NOW()
                         WHERE profile_id=%s""", (voice_id,str(job_id),profile_id))
+                cursor.execute("""UPDATE digital_human_training_jobs
+                    SET provider_payload=provider_payload || '{"_stay_activated":true}'::jsonb
+                    WHERE job_id=%s""", (job_id,))
                 return {**dict(job), 'voice_activated': True}
 
     def get_voice_status_snapshot(self, profile_id: UUID):
@@ -834,6 +847,12 @@ class DigitalHumanProfileRepository:
                 return {**job, 'profile_updated': False}
             return {**job, 'profile_updated': True}
 
+    @staticmethod
+    def voice_training_retry_allowed(job: Dict[str, Any]) -> bool:
+        return bool(job.get('training_type') == 'voice' and job.get('provider') == 'elevenlabs'
+            and job.get('status') == 'failed' and job.get('provider_job_id') is None
+            and re.fullmatch(VOICE_RETRY_ERROR_PATTERN, job.get('error_code') or ''))
+
     def restart_failed_voice_training_job(
         self,
         *,
@@ -873,12 +892,13 @@ class DigitalHumanProfileRepository:
                       AND provider = 'elevenlabs'
                       AND status = 'failed'
                       AND provider_job_id IS NULL
-                      AND error_code ~ '^provider_http_(400|401|403|404|413|415|422|429)(_[[:alnum:]_-]{1,64})?$'
+                      AND error_code ~ %s
                     RETURNING *
                     """,
                     (
                         job_id,
                         profile_id,
+                        VOICE_RETRY_ERROR_PATTERN,
                     ),
                 )
 

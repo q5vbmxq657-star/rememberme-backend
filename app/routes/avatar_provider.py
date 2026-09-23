@@ -46,6 +46,9 @@ def _response(state, response_type):
             status=state.status,
             preview_url=state.preview_url,
             error_message=state.error_message,
+            error_code=getattr(state, 'error_code', None) if state.status in {'failed', 'cancelled', 'stale'} else None,
+            recovery_action=(getattr(state, 'recovery_action', None) or 'review_setup')
+                if state.status in {'failed', 'cancelled', 'stale'} else None,
             current_stage=state.current_stage,
             provider_detail_message=state.provider_detail_message,
         )

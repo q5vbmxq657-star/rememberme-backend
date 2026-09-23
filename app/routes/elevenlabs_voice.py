@@ -50,6 +50,7 @@ class ProfileVoiceTTSRequest(BaseModel):
         max_length=8_000,
     )
     delivery: VoiceDelivery | None = None
+    voice_version: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 @router.get("/health")
@@ -218,6 +219,9 @@ async def profile_voice_status(
         await run_in_threadpool(require_profile_access, principal=principal, profile_id=profile_id)
         service = await run_in_threadpool(ElevenLabsVoiceService)
         result = await run_in_threadpool(service.status_for_profile, profile_id)
+        if (result.get("pending_training") or {}).get("requires_verification") is True:
+            await service.refresh_voice_verification(profile_id)
+            result = await run_in_threadpool(service.status_for_profile, profile_id)
         await run_in_threadpool(require_profile_access, principal=principal, profile_id=profile_id)
         return JSONResponse(result, headers={"Cache-Control": "no-store"})
     except (httpx.HTTPError, psycopg.Error, DigitalHumanProfileRepositoryError, ElevenLabsVoiceError, TimeoutError) as error:
@@ -232,12 +236,9 @@ async def synthesize_profile_voice(
         require_authenticated_principal
     ),
 ):
-    require_profile_access(
-        principal=principal,
-        profile_id=request.profile_id,
-    )
+    await run_in_threadpool(require_profile_access, principal=principal, profile_id=request.profile_id)
     try:
-        service = ElevenLabsVoiceService()
+        service = await run_in_threadpool(ElevenLabsVoiceService)
 
         synthesis = (
             await service
@@ -247,9 +248,11 @@ async def synthesize_profile_voice(
                 ),
                 text=request.text,
                 delivery=request.delivery,
+                voice_version=request.voice_version,
             )
         )
 
+        await run_in_threadpool(require_profile_access, principal=principal, profile_id=request.profile_id)
         return StreamingResponse(
             synthesis.audio_stream,
             media_type="audio/mpeg",
@@ -262,9 +265,12 @@ async def synthesize_profile_voice(
                 "X-STAY-Voice-Mode": (
                     synthesis.voice_mode
                 ),
+                **({"X-STAY-Voice-Version": request.voice_version} if request.voice_version else {}),
             },
         )
 
+    except ElevenLabsVoiceConflictError as error:
+        raise HTTPException(status_code=409, detail="This call voice is no longer available. Start a new call to use the current voice.") from error
     except ElevenLabsVoiceValidationError as error:
         raise HTTPException(
             status_code=422,
@@ -276,6 +282,9 @@ async def synthesize_profile_voice(
             status_code=503,
             detail="Voice playback is temporarily unavailable. Please try again.",
         ) from error
+    except (httpx.HTTPError, psycopg.Error, DigitalHumanProfileRepositoryError, TimeoutError) as error:
+        raise HTTPException(status_code=503,
+            detail="Voice playback is temporarily unavailable. Please try again.") from error
 
 
 @router.delete(

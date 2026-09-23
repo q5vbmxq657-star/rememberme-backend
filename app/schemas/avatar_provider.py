@@ -13,6 +13,8 @@ class AvatarProviderSubmitResponse(BaseModel):
     status: str
     preview_url: Optional[str] = None
     error_message: Optional[str] = None
+    error_code: Optional[str] = None
+    recovery_action: Optional[str] = None
     current_stage: Optional[str] = None
     provider_detail_message: Optional[str] = None
 
@@ -22,5 +24,7 @@ class AvatarProviderStatusResponse(BaseModel):
     status: str
     preview_url: Optional[str] = None
     error_message: Optional[str] = None
+    error_code: Optional[str] = None
+    recovery_action: Optional[str] = None
     current_stage: Optional[str] = None
     provider_detail_message: Optional[str] = None
