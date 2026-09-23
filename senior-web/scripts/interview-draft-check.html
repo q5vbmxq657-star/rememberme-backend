@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>AP6 draft contract test</title>
+<body><h1>AP6 draft contract test</h1>
+<p id="result" role="status">Loading</p>
+<button id="save">Save test answer</button>
+<button id="isolation">Check invitation isolation</button>
+<button id="change">Change questions</button>
+<button id="clear">Clear test draft</button>
+<button id="expiry">Reject expired draft</button>
+<script type="module">
+import { draftKey, saveDraft, readDraft, deleteDraft } from './interviewDraft.js';
+const key = await draftKey('https://ap6-test.invalid', 'disposable-test-invitation');
+const result = document.querySelector('#result');
+const show = async () => {
+  const answers = await readDraft(key, 'question-one');
+  result.textContent = `Restored ${answers.length} answers${answers.length ? ': ' + await answers[0].text() : ''}`;
+};
+await show();
+document.querySelector('#save').onclick = async () => {
+  await saveDraft(key, 'question-one', Date.now() + 600000, [new Blob(['Test answer'], {type:'audio/webm'})]);
+  await show();
+};
+document.querySelector('#isolation').onclick = async () => {
+  const other = await draftKey('https://ap6-test.invalid', 'other-disposable-invitation');
+  result.textContent = `Other invitation: ${(await readDraft(other, 'question-one')).length} answers`;
+};
+document.querySelector('#change').onclick = async () => {
+  result.textContent = `Changed questions: ${(await readDraft(key, 'question-two')).length} answers`;
+};
+document.querySelector('#clear').onclick = async () => { await deleteDraft(key); await show(); };
+document.querySelector('#expiry').onclick = async () => {
+  try { await saveDraft(key, 'question-one', Date.now() - 1, [new Blob(['Expired'])]); result.textContent = 'FAIL'; }
+  catch { result.textContent = 'Expired draft rejected'; }
+};
+</script></body></html>

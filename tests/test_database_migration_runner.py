@@ -139,6 +139,12 @@ def test_legacy_migrations_are_exactly_frozen():
         "028_profile_erasure_receipts",
         "029_runtime_conversation_deletion",
         "030_memory_confirmed_address",
+        "031_memory_sync_metadata",
+        "032_family_membership",
+        "033_family_organizer_handover",
+        "034_family_content",
+        "035_family_content_lifecycle",
+        "036_family_collaboration",
     ]
 
     for migration in migrations[:6]:
@@ -672,6 +678,12 @@ def test_fresh_plan_bootstraps_through_008():
         "028_profile_erasure_receipts",
         "029_runtime_conversation_deletion",
         "030_memory_confirmed_address",
+        "031_memory_sync_metadata",
+        "032_family_membership",
+        "033_family_organizer_handover",
+        "034_family_content",
+        "035_family_content_lifecycle",
+        "036_family_collaboration",
     ]
 
 

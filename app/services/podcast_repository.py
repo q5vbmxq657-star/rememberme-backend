@@ -291,6 +291,20 @@ class PodcastRepository:
             ))
         return results
 
+    def completed_memory_ids(self, *, invitation_id: UUID, profile_id: UUID) -> list[UUID]:
+        with psycopg.connect(self.database_url, row_factory=dict_row) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT r.memory_id FROM podcast_responses r
+                    JOIN podcast_invitations i ON i.invitation_id = r.invitation_id
+                    WHERE i.invitation_id = %s AND i.profile_id = %s AND i.status = 'completed'
+                    ORDER BY r.turn_index ASC
+                    """,
+                    (invitation_id, profile_id),
+                )
+                return [row["memory_id"] for row in cursor.fetchall()]
+
     def mark_voice_training_used(
         self,
         *,

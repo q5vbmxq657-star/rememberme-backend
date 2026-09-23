@@ -11,6 +11,7 @@ from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from app.routes.memory import router as memory_router
 from app.routes.voice import router as voice_router
@@ -34,6 +35,7 @@ from app.routes.memory_retrieval import router as memory_retrieval_router
 from app.routes.elevenlabs_voice import router as elevenlabs_voice_router
 from app.routes.auth import router as auth_router
 from app.routes.profiles import router as profiles_router
+from app.routes.family import router as family_router
 from app.routes.profile_erasure import router as profile_erasure_router
 from app.routes.podcast import public_router as podcast_public_router, router as podcast_router
 from app.security.client_auth import require_client_key
@@ -64,18 +66,31 @@ async def lifespan(_app):
             await asyncio.sleep(5)
 
     openai_recovery = asyncio.create_task(run_openai_recovery())
+    async def run_family_retention():
+        from app.services.family_repository import FamilyRepository
+        while True:
+            try:
+                await run_in_threadpool(FamilyRepository().purge_expired)
+            except Exception:
+                logging.getLogger(__name__).error("Family invitation cleanup will be retried.")
+            await asyncio.sleep(60)
+
+    family_retention = asyncio.create_task(run_family_retention())
     try:
         yield
     finally:
         recovery.cancel()
         erasure_recovery.cancel()
         openai_recovery.cancel()
+        family_retention.cancel()
         with suppress(asyncio.CancelledError):
             await recovery
         with suppress(asyncio.CancelledError):
             await erasure_recovery
         with suppress(asyncio.CancelledError):
             await openai_recovery
+        with suppress(asyncio.CancelledError):
+            await family_retention
 
 
 app = FastAPI(
@@ -122,6 +137,7 @@ app.include_router(
     tags=["authentication"],
 )
 app.include_router(podcast_router, prefix="/v1/podcast", tags=["podcast"], dependencies=authenticated)
+app.include_router(family_router, prefix="/v1/family", tags=["family"], dependencies=authenticated)
 app.include_router(podcast_public_router, prefix="/v1/public/podcast", tags=["podcast-public"])
 app.include_router(
     profiles_router,

@@ -26,6 +26,16 @@ router = APIRouter()
 public_router = APIRouter()
 
 
+def interview_error_status(error: PodcastServiceError) -> int:
+    if error.code == "processing_in_progress":
+        return status.HTTP_409_CONFLICT
+    if error.code == "invitation_expired":
+        return status.HTTP_404_NOT_FOUND
+    if error.code in {"invalid_turn_count", "voice_identity_confirmation_required", "empty_transcript"}:
+        return status.HTTP_422_UNPROCESSABLE_ENTITY
+    return status.HTTP_503_SERVICE_UNAVAILABLE
+
+
 @router.post("/invitations", response_model=PodcastInvitationCreateResponse)
 async def create_invitation(
     body: PodcastInvitationCreateRequest,
@@ -53,6 +63,8 @@ async def create_invitation(
             public_web_base_url=web_base_url,
             backend_base_url=str(request.base_url).rstrip("/"),
         )
+    except HTTPException:
+        raise
     except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -152,7 +164,7 @@ async def upload_response(
     except PodcastInvitationNotFound as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This private interview is no longer available.") from error
     except PodcastServiceError as error:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=error.safe_message) from error
+        raise HTTPException(status_code=interview_error_status(error), detail=error.safe_message) from error
     except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -179,14 +191,9 @@ async def complete_interview(
     except PodcastInvitationNotFound as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This interview is no longer available.") from error
     except PodcastServiceError as error:
-        response_status = (
-            status.HTTP_409_CONFLICT
-            if error.code == "processing_in_progress"
-            else status.HTTP_422_UNPROCESSABLE_ENTITY
-        )
-        raise HTTPException(status_code=response_status, detail=error.safe_message) from error
+        raise HTTPException(status_code=interview_error_status(error), detail=error.safe_message) from error
     except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Your story could not be processed. The recording remains in this browser for another try.",
+            detail="Your story could not be processed. Please try sending it again.",
         ) from error

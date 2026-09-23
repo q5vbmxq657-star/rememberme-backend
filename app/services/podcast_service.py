@@ -12,7 +12,7 @@ from fastapi import UploadFile
 from openai import OpenAI
 
 from app.schemas.memory_ingestion import MemoryIngestionRequest
-from app.schemas.vector_memory import IndexMemoryRequest, VectorMemoryItem
+from app.schemas.vector_memory import IndexMemoryRequest, VectorMemoryItem, MemorySyncMetadata
 from app.schemas.podcast import (
     PodcastInvitationCreateRequest,
     PodcastInvitationCreateResponse,
@@ -29,6 +29,7 @@ from app.services.avatar_media_storage_service import AvatarMediaStorageService
 from app.services.memory_ingestion_service import MemoryIngestionService
 from app.services.pgvector_memory_service import PGVectorMemoryService
 from app.services.podcast_repository import PodcastInvitationNotFound, PodcastRepository
+from app.security.purpose_authorization import require_profile_purposes
 
 
 class PodcastServiceError(RuntimeError):
@@ -121,6 +122,15 @@ class PodcastService:
         public_web_base_url: str,
         backend_base_url: str,
     ) -> PodcastInvitationCreateResponse:
+        consent = require_profile_purposes(request.profile_id, {"memory_context"})
+
+        def authorize() -> None:
+            require_profile_purposes(request.profile_id, {"memory_context"}, expected_revision=consent.revision)
+
+        def synthesize(question: str) -> bytes:
+            authorize()
+            return self._synthesize_prompt(question)
+
         invitation_id = uuid4()
         memory_id = uuid4()
         raw_token = secrets.token_urlsafe(32)
@@ -129,9 +139,10 @@ class PodcastService:
         theme = self._normalized_theme(request.theme)
         prompts = self._session_prompts(theme=theme, locale=request.locale, opening_prompt=request.prompt)
         prompt_audio_results = await asyncio.gather(
-            *(asyncio.to_thread(self._synthesize_prompt, prompt["question"]) for prompt in prompts),
+            *(asyncio.to_thread(synthesize, prompt["question"]) for prompt in prompts),
             return_exceptions=True,
         )
+        authorize()
         stored_prompt_assets = []
         try:
             for index, (prompt, audio_result) in enumerate(zip(prompts, prompt_audio_results, strict=True)):
@@ -157,6 +168,7 @@ class PodcastService:
             raise
 
         try:
+            authorize()
             record = self.repository.create(
                 invitation_id=invitation_id,
                 profile_id=request.profile_id,
@@ -370,6 +382,7 @@ class PodcastService:
                         summary=ingestion.summary,
                         original_text=response.transcript,
                         type="voiceMemory",
+                        sync_metadata=MemorySyncMetadata(created_at=response.created_at.timestamp(), updated_at=response.created_at.timestamp()),
                         emotional_tags=ingestion.emotional_tags,
                         confidence_score=ingestion.confidence_score,
                     ) for response, ingestion in zip(responses, ingestions, strict=True)],
@@ -403,7 +416,7 @@ class PodcastService:
                 published_generation=published_generation,
             )
             raise PodcastServiceError(
-                "Your recording is still on this device. Please try sending it again.",
+                "Your story could not be saved. Please try sending it again.",
                 code="processing_failed",
             ) from error
 
@@ -500,7 +513,10 @@ class PodcastService:
                 profile_id=record.profile_id,
                 subject_name=record.subject_name,
                 theme=record.theme,
-                status=record.status,
+                status=(PodcastInvitationStatus.expired
+                        if record.status != PodcastInvitationStatus.completed
+                        and record.expires_at <= datetime.now(timezone.utc)
+                        else record.status),
                 answer_count=answer_count,
                 created_at=record.created_at,
                 completed_at=record.completed_at,
@@ -637,17 +653,21 @@ class PodcastService:
     def token_digest(token: str) -> str:
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
-    @staticmethod
     def _completed_response(
+        self,
         record: PodcastInvitationRecord,
         *,
         memory_ids: list[UUID] | None = None,
     ) -> PodcastUploadResponse:
-        resolved_memory_ids = memory_ids or [record.memory_id]
+        resolved_memory_ids = memory_ids
+        if resolved_memory_ids is None:
+            resolved_memory_ids = self.repository.completed_memory_ids(
+                invitation_id=record.invitation_id, profile_id=record.profile_id
+            ) or [record.memory_id]
         return PodcastUploadResponse(
             invitation_id=record.invitation_id,
             status=PodcastInvitationStatus.completed,
             memory_id=record.memory_id,
             memory_ids=resolved_memory_ids,
-            message=f"Vielen Dank! Deine Geschichte wurde sicher für {record.subject_name} gespeichert.",
+            message=f"Your story has been saved for {record.subject_name}.",
         )

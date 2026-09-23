@@ -2,6 +2,7 @@
 
 import type { MicVAD } from "@ricky0123/vad-web";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { deleteDraft, draftKey, readDraft, saveDraft } from "./interviewDraft";
 
 export type PodcastPrompt = {
   prompt_id: string;
@@ -12,12 +13,14 @@ export type PodcastPrompt = {
 
 export type SeniorRecorderState =
   | "IDLE" | "PLAYING_PROMPT" | "RECORDING" | "SILENCE_DETECTED"
-  | "CONSENT" | "UPLOADING" | "SUCCESS" | "ERROR";
+  | "CONSENT" | "UPLOADING" | "SUCCESS" | "ERROR" | "RESTORING";
 
 type RecorderOptions = {
   token: string;
   apiBaseURL: string;
   prompts: PodcastPrompt[];
+  expiresAt: string;
+  completed: boolean;
   silenceMilliseconds?: number;
   noiseThreshold?: number;
   onSuccess: (message: string) => void;
@@ -32,11 +35,13 @@ export function useSeniorVADRecorder({
   token,
   apiBaseURL,
   prompts,
+  expiresAt,
+  completed,
   silenceMilliseconds = 5000,
   noiseThreshold = 0.018,
   onSuccess
 }: RecorderOptions) {
-  const [state, setState] = useState<SeniorRecorderState>("IDLE");
+  const [state, setState] = useState<SeniorRecorderState>("RESTORING");
   const [level, setLevel] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [currentPromptIndex, setCurrentPromptIndex] = useState(0);
@@ -56,6 +61,38 @@ export function useSeniorVADRecorder({
   const currentPromptIndexRef = useRef(0);
   const mediaSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const mountedRef = useRef(true);
+  const draftKeyRef = useRef<string | null>(null);
+  const promptIdentity = JSON.stringify(prompts.map(({ prompt_id, question }) => [prompt_id, question]));
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const key = await draftKey(apiBaseURL, token);
+        if (cancelled) return;
+        draftKeyRef.current = key;
+        if (completed) {
+          await deleteDraft(key);
+          return;
+        }
+        const answers = await readDraft(key, promptIdentity);
+        if (cancelled) return;
+        if (answers.length > prompts.length) throw new Error("The saved answers do not match this interview.");
+        answersRef.current = answers;
+        currentPromptIndexRef.current = Math.min(answers.length, prompts.length - 1);
+        setCurrentPromptIndex(currentPromptIndexRef.current);
+        setCompletedTurns(answers.length);
+        setState(answers.length === prompts.length ? "CONSENT" : "IDLE");
+      } catch {
+        if (!cancelled) {
+          setError("Local recording storage is unavailable. Enable browser storage and reload before recording.");
+          setState("RESTORING");
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [apiBaseURL, token, promptIdentity, prompts.length, completed]);
 
   const stopTurnMonitoring = useCallback(() => {
     if (animationRef.current !== null) cancelAnimationFrame(animationRef.current);
@@ -83,7 +120,17 @@ export function useSeniorVADRecorder({
     contextRef.current = null;
   }, [stopTurnMonitoring]);
 
-  useEffect(() => () => { void cleanup(); }, [cleanup]);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; void cleanup(); };
+  }, [cleanup]);
+
+  useEffect(() => {
+    if (!["RECORDING", "SILENCE_DETECTED", "UPLOADING"].includes(state)) return;
+    const warn = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ""; };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [state]);
 
   const uploadWithRetry = useCallback(async (
     blobs: Blob[],
@@ -91,7 +138,7 @@ export function useSeniorVADRecorder({
     voiceTrainingConsentGranted: boolean
   ) => {
     const backendURL = apiBaseURL.replace(/\/$/, "");
-    if (!backendURL) throw new Error("STAY ist gerade nicht erreichbar.");
+    if (!backendURL) throw new Error("STAY is temporarily unavailable.");
     for (let attempt = 0; attempt < 4; attempt += 1) {
       const form = new FormData();
       blobs.forEach((blob, index) => {
@@ -106,15 +153,25 @@ export function useSeniorVADRecorder({
           body: form,
           cache: "no-store"
         });
-        const payload = await response.json().catch(() => ({})) as { detail?: string; message?: string };
-        if (response.ok) return payload.message ?? "Vielen Dank! Deine Geschichte wurde sicher gespeichert.";
+        const payload = await response.json().catch(() => ({})) as {
+          detail?: string; message?: string; status?: string; memory_ids?: unknown;
+        };
+        if (response.ok) {
+          const ids = payload.memory_ids;
+          if (payload.status !== "completed" || !Array.isArray(ids) || ids.length !== blobs.length
+              || new Set(ids).size !== ids.length || !ids.every(id => typeof id === "string"
+                && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id))) {
+            throw new Error("STAY has not confirmed every answer yet. Please try again.");
+          }
+          return payload.message ?? "Your story has been saved.";
+        }
         if (
           response.status >= 400
           && response.status < 500
           && ![408, 409, 429].includes(response.status)
         ) {
           throw new NonRetryableUploadError(
-            payload.detail ?? "Die Aufnahme konnte nicht verarbeitet werden."
+            payload.detail ?? "This recording could not be processed."
           );
         }
       } catch (uploadError) {
@@ -123,7 +180,7 @@ export function useSeniorVADRecorder({
       }
       await new Promise((resolve) => window.setTimeout(resolve, 1000 * 2 ** attempt));
     }
-    throw new Error("Die Verbindung war zu schwach. Bitte versuche es noch einmal.");
+    throw new Error("Your story could not be sent. Check your connection and try again.");
   }, [apiBaseURL, token]);
 
   const submit = useCallback(async (
@@ -131,7 +188,7 @@ export function useSeniorVADRecorder({
     voiceTrainingConsentGranted: boolean
   ) => {
     if (answersRef.current.length === 0) {
-      setError("Es wurde noch keine Antwort aufgenommen.");
+      setError("Record an answer before saving your story.");
       setState("ERROR");
       return;
     }
@@ -145,8 +202,14 @@ export function useSeniorVADRecorder({
       );
       setState("SUCCESS");
       onSuccess(message);
+      answersRef.current = [];
+      if (draftKeyRef.current) {
+        await deleteDraft(draftKeyRef.current).catch(() => {
+          setError("Your story is saved, but this browser could not remove its local recording. Clear this site's data on shared devices.");
+        });
+      }
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Die Geschichte konnte nicht gespeichert werden.");
+      setError(submitError instanceof Error ? submitError.message : "Your story could not be saved.");
       setState("CONSENT");
     }
   }, [onSuccess, uploadWithRetry]);
@@ -155,7 +218,7 @@ export function useSeniorVADRecorder({
     const context = contextRef.current;
     const stream = streamRef.current;
     const prompt = prompts[index];
-    if (!context || !stream || !prompt) throw new Error("Die nächste Frage ist nicht verfügbar.");
+    if (!context || !stream || !prompt) throw new Error("The next question is unavailable. Please try again.");
 
     currentPromptIndexRef.current = index;
     setCurrentPromptIndex(index);
@@ -193,7 +256,7 @@ export function useSeniorVADRecorder({
         const utterance = new SpeechSynthesisUtterance(prompt.question);
         const timeout = window.setTimeout(() => {
           window.speechSynthesis.cancel();
-          reject(new Error("Die Frage konnte nicht vorgelesen werden. Bitte tippe erneut auf Start."));
+          reject(new Error("The question could not be played. Please try again."));
         }, promptPlaybackTimeoutMilliseconds);
         utterance.lang = navigator.language || "de-DE";
         utterance.rate = 0.9;
@@ -203,13 +266,14 @@ export function useSeniorVADRecorder({
         };
         utterance.onerror = () => {
           window.clearTimeout(timeout);
-          reject(new Error("Die Frage konnte nicht vorgelesen werden. Bitte tippe erneut auf Start."));
+          reject(new Error("The question could not be played. Please try again."));
         };
         window.speechSynthesis.cancel();
         window.speechSynthesis.speak(utterance);
       });
     }
 
+    if (!mountedRef.current) return;
     chunksRef.current = [];
     speechHeardRef.current = false;
     silenceStartedRef.current = null;
@@ -258,7 +322,7 @@ export function useSeniorVADRecorder({
     setState("RECORDING");
   }, [noiseThreshold, prompts, silenceMilliseconds]);
 
-  const finish = useCallback(async () => {
+  const finish = useCallback(async (pauseAfterAnswer = false) => {
     if (stoppingRef.current || !recorderRef.current) return;
     stoppingRef.current = true;
     setState("SILENCE_DETECTED");
@@ -276,26 +340,37 @@ export function useSeniorVADRecorder({
       });
     try {
       if (blob.size < 1500 || !speechHeardRef.current) {
-        throw new Error("Ich konnte noch keine Antwort hören. Bitte sprich etwas länger.");
+        throw new Error("We could not hear an answer. Please speak a little longer.");
       }
-      answersRef.current.push(blob);
+      const key = draftKeyRef.current;
+      if (!key) throw new Error("Local recording storage is not ready. Reload and try again.");
+      const answers = [...answersRef.current, blob];
+      await saveDraft(key, promptIdentity, Date.parse(expiresAt), answers);
+      answersRef.current = answers;
       const nextCount = answersRef.current.length;
       setCompletedTurns(nextCount);
       const nextIndex = currentPromptIndexRef.current + 1;
       if (nextIndex < prompts.length) {
-        await new Promise((resolve) => window.setTimeout(resolve, 650));
-        await playPromptAndRecord(nextIndex);
+        if (pauseAfterAnswer) {
+          await cleanup();
+          currentPromptIndexRef.current = nextIndex;
+          setCurrentPromptIndex(nextIndex);
+          setState("IDLE");
+        } else {
+          await new Promise((resolve) => window.setTimeout(resolve, 650));
+          await playPromptAndRecord(nextIndex);
+        }
       } else {
         await cleanup();
         setState("CONSENT");
       }
     } catch (finishError) {
-      setError(finishError instanceof Error ? finishError.message : "Die Antwort konnte nicht aufgenommen werden.");
+      setError(finishError instanceof Error ? finishError.message : "Your answer could not be recorded.");
       setState("ERROR");
     } finally {
       stoppingRef.current = false;
     }
-  }, [cleanup, playPromptAndRecord, prompts.length, stopTurnMonitoring]);
+  }, [cleanup, playPromptAndRecord, prompts.length, stopTurnMonitoring, promptIdentity, expiresAt]);
 
   useEffect(() => {
     const handler = () => { void finish(); };
@@ -306,8 +381,11 @@ export function useSeniorVADRecorder({
   const start = useCallback(() => {
     setError(null);
     stoppingRef.current = false;
-    answersRef.current = [];
-    setCompletedTurns(0);
+    if (answersRef.current.length === prompts.length) {
+      setState("CONSENT");
+      return;
+    }
+    setState("PLAYING_PROMPT");
     const AudioContextClass = window.AudioContext
       ?? (window as typeof window & { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     const context = new AudioContextClass();
@@ -321,6 +399,11 @@ export function useSeniorVADRecorder({
     void (async () => {
       try {
         const stream = await microphonePromise;
+        if (!mountedRef.current) {
+          stream.getTracks().forEach(track => track.stop());
+          await context.close().catch(() => undefined);
+          return;
+        }
         streamRef.current = stream;
         try {
           const { MicVAD } = await import("@ricky0123/vad-web");
@@ -346,18 +429,19 @@ export function useSeniorVADRecorder({
           // WASM model adds accuracy but must never block a senior's answer.
           vadRef.current = null;
         }
-        await playPromptAndRecord(0);
+        if (!mountedRef.current) { await cleanup(); return; }
+        await playPromptAndRecord(answersRef.current.length);
       } catch (startError) {
         await cleanup();
         const denied = startError instanceof DOMException
           && ["NotAllowedError", "SecurityError"].includes(startError.name);
         setError(denied
-          ? "Bitte erlaube den Mikrofonzugriff in den Browser-Einstellungen und tippe erneut auf Start."
-          : startError instanceof Error ? startError.message : "Die Aufnahme konnte nicht gestartet werden.");
+          ? "Allow microphone access in your browser settings, then try again."
+          : startError instanceof Error ? startError.message : "Recording could not start.");
         setState("ERROR");
       }
     })();
-  }, [cleanup, playPromptAndRecord]);
+  }, [cleanup, playPromptAndRecord, prompts.length]);
 
   const retry = useCallback(() => {
     setError(null);
@@ -369,12 +453,32 @@ export function useSeniorVADRecorder({
 
     // This runs directly from the recovery tap so Safari can unlock audio.
     void context.resume();
-    void playPromptAndRecord(currentPromptIndexRef.current).catch(async (retryError) => {
+    if (answersRef.current.length === prompts.length) {
+      void cleanup();
+      setState("CONSENT");
+      return;
+    }
+    void playPromptAndRecord(answersRef.current.length).catch(async (retryError) => {
       await cleanup();
-      setError(retryError instanceof Error ? retryError.message : "Die Aufnahme konnte nicht neu gestartet werden.");
+      setError(retryError instanceof Error ? retryError.message : "Recording could not restart.");
       setState("ERROR");
     });
-  }, [cleanup, playPromptAndRecord, start]);
+  }, [cleanup, playPromptAndRecord, start, prompts.length]);
+
+  const discard = useCallback(async () => {
+    if (!window.confirm("Delete the answers saved on this device? This cannot be undone.")) return;
+    try {
+      if (draftKeyRef.current) await deleteDraft(draftKeyRef.current);
+      answersRef.current = [];
+      setCompletedTurns(0);
+      currentPromptIndexRef.current = 0;
+      setCurrentPromptIndex(0);
+      setError(null);
+      setState("IDLE");
+    } catch {
+      setError("The saved answers could not be removed. Please try again.");
+    }
+  }, []);
 
   return {
     state,
@@ -385,6 +489,8 @@ export function useSeniorVADRecorder({
     totalPrompts: prompts.length,
     start,
     finish,
+    pause: () => finish(true),
+    discard,
     submit,
     retry
   };

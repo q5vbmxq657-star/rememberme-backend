@@ -2,6 +2,7 @@ from __future__ import annotations
 from app.security.purpose_authorization import require_profile_purposes
 
 import math
+import json
 import os
 from collections.abc import Sequence
 from typing import Any
@@ -138,6 +139,7 @@ class PGVectorMemoryService:
                         embedding
                     ),
                     memory.confirmed_address,
+                    json.dumps(memory.sync_metadata.model_dump(mode="json", exclude_none=True)),
                 )
             )
 
@@ -197,7 +199,8 @@ class PGVectorMemoryService:
                                 confidence_score,
                                 content,
                                 embedding,
-                                confirmed_address
+                                confirmed_address,
+                                sync_metadata
                             )
                             VALUES (
                                 %s::text,
@@ -210,7 +213,8 @@ class PGVectorMemoryService:
                                 %s::double precision,
                                 %s::text,
                                 %s::vector,
-                                %s::text
+                                %s::text,
+                                %s::jsonb
                             )
                             """,
                             prepared_rows,
@@ -244,6 +248,7 @@ class PGVectorMemoryService:
                 cursor.execute("""SELECT generation, published_generation FROM memory_index_generations
                     WHERE profile_id=%s::uuid FOR UPDATE""", (request.profile_id,))
                 state = cursor.fetchone()
+                self._check_client_revision(request, int(state[0]) if state else 0)
                 if state is None or state[0] != state[1]:
                     return False
                 for identifier in {value.strip().lower() for value in request.excluded_memory_ids}:
@@ -252,11 +257,12 @@ class PGVectorMemoryService:
                     if cursor.fetchone() is None:
                         return False
                 cursor.execute("""SELECT memory_id,title,summary,original_text,type,emotional_tags,
-                    confidence_score,content,confirmed_address FROM memory_embeddings
+                    confidence_score,content,confirmed_address,sync_metadata FROM memory_embeddings
                     WHERE lower(profile_id)=lower(%s) ORDER BY memory_id""", (request.profile_id,))
                 expected = sorted((memory.id, memory.title, memory.summary, memory.original_text,
                     memory.type, memory.emotional_tags, float(memory.confidence_score),
-                    self._memory_text(memory), memory.confirmed_address) for memory in request.memories)
+                    self._memory_text(memory), memory.confirmed_address,
+                    memory.sync_metadata.model_dump(mode="json", exclude_none=True)) for memory in request.memories)
                 return cursor.fetchall() == expected
 
     def _reserve_index_generation(self, request: IndexMemoryRequest) -> tuple[int, UUID]:
@@ -264,7 +270,11 @@ class PGVectorMemoryService:
         with psycopg.connect(self.database_url) as connection:
             with connection.transaction():
                 with connection.cursor() as cursor:
-                    self._require_index_write_allowed(cursor, request.profile_id)
+                    self._require_index_write_allowed(cursor, request.profile_id, exclusive=True)
+                    cursor.execute("SELECT generation FROM memory_index_generations WHERE profile_id=%s::uuid FOR UPDATE",
+                                   (request.profile_id,))
+                    state = cursor.fetchone()
+                    self._check_client_revision(request, int(state[0]) if state else 0)
                     # Legacy local exclusions may initialize a decision, never overwrite one.
                     for identifier in sorted({value.strip().lower() for value in request.excluded_memory_ids}):
                         cursor.execute(
@@ -288,6 +298,32 @@ class PGVectorMemoryService:
                     )
                     row = cursor.fetchone()
                     return int(row[0]), row[1]
+
+    @staticmethod
+    def _check_client_revision(request: IndexMemoryRequest, revision: int) -> None:
+        if request.expected_revision is not None and request.expected_revision != revision:
+            raise PGVectorStaleIndexError("The memory snapshot changed. Download it before writing.")
+
+    def content_snapshot(self, profile_id: str) -> dict:
+        with psycopg.connect(self.database_url) as connection:
+            with connection.transaction():
+                with connection.cursor() as cursor:
+                    self._require_index_write_allowed(cursor, profile_id, exclusive=True)
+                    cursor.execute("SELECT generation FROM memory_index_generations WHERE profile_id=%s::uuid FOR UPDATE", (profile_id,))
+                    row = cursor.fetchone()
+                    revision = int(row[0]) if row else 0
+                    cursor.execute("""SELECT memory_id,title,summary,original_text,type,emotional_tags,confidence_score,confirmed_address,sync_metadata
+                        FROM memory_embeddings e WHERE lower(e.profile_id)=lower(%s)
+                        AND NOT EXISTS (SELECT 1 FROM memory_deletion_tombstones d WHERE d.profile_id=%s::uuid AND d.memory_id=lower(e.memory_id))
+                        AND NOT EXISTS (SELECT 1 FROM memory_usage_decisions u WHERE u.profile_id=%s::uuid AND u.memory_id=lower(e.memory_id) AND NOT u.included)
+                        ORDER BY memory_id""", (profile_id, profile_id, profile_id))
+                    memories = [dict(id=r[0], profile_id=profile_id, title=r[1], summary=r[2], original_text=r[3],
+                        type=r[4], emotional_tags=r[5], confidence_score=float(r[6]), confirmed_address=r[7], sync_metadata=r[8]) for r in cursor.fetchall()]
+                    cursor.execute("SELECT memory_id,included,revision FROM memory_usage_decisions WHERE profile_id=%s::uuid ORDER BY memory_id", (profile_id,))
+                    decisions = [dict(memory_id=r[0], included=r[1], revision=r[2]) for r in cursor.fetchall()]
+                    cursor.execute("SELECT memory_id FROM memory_deletion_tombstones WHERE profile_id=%s::uuid ORDER BY memory_id", (profile_id,))
+                    deleted = [r[0] for r in cursor.fetchall()]
+        return dict(profile_id=profile_id, revision=revision, memories=memories, decisions=decisions, deleted_memory_ids=deleted)
 
     @staticmethod
     def _require_index_write_allowed(cursor: Any, profile_id: str, *, exclusive: bool = False) -> None:
@@ -479,8 +515,8 @@ class PGVectorMemoryService:
                         """
                         INSERT INTO memory_embeddings (
                             memory_id, profile_id, title, summary, original_text,
-                            type, emotional_tags, confidence_score, content, embedding, confirmed_address
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector, %s)
+                            type, emotional_tags, confidence_score, content, embedding, confirmed_address, sync_metadata
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector, %s, %s::jsonb)
                         ON CONFLICT (profile_id, memory_id) DO UPDATE SET
                             title = EXCLUDED.title,
                             summary = EXCLUDED.summary,
@@ -491,16 +527,17 @@ class PGVectorMemoryService:
                             content = EXCLUDED.content,
                             embedding = EXCLUDED.embedding,
                             confirmed_address = EXCLUDED.confirmed_address,
+                            sync_metadata = EXCLUDED.sync_metadata,
                             updated_at = NOW()
                         WHERE (memory_embeddings.title, memory_embeddings.summary,
                             memory_embeddings.original_text, memory_embeddings.type,
                             memory_embeddings.emotional_tags, memory_embeddings.confidence_score,
                             memory_embeddings.content, memory_embeddings.embedding,
-                            memory_embeddings.confirmed_address)
+                            memory_embeddings.confirmed_address, memory_embeddings.sync_metadata)
                         IS DISTINCT FROM (EXCLUDED.title, EXCLUDED.summary,
                             EXCLUDED.original_text, EXCLUDED.type,
                             EXCLUDED.emotional_tags, EXCLUDED.confidence_score,
-                            EXCLUDED.content, EXCLUDED.embedding, EXCLUDED.confirmed_address)
+                            EXCLUDED.content, EXCLUDED.embedding, EXCLUDED.confirmed_address, EXCLUDED.sync_metadata)
                         """,
                         prepared_rows,
                     )
@@ -908,7 +945,10 @@ class PGVectorMemoryService:
                             ) AND EXISTS (
                                 SELECT 1 FROM schema_migration_audit
                                 WHERE version = '030_memory_confirmed_address' AND audit_mode = 'executed'
-                            ) AS confirmed_address_migration_ready
+                            ) AS confirmed_address_migration_ready,
+                            EXISTS (SELECT 1 FROM schema_migrations WHERE version = '031_memory_sync_metadata')
+                            AND EXISTS (SELECT 1 FROM schema_migration_audit WHERE version = '031_memory_sync_metadata'
+                                AND audit_mode = 'executed') AS sync_metadata_migration_ready
                         """,
                         (
                             PGVECTOR_AUTHORITY_VERSION,
@@ -934,6 +974,8 @@ class PGVectorMemoryService:
                         failures.append("migration 027 not applied and audited")
                     if not authority["confirmed_address_migration_ready"]:
                         failures.append("migration 030 not applied and audited")
+                    if not authority["sync_metadata_migration_ready"]:
+                        failures.append("migration 031 not applied and audited")
 
                     if not authority[
                         "migration_applied"
@@ -1009,6 +1051,7 @@ class PGVectorMemoryService:
                     }
 
                     expected_columns = {
+                        "sync_metadata": ("jsonb", "NO"),
                         "confirmed_address": ("text", "YES"),
                         "id": (
                             "bigint",
@@ -1067,7 +1110,7 @@ class PGVectorMemoryService:
                     if actual_columns != expected_columns:
                         raise PGVectorSchemaNotReadyError(
                             "memory_embeddings does not match "
-                            "the canonical memory schema (migrations 009 and 030)."
+                            "the canonical memory schema (migrations 009, 030 and 031)."
                         )
 
                     cursor.execute(

@@ -5,14 +5,37 @@ import asyncio
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from fastapi import HTTPException
 
 from app.schemas.podcast import (
+    PodcastInvitationCreateRequest,
     PodcastInvitationRecord,
     PodcastInvitationStatus,
     PodcastResponseRecord,
 )
 from app.services.podcast_service import PodcastService, PodcastServiceError
 from app.services import podcast_service
+
+
+@pytest.mark.parametrize("status_code", [403, 409])
+def test_invitation_route_preserves_changed_permission_error(monkeypatch, status_code):
+    from app.routes import podcast
+
+    monkeypatch.setattr(podcast, "require_profile_access", Mock())
+    monkeypatch.setattr(podcast, "require_profile_purposes", Mock())
+    monkeypatch.setattr(podcast, "DigitalHumanProfileRepository", lambda: SimpleNamespace(
+        require=lambda _: SimpleNamespace(consent_verified=True)))
+    failure = HTTPException(status_code=status_code, detail="Permission changed")
+    monkeypatch.setattr(podcast, "PodcastService", lambda: SimpleNamespace(
+        create_invitation=AsyncMock(side_effect=failure)))
+    monkeypatch.setenv("PODCAST_WEB_BASE_URL", "https://interview.example.test")
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(podcast.create_invitation(
+            body=SimpleNamespace(profile_id=uuid4()),
+            request=SimpleNamespace(base_url="https://api.example.test/"),
+            principal=SimpleNamespace(user=SimpleNamespace(user_id=uuid4())),
+        ))
+    assert caught.value is failure
 
 
 class PodcastRepositoryStub:
@@ -27,6 +50,11 @@ class PodcastRepositoryStub:
     def list_completed(self, *, profile_id):
         assert profile_id == self.record.profile_id
         return []
+
+    def completed_memory_ids(self, *, invitation_id, profile_id):
+        assert invitation_id == self.record.invitation_id
+        assert profile_id == self.record.profile_id
+        return [response.memory_id for response in self.responses]
 
     def mark_voice_training_used(self, *, invitation_id, profile_id):
         assert invitation_id == self.record.invitation_id
@@ -93,6 +121,28 @@ def make_record(*, consent=True):
     )
 
 
+@pytest.mark.parametrize("revoke_after_audio", [False, True])
+def test_invitation_creation_checks_purpose_revision_before_audio_and_persistence(monkeypatch, revoke_after_audio):
+    service = object.__new__(PodcastService)
+    service.repository = Mock()
+    service.media = Mock()
+    service._synthesize_prompt = Mock(return_value=b"test-audio")
+    service._session_prompts = Mock(return_value=[{"question": "A private question", "prompt_id": "one"}])
+    consent = SimpleNamespace(revision=7)
+    authorize = Mock(side_effect=[consent, consent, HTTPException(409, "Permissions changed")]
+                     if revoke_after_audio else HTTPException(403, "Permission required"))
+    monkeypatch.setattr(podcast_service, "require_profile_purposes", authorize)
+    request = PodcastInvitationCreateRequest(profile_id=uuid4(), requester_name="Anna", subject_name="Peter")
+    with pytest.raises(HTTPException):
+        asyncio.run(service.create_invitation(request=request, user_id=uuid4(),
+            public_web_base_url="https://example.test", backend_base_url="https://api.example.test"))
+    assert service._synthesize_prompt.call_count == int(revoke_after_audio)
+    service.repository.create.assert_not_called()
+    service.media.upload.assert_not_called()
+    if revoke_after_audio:
+        assert authorize.call_args.kwargs["expected_revision"] == 7
+
+
 def make_response(record, index):
     now = datetime.now(timezone.utc)
     return PodcastResponseRecord(
@@ -114,6 +164,45 @@ def make_response(record, index):
         },
         created_at=now,
     )
+
+
+@pytest.mark.parametrize("code, expected", [
+    ("processing_in_progress", 409), ("processing_failed", 503),
+    ("invitation_expired", 404), ("empty_transcript", 422),
+    ("invalid_turn_count", 422), ("voice_identity_confirmation_required", 422),
+])
+def test_interview_errors_distinguish_retryable_processing_from_invalid_material(code, expected):
+    from app.routes.podcast import interview_error_status
+    assert interview_error_status(PodcastServiceError("Safe message", code=code)) == expected
+
+
+def test_completed_retry_returns_all_original_memory_ids_without_processing():
+    record = make_record()
+    responses = [make_response(record, index) for index in range(3)]
+    record.memory_id = responses[0].memory_id
+    service = object.__new__(PodcastService)
+    service.repository = PodcastRepositoryStub(record, responses)
+    service.media = Mock()
+    result = asyncio.run(service.complete_session(
+        token="a" * 48, files=[], speaker_confirmed_subject=False,
+        voice_training_consent_granted=False, backend_base_url="https://example.test",
+    ))
+    assert result.memory_ids == [response.memory_id for response in responses]
+    assert result.memory_id == responses[0].memory_id
+    service.media.upload.assert_not_called()
+    assert record.voice_training_consent_granted is True
+
+
+@pytest.mark.parametrize("completed", [False, True])
+def test_invitation_list_reports_expiration_without_hiding_completed_answers(completed):
+    record = make_record()
+    record.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    record.status = PodcastInvitationStatus.completed if completed else PodcastInvitationStatus.pending
+    service = object.__new__(PodcastService)
+    service.repository = Mock()
+    service.repository.list_recent.return_value = [(record, 3 if completed else 0)]
+    result = service.list_invitations(profile_id=record.profile_id)
+    assert result[0].status == (PodcastInvitationStatus.completed if completed else PodcastInvitationStatus.expired)
 
 
 def test_story_session_prompt_selection_is_deterministic_and_bounded():

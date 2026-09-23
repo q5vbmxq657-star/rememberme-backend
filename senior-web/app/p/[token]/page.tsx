@@ -10,6 +10,7 @@ type PodcastMetadata = {
   prompt: string;
   prompt_audio_url: string | null;
   theme: string;
+  expires_at: string;
   status: "pending" | "recording" | "uploaded" | "processing" | "completed" | "retryable_failed" | "expired";
   prompts: Array<{
     prompt_id: string;
@@ -53,5 +54,5 @@ export default async function PodcastPage({ params }: { params: Promise<{ token:
   const { token } = await params;
   const metadata = await loadMetadata(token);
   if (!metadata) notFound();
-  return <SeniorRecorder token={token} apiBaseURL={apiURL} metadata={metadata} />;
+  return <SeniorRecorder key={token} token={token} apiBaseURL={apiURL} metadata={metadata} />;
 }

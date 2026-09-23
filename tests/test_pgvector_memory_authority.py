@@ -149,13 +149,14 @@ def test_valid_and_empty_batches_preserve_profile_scoped_atomic_replacement(monk
     result = service.index(IndexMemoryRequest(profile_id="profile-a", memories=memories))
     assert result["count"] == count
     assert len(embedded) == count
-    assert len(executed) == 8 + count
+    assert len(executed) == 9 + count
     assert "FROM digital_human_profiles" in executed[0][0]
-    assert "FOR SHARE" in executed[0][0]
+    assert "FOR UPDATE" in executed[0][0]
     assert "FROM digital_human_profile_erasure_requests" in executed[1][0]
-    assert "FROM memory_deletion_tombstones" in executed[2][0]
-    assert "FROM memory_usage_decisions" in executed[3][0]
-    assert "INSERT INTO memory_index_generations" in executed[4][0]
+    assert "SELECT generation FROM memory_index_generations" in executed[2][0]
+    assert "FROM memory_deletion_tombstones" in executed[3][0]
+    assert "FROM memory_usage_decisions" in executed[4][0]
+    assert "INSERT INTO memory_index_generations" in executed[5][0]
     assert "FOR UPDATE" in executed[-3][0]
     assert "DELETE FROM memory_embeddings" in executed[-2][0]
     assert "WHERE lower(profile_id) = lower(%s::text)" in executed[-2][0]

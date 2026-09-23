@@ -23,6 +23,20 @@ from app.security.user_auth import (
 router = APIRouter()
 
 
+@router.get("/snapshot/{profile_id}")
+def memory_snapshot(profile_id: UUID, principal: AuthenticatedSessionPrincipal = Depends(require_authenticated_principal)):
+    identifier = str(profile_id)
+    require_profile_access(principal=principal, profile_id=identifier)
+    try:
+        result = make_service().content_snapshot(identifier)
+        require_profile_access(principal=principal, profile_id=identifier)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise memory_runtime_error("snapshot", error) from error
+
+
 @router.delete("/profiles/{profile_id}/memories/{memory_id}")
 def delete_memory(profile_id: UUID, memory_id: str,
                   principal: AuthenticatedSessionPrincipal = Depends(require_authenticated_principal)):
@@ -117,6 +131,8 @@ def index_memories(
         principal=principal,
         profile_id=request.profile_id,
     )
+    if request.expected_revision is None:
+        raise HTTPException(status_code=426, detail="Update STAY before syncing memories.")
     try:
         result = make_service().index(request)
         require_profile_access(principal=principal, profile_id=request.profile_id)
