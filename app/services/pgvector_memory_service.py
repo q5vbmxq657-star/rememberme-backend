@@ -27,6 +27,7 @@ PGVECTOR_AUTHORITY_VERSION = (
 
 PGVECTOR_EXTENSION_NAME = "vector"
 PGVECTOR_EXTENSION_VERSION = "0.8.5"
+PGVECTOR_SUPPORTED_EXTENSION_VERSIONS = frozenset({"0.8.2", PGVECTOR_EXTENSION_VERSION})
 PGVECTOR_EMBEDDING_DIMENSIONS = 1536
 
 PGVECTOR_REQUIRED_INDEXES = {
@@ -887,11 +888,11 @@ class PGVectorMemoryService:
                         table_state[
                             "extension_version"
                         ]
-                        != PGVECTOR_EXTENSION_VERSION
+                        not in PGVECTOR_SUPPORTED_EXTENSION_VERSIONS
                     ):
                         initial_failures.append(
                             "pgvector extension version "
-                            f"is not {PGVECTOR_EXTENSION_VERSION}"
+                            f"is not supported (expected {', '.join(sorted(PGVECTOR_SUPPORTED_EXTENSION_VERSIONS))})"
                         )
 
                     if initial_failures:

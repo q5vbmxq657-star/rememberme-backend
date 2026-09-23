@@ -251,6 +251,9 @@ def test_service_freezes_embedding_contract():
         encoding="utf-8"
     )
 
+    from app.services.pgvector_memory_service import PGVECTOR_SUPPORTED_EXTENSION_VERSIONS
+    assert PGVECTOR_SUPPORTED_EXTENSION_VERSIONS == {"0.8.2", "0.8.5"}
+
     assert (
         "PGVECTOR_EMBEDDING_DIMENSIONS = 1536"
         in source

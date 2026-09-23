@@ -93,6 +93,11 @@ def library(after_profile_id: UUID | None = None, after_memory_id: UUID | None =
     return execute(principal, "library", after_profile_id, after_memory_id)
 
 
+@router.get("/credits")
+def credits(principal: AuthenticatedSessionPrincipal = Depends(require_authenticated_principal)):
+    return execute(principal, "credits")
+
+
 @router.put("/content/{profile_id}/{memory_id}")
 def publish_content(profile_id: UUID, memory_id: UUID, body: FamilyContent,
                     principal: AuthenticatedSessionPrincipal = Depends(require_authenticated_principal)):

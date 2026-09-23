@@ -10,6 +10,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from fastapi import HTTPException
+from app.services.family_credit_ledger import FamilyCreditLedger
 
 
 class FamilyRepository:
@@ -68,7 +69,13 @@ class FamilyRepository:
                 WHERE family_id=%s AND expires_at>NOW()""", (group["family_id"],)).fetchone()
             return {"family": {"family_id": group["family_id"], "name": group["name"],
                     "organizer_id": group["organizer_id"], "current_user_id": uid, "members": members,
-                    "invitations": invitations, "handover": handover}, "pending_family_name": None}
+                    "invitations": invitations, "handover": handover,
+                    "credits": FamilyCreditLedger.balance(db, group["family_id"])}, "pending_family_name": None}
+
+    def credits(self, principal):
+        with self.transaction(principal) as db:
+            group = self.group(db, principal.user.user_id)
+            return {"family_id": group["family_id"], **FamilyCreditLedger.balance(db, group["family_id"])}
 
     def create(self, principal, name, display_name):
         uid = principal.user.user_id

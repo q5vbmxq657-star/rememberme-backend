@@ -34,7 +34,16 @@ def main() -> int:
         ],
         check=False,
     )
-    return completed.returncode
+    if completed.returncode != 0:
+        return completed.returncode
+    # Migration success alone does not establish runtime compatibility.
+    readiness = subprocess.run(
+        [sys.executable, "-c",
+         "from app.services.pgvector_memory_service import PGVectorMemoryService; "
+         "PGVectorMemoryService(); print('Canonical memory runtime verified.')"],
+        check=False,
+    )
+    return readiness.returncode
 
 
 if __name__ == "__main__":

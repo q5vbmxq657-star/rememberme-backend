@@ -10,6 +10,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.services.family_repository import FamilyRepository
+from app.services.family_credit_ledger import FamilyCreditLedger
 from app.routes.family import FamilyCreate, FamilyJoin, FamilyContent, FamilyContentEdit, FamilyCollaborationUpdate
 
 
@@ -57,6 +58,90 @@ def test_family_request_requires_approval_and_never_grants_profile_access(family
     repo.remove(guest, guest.user.user_id)
     assert repo.snapshot(guest)["family"] is None
     assert len(repo.snapshot(owner)["family"]["members"]) == 1
+
+
+def test_family_credit_rollover_receipts_and_private_access(family_data):
+    repo, people, _ = family_data
+    owner, stranger = people[:2]
+    repo.create(owner, "Family", "Owner")
+    fid = repo.snapshot(owner)["family"]["family_id"]
+    for period in ("month-one", "month-one", "month-two"):
+        with repo.transaction(owner) as db:
+            FamilyCreditLedger.grant(db, fid, evidence_key=str(fid)+period, units=18000)
+    assert repo.credits(owner)["balance_units"] == 36000
+    assert repo.credits(owner)["monthly_credits_roll_over"] is True
+    with pytest.raises(HTTPException):
+        repo.credits(stranger)
+    with pytest.raises(HTTPException) as error:
+        with repo.transaction(owner) as db:
+            FamilyCreditLedger.grant(db, fid, evidence_key=str(fid)+"month-one", units=18001)
+    assert error.value.status_code == 409
+    assert repo.credits(owner)["balance_units"] == 36000
+
+
+def test_family_credit_concurrent_reservations_cannot_overspend(family_data):
+    repo, people, _ = family_data
+    owner, guest = people[:2]
+    repo.create(owner, "Family", "Owner")
+    invitation = repo.invite(owner)
+    repo.claim(guest, invitation["code"], "Guest")
+    repo.resolve_invitation(owner, invitation["invitation_id"], True)
+    fid = repo.snapshot(owner)["family"]["family_id"]
+    with repo.transaction(owner) as db:
+        FamilyCreditLedger.grant(db, fid, evidence_key=str(fid), units=600)
+    def reserve(person):
+        try:
+            with repo.transaction(person) as db:
+                FamilyCreditLedger.reserve(db, fid, person.user.user_id, uuid4(), mode="video", seconds=60)
+            return True
+        except HTTPException as error:
+            assert error.status_code == 409
+            return False
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sum(pool.map(reserve, (owner, guest))) == 1
+    assert repo.credits(owner)["available_units"] == 0
+    assert repo.credits(owner)["balance_units"] == 600
+
+
+@pytest.mark.parametrize("mode,seconds,cost", [("voice", 7, 7), ("video", 7, 70), ("voice", 0, 0)])
+def test_family_credit_settlement_is_exact_and_idempotent(family_data, mode, seconds, cost):
+    repo, people, _ = family_data
+    owner = people[0]
+    repo.create(owner, "Family", "Owner")
+    fid = repo.snapshot(owner)["family"]["family_id"]
+    call = uuid4()
+    with repo.transaction(owner) as db:
+        FamilyCreditLedger.grant(db, fid, evidence_key=str(fid), units=18000)
+        FamilyCreditLedger.reserve(db, fid, owner.user.user_id, call, mode=mode, seconds=60)
+        FamilyCreditLedger.reserve(db, fid, owner.user.user_id, call, mode=mode, seconds=60)
+    for _ in range(2):
+        with repo.transaction(owner) as db:
+            FamilyCreditLedger.settle(db, fid, call, verified_seconds=seconds)
+    balance = repo.credits(owner)
+    assert balance["balance_units"] == 18000-cost
+    assert balance["reserved_units"] == 0
+    with pytest.raises(HTTPException):
+        with repo.transaction(owner) as db:
+            FamilyCreditLedger.settle(db, fid, call, verified_seconds=seconds+1)
+
+
+def test_family_credit_rejects_foreign_members_and_unreserved_usage(family_data):
+    repo, people, _ = family_data
+    owner, stranger = people[:2]
+    repo.create(owner, "Family", "Owner")
+    fid = repo.snapshot(owner)["family"]["family_id"]
+    call = uuid4()
+    with repo.transaction(owner) as db:
+        FamilyCreditLedger.grant(db, fid, evidence_key=str(fid), units=600)
+    with pytest.raises(HTTPException):
+        with repo.transaction(owner) as db:
+            FamilyCreditLedger.reserve(db, fid, stranger.user.user_id, call, mode="voice", seconds=60)
+    with repo.transaction(owner) as db:
+        FamilyCreditLedger.reserve(db, fid, owner.user.user_id, call, mode="voice", seconds=60)
+    with pytest.raises(HTTPException):
+        with repo.transaction(owner) as db:
+            FamilyCreditLedger.settle(db, fid, call, verified_seconds=61)
+    assert repo.credits(owner)["reserved_units"] == 60
 
 
 def test_revoke_expiry_and_account_deletion_remove_invitations(family_data):
