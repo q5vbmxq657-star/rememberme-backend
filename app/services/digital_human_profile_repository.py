@@ -238,10 +238,18 @@ class DigitalHumanProfileRepository:
                     WHERE profile_id=%s AND provider=%s AND training_type='avatar'
                     ORDER BY created_at DESC, job_id DESC LIMIT 1 FOR UPDATE""", (profile_id, provider))
                 job = cursor.fetchone()
+                replacing_verified_avatar = (
+                    current.get('avatar_training_status') == 'ready'
+                    and bool(current.get('avatar_replica_id'))
+                    and current.get('runtime_verified_at') is not None
+                    and current.get('consent_verified') is True
+                    and current.get('avatar_training_job_id') != provider_job_id
+                )
                 if (not job or (training_job_id is not None and job['job_id'] != training_job_id)
                         or job['provider_job_id'] != provider_job_id
                         or (training_job_id is None and (not provider_job_id or job['provider_job_id'] != provider_job_id))
-                        or (expected_provider_job_id is not None and current['avatar_training_job_id'] != expected_provider_job_id)):
+                        or (expected_provider_job_id is not None and current['avatar_training_job_id'] != expected_provider_job_id
+                            and not replacing_verified_avatar)):
                     raise StaleAvatarTrainingError('Avatar training is no longer current.')
                 if (job.get('status') in {'cancelled', 'deleted'}
                         or not self._avatar_status_allows(job.get('status', 'training'), status)
@@ -263,6 +271,12 @@ class DigitalHumanProfileRepository:
                         or consent['policy_version'] != CONSENT_POLICY_VERSION
                         or not required.issubset(consent['purposes'])):
                     raise StaleAvatarTrainingError('Avatar training permission changed.')
+                # The durable job owns upgrade progress. Keep the verified active
+                # generation available until the latest candidate is ready.
+                if replacing_verified_avatar and not ready:
+                    return self._profile_from_row(current)
+                expected_current_job_id = (current['avatar_training_job_id']
+                    if replacing_verified_avatar else expected_provider_job_id)
                 cursor.execute(
                     """
                     UPDATE digital_human_profiles
@@ -307,8 +321,8 @@ class DigitalHumanProfileRepository:
                         error_code,
                         error_message,
                         profile_id,
-                        expected_provider_job_id,
-                        expected_provider_job_id,
+                        expected_current_job_id,
+                        expected_current_job_id,
                     ),
                 )
 
@@ -838,14 +852,14 @@ class DigitalHumanProfileRepository:
                 provider_payload=provider_payload, error_code=error_code, error_message=error_message,
                 _connection=connection)
             try:
-                self.set_avatar_training(profile_id, provider=provider, status=job['status'],
+                projected = self.set_avatar_training(profile_id, provider=provider, status=job['status'],
                     provider_job_id=provider_job_id, replica_id=replica_id, training_job_id=job_id,
                     expected_provider_job_id=provider_job_id, error_code=error_code,
                     error_message=error_message, _connection=connection)
             except StaleAvatarTrainingError:
                 # Keep provider evidence for cleanup without reviving obsolete state.
                 return {**job, 'profile_updated': False}
-            return {**job, 'profile_updated': True}
+            return {**job, 'profile_updated': projected.avatar_training_job_id == provider_job_id}
 
     @staticmethod
     def voice_training_retry_allowed(job: Dict[str, Any]) -> bool:

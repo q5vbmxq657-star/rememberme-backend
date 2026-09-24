@@ -354,7 +354,7 @@ class AvatarProviderService:
             "package_record_id": package_record_id,
             "_stay_consent_revision": consent.revision,
             source_kind: source_url,
-            "model_name": "phoenix-4",
+            "model_name": "phoenix-4.5",
         }
         job_id = uuid.uuid4()
         request_payload['_stay_face_name'] = f'stay_face_{job_id.hex}'
@@ -442,7 +442,7 @@ class AvatarProviderService:
 
         payload: Dict[str, Any] = {
             "face_name": request_payload['_stay_face_name'],
-            "model_name": "phoenix-4",
+            "model_name": request_payload.get("model_name", "phoenix-4"),
             source_kind: source_url,
         }
 
@@ -593,6 +593,7 @@ class AvatarProviderService:
                 "Avatar training status could not be verified."
             )
         tavus_status = data["status"].strip().lower()
+        existing.provider_detail_message = self._tavus_refinement_message(data)
 
         if tavus_status in {"ready", "completed", "complete"}:
             existing.status = "ready"
@@ -2048,6 +2049,7 @@ class AvatarProviderService:
                 error_message=None,
             )
 
+        state.provider_detail_message = self._tavus_refinement_message(payload)
         self._sync_tavus_status_to_profile(
             state=state,
             provider_payload=payload,
@@ -2096,6 +2098,18 @@ class AvatarProviderService:
                 if isinstance(candidate, str) and candidate.strip():
                     return candidate.strip()
 
+        return None
+
+    @staticmethod
+    def _tavus_refinement_message(payload: Dict[str, Any]) -> Optional[str]:
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        if str(data.get("status", "")).lower() != "completed":
+            return None
+        refinement = data.get("finetune_status")
+        if refinement == "started":
+            return "Your video preview is ready to call with a watermark. Quality is improving in the background."
+        if refinement == "errored":
+            return "Your video preview is still ready to call. Quality improvement failed; the preview retains a watermark."
         return None
 
     def _normalize_tavus_status_from_payload(

@@ -12,6 +12,20 @@ import app.services.avatar_provider_service as provider_module
 from app.services.avatar_provider_service import AvatarProviderService
 
 
+@pytest.mark.parametrize('refinement', ['started', 'completed', 'errored'])
+def test_phoenix_45_preview_is_callable_independently_of_refinement(refinement):
+    service = AvatarProviderService()
+    payload = {'status': 'completed', 'finetune_status': refinement}
+    assert service._normalize_tavus_status_from_payload(payload) == 'ready'
+    message = service._tavus_refinement_message(payload)
+    if refinement == 'completed':
+        assert message is None
+    else:
+        assert 'watermark' in message
+    assert service._tavus_refinement_message({'status': 'started', 'finetune_status': None}) is None
+    assert service._normalize_tavus_status_from_payload({'status': 'error'}) == 'failed'
+
+
 @pytest.fixture
 def valid_tavus_consent(monkeypatch):
     def grant(profile_id, purposes, *, expected_revision=None):
@@ -207,7 +221,7 @@ def test_submit_uses_current_tavus_faces_image_contract(monkeypatch, requested_i
     assert FakeHTTPClient.last_url == "https://tavusapi.com/v2/faces"
     assert FakeHTTPClient.last_payload == {
         "face_name": FakeHTTPClient.last_payload["face_name"],
-        "model_name": "phoenix-4",
+        "model_name": "phoenix-4.5",
         "train_image_url": "https://stay.example/training.jpg",
         "voice_name": "james",
         "auto_fix_training_image": False,
