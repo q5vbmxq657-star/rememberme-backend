@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
@@ -226,6 +228,11 @@ class ProfileErasureService:
             if job.get("training_type") != "voice" or job.get("status") == "deleted":
                 continue
             voice_id = job.get("provider_job_id")
+            if job.get('provider') == 'stay_voice':
+                from app.services.voice_reference_repository import VoiceReferenceRepository
+                await asyncio.to_thread(VoiceReferenceRepository.delete, self.repository,
+                    profile_id=profile_id, job_id=UUID(str(job['job_id'])))
+                continue
             if not voice_id:
                 if job.get("status") in {"created", "submitted", "training"} or (
                     job.get("status") == "failed" and job.get("submitted_at") is not None

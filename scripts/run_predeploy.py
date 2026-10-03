@@ -43,7 +43,12 @@ def main() -> int:
          "PGVectorMemoryService(); print('Canonical memory runtime verified.')"],
         check=False,
     )
-    return readiness.returncode
+    if readiness.returncode != 0:
+        return readiness.returncode
+    voice = subprocess.run(
+        [sys.executable, "-m", "app.services.voice_release_preflight"], check=False,
+    )
+    return voice.returncode
 
 
 if __name__ == "__main__":

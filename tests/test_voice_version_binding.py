@@ -30,7 +30,7 @@ def test_running_call_retains_previously_activated_voice(valid_voice_consent):
     result = asyncio.run(service.synthesize_for_profile(profile_id=profile.profile_id, text="Hello", voice_version=str(previous)))
     assert result.voice_mode == "personalized"
     service.synthesize.assert_awaited_once_with(text="Hello", voice_id="voice-A", delivery=None)
-    assert repository.get_training_job.call_count == 2
+    assert repository.get_training_job.call_count == 3
 
 
 def test_new_call_uses_current_voice_without_historical_lookup(valid_voice_consent):
@@ -45,6 +45,54 @@ def test_generic_call_does_not_switch_when_a_clone_becomes_ready(valid_voice_con
     result = asyncio.run(service.synthesize_for_profile(profile_id=profile.profile_id, text="Hello", voice_version="generic"))
     assert result.voice_mode == "warm_default"
     service.synthesize.assert_awaited_once_with(text="Hello", voice_id="generic-id", delivery=None)
+
+
+def test_generic_provider_hang_is_cancelled_for_native_fallback(valid_voice_consent, monkeypatch):
+    profile, repository, previous, job, service = setup_version()
+    timeout = asyncio.timeout
+    deadlines = []
+    cancelled = []
+
+    def short_timeout(seconds):
+        deadlines.append(seconds)
+        return timeout(.01)
+
+    async def hang(**kwargs):
+        try:
+            await asyncio.sleep(60)
+        finally:
+            cancelled.append(True)
+
+    monkeypatch.setattr(asyncio, "timeout", short_timeout)
+    service.synthesize.side_effect = hang
+    with pytest.raises(ElevenLabsVoiceProviderError) as error:
+        asyncio.run(service.synthesize_for_profile(
+            profile_id=profile.profile_id, text="Hello", voice_version="generic"))
+    assert error.value.status_code == 504
+    assert deadlines == [8]
+    assert cancelled == [True]
+    assert valid_voice_consent.call_args.kwargs["expected_revision"] == 7
+
+
+def test_generic_timeout_rechecks_revocation_before_fallback(valid_voice_consent):
+    profile, repository, previous, job, service = setup_version()
+
+    async def timeout_after_revocation(**kwargs):
+        valid_voice_consent.side_effect = PermissionError("Consent revoked")
+        raise TimeoutError()
+
+    service.synthesize.side_effect = timeout_after_revocation
+    with pytest.raises(PermissionError, match="Consent revoked"):
+        asyncio.run(service.synthesize_for_profile(
+            profile_id=profile.profile_id, text="Hello", voice_version="generic"))
+
+
+def test_generic_timeout_never_swallows_call_cancellation(valid_voice_consent):
+    profile, repository, previous, job, service = setup_version()
+    service.synthesize.side_effect = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(service.synthesize_for_profile(
+            profile_id=profile.profile_id, text="Hello", voice_version="generic"))
 
 
 @pytest.mark.parametrize("field,value", [("profile_id", uuid4()), ("provider", "other"),
@@ -99,3 +147,13 @@ def test_activation_during_audio_generation_preserves_the_original_voice(valid_v
     service.synthesize.side_effect = activate_new
     result = asyncio.run(service.synthesize_for_profile(profile_id=profile.profile_id, text="Hello", voice_version=version))
     assert result.audio_stream.read() == b"original voice"
+
+
+@pytest.mark.parametrize("version", [None, "current"])
+def test_self_hosted_voice_never_falls_back_to_elevenlabs(valid_voice_consent, version):
+    profile, repository, previous, job, service = setup_version()
+    repository.profile = replace(profile, voice_provider="stay_voice")
+    with pytest.raises(ElevenLabsVoiceConflictError):
+        asyncio.run(service.synthesize_for_profile(profile_id=profile.profile_id, text="Hello",
+            voice_version=profile.voice_training_job_id if version else None))
+    service.synthesize.assert_not_awaited()

@@ -51,6 +51,7 @@ class ProfileVoiceTTSRequest(BaseModel):
     )
     delivery: VoiceDelivery | None = None
     voice_version: str | None = Field(default=None, min_length=1, max_length=100)
+    language: str | None = Field(default=None, min_length=2, max_length=12)
 
 
 @router.get("/health")
@@ -249,18 +250,20 @@ async def synthesize_profile_voice(
                 text=request.text,
                 delivery=request.delivery,
                 voice_version=request.voice_version,
+                **({"language": request.language} if request.language else {}),
             )
         )
 
         await run_in_threadpool(require_profile_access, principal=principal, profile_id=request.profile_id)
         return StreamingResponse(
             synthesis.audio_stream,
-            media_type="audio/mpeg",
+            media_type=synthesis.media_type,
             headers={
                 "Cache-Control": "no-store",
                 "Content-Disposition": (
                     "inline; "
-                    "filename=rememberme-voice.mp3"
+                    + ("filename=rememberme-voice.wav" if synthesis.media_type == "audio/wav"
+                       else "filename=rememberme-voice.mp3")
                 ),
                 "X-STAY-Voice-Mode": (
                     synthesis.voice_mode

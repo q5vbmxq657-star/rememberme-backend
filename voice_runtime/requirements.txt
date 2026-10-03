@@ -1,0 +1,4 @@
+fastapi==0.115.6
+pydantic==2.10.4
+uvicorn==0.34.0
+chatterbox-tts @ git+https://github.com/resemble-ai/chatterbox.git@5de7a54aa4e5e2baadb0182dde554908b48b85c2

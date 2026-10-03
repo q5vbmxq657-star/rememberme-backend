@@ -446,7 +446,7 @@ class DigitalHumanProfileRepository:
             raise DigitalHumanProfileNotFoundError('Voice profile was not found.')
         cursor.execute("""SELECT * FROM digital_human_training_jobs
             WHERE job_id=%s AND profile_id=%s AND training_type='voice'
-              AND provider='elevenlabs' FOR UPDATE""", (job_id, profile_id))
+              AND provider IN ('elevenlabs','stay_voice') FOR UPDATE""", (job_id, profile_id))
         job = cursor.fetchone()
         if job is None:
             raise StaleVoiceTrainingError('Voice job does not belong to this profile.')
@@ -474,7 +474,7 @@ class DigitalHumanProfileRepository:
                 if not self._voice_consent_matches(cursor, profile_id, expected_consent_revision):
                     raise StaleVoiceTrainingError('Voice permission changed.')
                 cursor.execute("""SELECT job_id FROM digital_human_training_jobs
-                    WHERE profile_id=%s AND training_type='voice' AND provider='elevenlabs'
+                    WHERE profile_id=%s AND training_type='voice' AND provider IN ('elevenlabs','stay_voice')
                     ORDER BY created_at DESC,job_id DESC LIMIT 1""", (profile_id,))
                 if cursor.fetchone()['job_id'] != job_id:
                     raise StaleVoiceTrainingError('A newer voice request was selected.')
@@ -537,12 +537,12 @@ class DigitalHumanProfileRepository:
                 cursor.execute('SELECT 1 FROM digital_human_profile_erasure_requests WHERE profile_id=%s LIMIT 1', (profile_id,))
                 erased = cursor.fetchone() is not None
                 cursor.execute("""SELECT job_id FROM digital_human_training_jobs
-                    WHERE profile_id=%s AND training_type='voice' AND provider='elevenlabs'
+                    WHERE profile_id=%s AND training_type='voice' AND provider IN ('elevenlabs','stay_voice')
                     ORDER BY created_at DESC,job_id DESC LIMIT 1""", (profile_id,))
                 latest = cursor.fetchone()['job_id'] == job_id
                 authorized = self._voice_consent_matches(cursor, profile_id, payload.get('_stay_consent_revision'))
                 already_active = (profile['voice_id'] == voice_id and profile['voice_training_job_id'] == str(job_id)
-                                  and profile['voice_training_status'] == 'ready' and profile['voice_provider'] == 'elevenlabs')
+                                  and profile['voice_training_status'] == 'ready' and profile['voice_provider'] == job['provider'])
                 if not profile['consent_verified'] or erased or not latest or not authorized or (
                         not already_active and payload.get('_stay_voice_selection') != self._voice_activation_snapshot(profile)):
                     return {**dict(job), 'voice_activated': False}
@@ -551,12 +551,12 @@ class DigitalHumanProfileRepository:
                     # running call may retain only a voice that was really active.
                     cursor.execute("""UPDATE digital_human_training_jobs
                         SET provider_payload=provider_payload || '{"_stay_activated":true}'::jsonb
-                        WHERE profile_id=%s AND training_type='voice' AND provider='elevenlabs'
+                        WHERE profile_id=%s AND training_type='voice' AND provider=%s
                           AND status='ready' AND job_id::text=%s AND provider_job_id=%s""",
-                        (profile_id, profile['voice_training_job_id'], profile['voice_id']))
-                    cursor.execute("""UPDATE digital_human_profiles SET voice_provider='elevenlabs',
+                        (profile_id, profile['voice_provider'], profile['voice_training_job_id'], profile['voice_id']))
+                    cursor.execute("""UPDATE digital_human_profiles SET voice_provider=%s,
                         voice_id=%s, voice_training_job_id=%s, voice_training_status='ready', voice_ready_at=NOW()
-                        WHERE profile_id=%s""", (voice_id,str(job_id),profile_id))
+                        WHERE profile_id=%s""", (job['provider'],voice_id,str(job_id),profile_id))
                 cursor.execute("""UPDATE digital_human_training_jobs
                     SET provider_payload=provider_payload || '{"_stay_activated":true}'::jsonb
                     WHERE job_id=%s""", (job_id,))
@@ -569,7 +569,7 @@ class DigitalHumanProfileRepository:
                 cursor.execute("""SELECT row_to_json(p) AS profile,
                     (SELECT row_to_json(j) FROM digital_human_training_jobs j
                      WHERE j.profile_id=p.profile_id AND j.training_type='voice'
-                       AND j.provider='elevenlabs'
+                       AND j.provider IN ('elevenlabs','stay_voice')
                      ORDER BY j.created_at DESC,j.job_id DESC LIMIT 1) AS latest_job
                     FROM digital_human_profiles p WHERE p.profile_id=%s""", (profile_id,))
                 row = cursor.fetchone()
@@ -863,6 +863,10 @@ class DigitalHumanProfileRepository:
 
     @staticmethod
     def voice_training_retry_allowed(job: Dict[str, Any]) -> bool:
+        if job.get('provider') == 'stay_voice':
+            return bool(job.get('training_type') == 'voice' and job.get('status') == 'failed'
+                and job.get('provider_job_id') == str(job.get('job_id'))
+                and job.get('error_code') == 'self_hosted_preparation_failed')
         return bool(job.get('training_type') == 'voice' and job.get('provider') == 'elevenlabs'
             and job.get('status') == 'failed' and job.get('provider_job_id') is None
             and re.fullmatch(VOICE_RETRY_ERROR_PATTERN, job.get('error_code') or ''))
@@ -903,10 +907,10 @@ class DigitalHumanProfileRepository:
                     WHERE job_id = %s
                       AND profile_id = %s
                       AND training_type = 'voice'
-                      AND provider = 'elevenlabs'
                       AND status = 'failed'
-                      AND provider_job_id IS NULL
-                      AND error_code ~ %s
+                      AND ((provider = 'elevenlabs' AND provider_job_id IS NULL AND error_code ~ %s)
+                        OR (provider = 'stay_voice' AND provider_job_id = job_id::text
+                            AND error_code = 'self_hosted_preparation_failed'))
                     RETURNING *
                     """,
                     (

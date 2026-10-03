@@ -30,10 +30,10 @@ def voice_scope():
             db.execute('DELETE FROM digital_human_profiles WHERE profile_id=%s', (profile,))
 
 
-def create(scope):
+def create(scope, provider='elevenlabs'):
     repo, profile, _ = scope
     job = uuid4()
-    repo.create_training_job(job_id=job, profile_id=profile, training_type='voice', provider='elevenlabs', status='created', training_version=1, idempotency_key=str(job), request_payload={})
+    repo.create_training_job(job_id=job, profile_id=profile, training_type='voice', provider=provider, status='created', training_version=1, idempotency_key=str(job), request_payload={})
     return job
 
 
@@ -214,3 +214,43 @@ def test_verification_then_ready_activates_once(voice_scope):
     before = repo.require(profile)
     assert result(voice_scope, job)['voice_activated']
     assert repo.require(profile) == before
+
+
+@pytest.mark.parametrize('first_provider,second_provider', [
+    ('elevenlabs', 'stay_voice'), ('stay_voice', 'elevenlabs'), ('stay_voice', 'stay_voice'),
+])
+def test_provider_switch_uses_one_activation_contract(voice_scope, first_provider, second_provider):
+    repo, profile, _ = voice_scope
+    first = create(voice_scope, first_provider)
+    repo.begin_voice_training(profile, first, 1)
+    assert result(voice_scope, first, voice_id='first')['voice_activated']
+    second = create(voice_scope, second_provider)
+    repo.begin_voice_training(profile, second, 1)
+    assert repo.require(profile).voice_provider == first_provider
+    assert repo.require(profile).voice_id == 'first'
+    assert result(voice_scope, second, voice_id='second')['voice_activated']
+    assert repo.require(profile).voice_provider == second_provider
+    assert repo.get_training_job(first)['provider_payload']['_stay_activated'] is True
+    assert not result(voice_scope, first, voice_id='first')['voice_activated']
+    assert repo.get_voice_status_snapshot(profile)[1]['job_id'] == str(second)
+
+
+@pytest.mark.parametrize('provider', ['elevenlabs', 'stay_voice'])
+def test_newer_request_supersedes_other_provider(voice_scope, provider):
+    repo, profile, _ = voice_scope
+    old = create(voice_scope, provider)
+    repo.begin_voice_training(profile, old, 1)
+    newer = create(voice_scope, 'stay_voice' if provider == 'elevenlabs' else 'elevenlabs')
+    repo.begin_voice_training(profile, newer, 1)
+    assert not result(voice_scope, old)['voice_activated']
+    assert repo.require(profile).voice_id == 'voice-A'
+
+
+def test_self_hosted_completion_cannot_bypass_revoked_consent(voice_scope):
+    repo, profile, url = voice_scope
+    job = create(voice_scope, 'stay_voice')
+    repo.begin_voice_training(profile, job, 1)
+    with psycopg.connect(url) as db:
+        db.execute('UPDATE profile_purpose_consents SET revision=2 WHERE profile_id=%s', (profile,))
+    assert not result(voice_scope, job)['voice_activated']
+    assert repo.require(profile).voice_id == 'voice-A'

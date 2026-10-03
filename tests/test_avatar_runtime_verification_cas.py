@@ -71,10 +71,10 @@ def test_concurrent_material_change_is_observed_after_lock(avatar_job):
     assert repository.require(profile).runtime_verified_at is None
 
 
-def test_new_training_clears_previous_avatar_readiness_evidence(avatar_job):
+def test_upgrade_preserves_active_avatar_until_candidate_ready(avatar_job):
     _, repository, profile, _ = avatar_job
     expected = ready_profile(avatar_job)
-    repository.mark_runtime_verified(profile, expected_profile=expected)
+    verified = repository.mark_runtime_verified(profile, expected_profile=expected)
     new_job = uuid4()
     repository.create_training_job(job_id=new_job, profile_id=profile, training_type='avatar',
         provider='tavus', status='created', training_version=2, idempotency_key=str(uuid4()),
@@ -82,5 +82,18 @@ def test_new_training_clears_previous_avatar_readiness_evidence(avatar_job):
     repository.update_training_job(new_job, status='training', provider_job_id='tavus:new-face')
     current = repository.set_avatar_training(profile, provider='tavus', status='training',
         provider_job_id='tavus:new-face', replica_id='new-face', training_job_id=new_job)
-    assert current.avatar_ready_at is None
-    assert current.runtime_verified_at is None
+    assert current.avatar_ready_at == verified.avatar_ready_at
+    assert current.runtime_verified_at == verified.runtime_verified_at
+    assert current.avatar_replica_id == verified.avatar_replica_id
+    assert current.avatar_training_job_id == verified.avatar_training_job_id
+    assert current.avatar_training_status == 'ready'
+
+    repository.update_training_job(new_job, status='ready', provider_job_id='tavus:new-face')
+    replacement = repository.set_avatar_training(profile, provider='tavus', status='ready',
+        provider_job_id='tavus:new-face', replica_id='new-face', training_job_id=new_job)
+    assert replacement.avatar_replica_id == 'new-face'
+    assert replacement.avatar_training_job_id == 'tavus:new-face'
+    assert replacement.avatar_ready_at is not None
+    assert replacement.runtime_verified_at is None
+    with pytest.raises(StaleAvatarTrainingError):
+        repository.mark_runtime_verified(profile, expected_profile=verified)

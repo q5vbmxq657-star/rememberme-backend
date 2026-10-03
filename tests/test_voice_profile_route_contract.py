@@ -21,7 +21,7 @@ def test_tts_version_is_forwarded_and_confirmed_without_exposing_provider_id(mon
     profile = uuid4()
     version = str(uuid4())
     service = SimpleNamespace(synthesize_for_profile=AsyncMock(return_value=SimpleNamespace(
-        audio_stream=BytesIO(b"audio"), voice_mode="personalized")))
+        audio_stream=BytesIO(b"audio"), voice_mode="personalized", media_type="audio/mpeg")))
     authorization = Mock()
     monkeypatch.setattr(routes, "require_profile_access", authorization)
     monkeypatch.setattr(routes, "ElevenLabsVoiceService", lambda: service)

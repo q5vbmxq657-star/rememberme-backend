@@ -78,6 +78,13 @@ class ProfileConsentRepository:
                     (profile_id, revision, actor_user_id, policy_version, purposes)
                 VALUES (%s, %s, %s, %s, %s)
                 """, (profile_id, revision, user_id, update.policy_version, purposes))
+            if not {'voice_synthesis', 'provider_processing'}.issubset(purposes):
+                connection.execute('DELETE FROM self_hosted_voice_references WHERE profile_id=%s', (profile_id,))
+                connection.execute("""UPDATE digital_human_training_jobs SET status='deleted'
+                    WHERE profile_id=%s AND training_type='voice' AND provider='stay_voice'""", (profile_id,))
+                connection.execute("""UPDATE digital_human_profiles SET voice_provider=NULL,voice_id=NULL,
+                    voice_training_job_id=NULL,voice_training_status='not_started',voice_ready_at=NULL
+                    WHERE profile_id=%s AND voice_provider='stay_voice'""", (profile_id,))
         return PurposeConsentSnapshot(profile_id=profile_id, revision=revision,
             policy_version=update.policy_version, purposes=purposes)
 

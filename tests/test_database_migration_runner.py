@@ -146,6 +146,7 @@ def test_legacy_migrations_are_exactly_frozen():
         "035_family_content_lifecycle",
         "036_family_collaboration",
         "037_family_credit_ledger",
+        "038_self_hosted_voice_references",
     ]
 
     for migration in migrations[:6]:
@@ -686,6 +687,7 @@ def test_fresh_plan_bootstraps_through_008():
         "035_family_content_lifecycle",
         "036_family_collaboration",
         "037_family_credit_ledger",
+        "038_self_hosted_voice_references",
     ]
 
 
@@ -810,9 +812,18 @@ def test_web_predeploy_runs_canonical_migrations(monkeypatch):
             False,
         )
     ]
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert calls[1][0][:2] == [sys.executable, "-c"]
     assert "PGVectorMemoryService()" in calls[1][0][2]
+    assert calls[2] == ([sys.executable, "-m", "app.services.voice_release_preflight"], False)
+
+
+def test_web_predeploy_fails_when_voice_contract_is_incompatible(monkeypatch):
+    module = load_predeploy_module()
+    monkeypatch.setenv("STAY_SERVICE_ROLE", "web")
+    outcomes = iter([0, 0, 1])
+    monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=next(outcomes)))
+    assert module.main() == 1
 
 
 def test_web_predeploy_fails_when_runtime_schema_is_incompatible(monkeypatch):
