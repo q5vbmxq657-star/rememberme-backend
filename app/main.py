@@ -99,6 +99,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+from app.routes.pricing import router as pricing_router
+app.include_router(pricing_router)
+
 
 @app.exception_handler(RequestValidationError)
 async def private_request_validation_error(_request, _error):

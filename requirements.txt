@@ -1,6 +1,8 @@
 # Production and worker builds use the same resolved versions as verification.
 -c requirements-python312.lock.txt
 
+app-store-server-library==3.1.2
+
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.5
 aiosignal==1.4.0

@@ -7,11 +7,15 @@ No client-facing grant or settlement endpoint exists.
 from uuid import uuid4
 
 from fastapi import HTTPException
+from app.services.pricing_catalog import (
+    UNITS_PER_CREDIT, FAMILY_MONTHLY_CREDITS,
+    VOICE_UNITS_PER_SECOND, VIDEO_UNITS_PER_SECOND,
+)
 
 
 class FamilyCreditLedger:
-    UNITS_PER_CREDIT = 60
-    MONTHLY_UNITS = 300 * UNITS_PER_CREDIT
+    UNITS_PER_CREDIT = UNITS_PER_CREDIT
+    MONTHLY_UNITS = FAMILY_MONTHLY_CREDITS * UNITS_PER_CREDIT
 
     @staticmethod
     def lock(db, family_id):
@@ -26,7 +30,7 @@ class FamilyCreditLedger:
                 WHERE family_id=%s AND settled_at IS NULL),0) AS reserved_units""", (family_id,family_id)).fetchone()
         balance, reserved = int(totals["balance_units"]), int(totals["reserved_units"])
         return {"balance_units": balance, "reserved_units": reserved,
-                "available_units": balance-reserved, "units_per_credit": 60,
+                "available_units": balance-reserved, "units_per_credit": UNITS_PER_CREDIT,
                 "monthly_credits_roll_over": True}
 
     @classmethod
@@ -52,7 +56,7 @@ class FamilyCreditLedger:
     def reserve(cls, db, family_id, member_id, call_id, *, mode, seconds):
         if mode not in ("voice", "video") or type(seconds) is not int or not 0 < seconds <= 86400:
             raise ValueError("A reservation requires a supported mode and bounded whole seconds.")
-        units = seconds * (10 if mode == "video" else 1)
+        units = seconds * (VIDEO_UNITS_PER_SECOND if mode == "video" else VOICE_UNITS_PER_SECOND)
         cls.lock(db, family_id)
         if not db.execute("SELECT 1 FROM family_members WHERE family_id=%s AND user_id=%s", (family_id,member_id)).fetchone():
             raise HTTPException(403, "Family membership is required.")
@@ -75,7 +79,7 @@ class FamilyCreditLedger:
         row = db.execute("SELECT * FROM family_credit_reservations WHERE family_id=%s AND call_id=%s FOR UPDATE", (family_id,call_id)).fetchone()
         if not row:
             raise HTTPException(404, "Call reservation not found.")
-        units = verified_seconds * (10 if row["mode"] == "video" else 1)
+        units = verified_seconds * (VIDEO_UNITS_PER_SECOND if row["mode"] == "video" else VOICE_UNITS_PER_SECOND)
         if units > row["reserved_units"]:
             raise HTTPException(409, "Usage exceeds the authorized reservation.")
         if row["settled_at"] is not None:

@@ -147,6 +147,8 @@ def test_legacy_migrations_are_exactly_frozen():
         "036_family_collaboration",
         "037_family_credit_ledger",
         "038_self_hosted_voice_references",
+        "039_apple_purchase_registry",
+        "040_apple_revocation_notifications",
     ]
 
     for migration in migrations[:6]:
@@ -688,6 +690,8 @@ def test_fresh_plan_bootstraps_through_008():
         "036_family_collaboration",
         "037_family_credit_ledger",
         "038_self_hosted_voice_references",
+        "039_apple_purchase_registry",
+        "040_apple_revocation_notifications",
     ]
 
 

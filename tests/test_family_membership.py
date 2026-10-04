@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 from types import SimpleNamespace
 from uuid import uuid4
+from datetime import datetime, timezone
 
 from fastapi import HTTPException
 import psycopg
@@ -11,6 +12,7 @@ from pydantic import ValidationError
 
 from app.services.family_repository import FamilyRepository
 from app.services.family_credit_ledger import FamilyCreditLedger
+from app.services.subscription_credit_period import monthly_credit_periods, grant_family_periods
 from app.routes.family import FamilyCreate, FamilyJoin, FamilyContent, FamilyContentEdit, FamilyCollaborationUpdate
 
 
@@ -77,6 +79,26 @@ def test_family_credit_rollover_receipts_and_private_access(family_data):
             FamilyCreditLedger.grant(db, fid, evidence_key=str(fid)+"month-one", units=18001)
     assert error.value.status_code == 409
     assert repo.credits(owner)["balance_units"] == 36000
+
+
+def test_annual_family_allowance_replay_and_catchup_use_existing_ledger(family_data):
+    repo, people, _ = family_data
+    owner = people[0]
+    repo.create(owner, "Family", "Owner")
+    fid = repo.snapshot(owner)["family"]["family_id"]
+    arguments = dict(original_transaction_id=str(uuid4().int), environment="Sandbox",
+                     paid_from=datetime(2028, 1, 31, tzinfo=timezone.utc),
+                     paid_until=datetime(2029, 1, 31, tzinfo=timezone.utc), cadence="annual")
+    first = monthly_credit_periods(**arguments, now=datetime(2028, 1, 31, tzinfo=timezone.utc))
+    for _ in range(2):
+        with repo.transaction(owner) as db:
+            grant_family_periods(db, fid, first)
+    assert repo.credits(owner)["balance_units"] == FamilyCreditLedger.MONTHLY_UNITS
+    catchup = monthly_credit_periods(**arguments, now=datetime(2028, 3, 31, tzinfo=timezone.utc))
+    for _ in range(2):
+        with repo.transaction(owner) as db:
+            grant_family_periods(db, fid, catchup)
+    assert repo.credits(owner)["balance_units"] == 3 * FamilyCreditLedger.MONTHLY_UNITS
 
 
 def test_family_credit_concurrent_reservations_cannot_overspend(family_data):
