@@ -239,7 +239,8 @@ def test_annual_scheduler_catches_up_and_defers_next_check(purchase):
                               environment="Sandbox")["balance_units"] == 18000
 
 
-def test_annual_scheduler_failure_keeps_retry_and_grants_nothing(purchase):
+@pytest.mark.parametrize("failure", ["network", "empty", "missing_signature"])
+def test_annual_scheduler_failure_keeps_retry_and_grants_nothing(purchase, failure):
     from types import SimpleNamespace
     from appstoreserverlibrary.models.Environment import Environment
     from app.services.apple_allowance_scheduler import AppleAllowanceScheduler
@@ -248,10 +249,15 @@ def test_annual_scheduler_failure_keeps_retry_and_grants_nothing(purchase):
     with repo.transaction(people[0]) as db:
         Registry.record(db, people[0].user.user_id, evidence)
     def fail(_):
+        if failure == "empty":
+            return None
+        if failure == "missing_signature":
+            return SimpleNamespace(signedTransactionInfo=None)
         raise RuntimeError("Provider unavailable")
     worker = AppleAllowanceScheduler(url, SimpleNamespace(environment=Environment.SANDBOX),
                                     SimpleNamespace(get_transaction_info=fail))
-    with pytest.raises(RuntimeError):
+    from app.services.apple_purchase_verifier import InvalidPurchaseEvidence
+    with pytest.raises(RuntimeError if failure == "network" else InvalidPurchaseEvidence):
         worker.run_once()
     with psycopg.connect(url) as db:
         retry = db.execute("""SELECT allowance_next_check_at>NOW(),allowance_lease IS NULL

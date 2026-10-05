@@ -40,8 +40,13 @@ class AppleAllowanceScheduler:
                 binding = db.execute("""SELECT account_token FROM apple_subscription_ownership
                     WHERE environment=%s AND original_transaction_id=%s""",
                     (row['environment'],row['original_transaction_id'])).fetchone()
+            if not binding:
+                raise InvalidPurchaseEvidence('Subscription account binding is unavailable')
             current = self.client.get_transaction_info(row['transaction_id'])
-            evidence = self.verifier.verify(current.signedTransactionInfo,
+            signed_transaction = getattr(current, 'signedTransactionInfo', None)
+            if not signed_transaction:
+                raise InvalidPurchaseEvidence('Apple transaction is unavailable')
+            evidence = self.verifier.verify(signed_transaction,
                 account_token=binding['account_token'], now=now, require_active=False)
             if (evidence.transaction_id != row['transaction_id']
                     or evidence.original_transaction_id != row['original_transaction_id']):

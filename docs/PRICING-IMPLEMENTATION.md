@@ -1,5 +1,31 @@
 # Pricing implementation checkpoint
 
+## Current release gate - 2026-10-05, after production deployment
+
+This section supersedes the historical implementation checkpoints below.
+
+- Backend commit `73fe82c` was deployed successfully to Production. Health and
+  pricing returned HTTP 200; the catalog still reported `purchases_available=false`.
+- iOS commit `58a3b71` was pushed to `main`. This does not constitute a TestFlight
+  upload or device acceptance of that source version.
+- Subsequent local review fixes guard StoreKit state against account changes and
+  recheck the server purchase gate before opening Apple's purchase sheet. They
+  also treat empty Apple status/transaction responses as retryable failures,
+  without granting credits. These review fixes are not yet deployed.
+- Backend review validation: 145 tests passed, including isolated PostgreSQL
+  fulfillment, refund, concurrency and annual scheduler failure tests.
+- Purchases must remain disabled: refund reversals, full entitlement reconciliation,
+  and measured call settlement are not complete end to end. Successful database
+  tests do not establish successful Apple purchase delivery.
+- The last recorded external checks remain unresolved: Production Apple API 401,
+  missing Sandbox notification URL, incomplete App Store product release metadata,
+  and no real purchase/restore/renewal/refund acceptance. Recheck rather than infer
+  that deployment resolved them. Confirm developer membership renewal as well.
+- Annual scheduling remains opt-in via `STAY_APPLE_ALLOWANCE_WORKER_ENABLED`.
+  Do not enable it or claim billing release readiness from the health endpoint.
+
+## Historical checkpoints
+
 ## Implemented
 
 - Authenticated billing-account and signed-transaction intake routes connect the existing durable registry to iOS. They never treat evidence storage as fulfillment (`fulfilled` remains false).

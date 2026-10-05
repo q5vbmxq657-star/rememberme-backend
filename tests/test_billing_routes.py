@@ -199,6 +199,29 @@ def test_current_paid_purchase_is_checked_with_apple(current_purchase):
     assert billing.confirm_current_purchase(client, verifier, evidence, now=now) == evidence
 
 
+def test_empty_apple_status_is_retryable(current_purchase):
+    client, verifier, evidence, _, _, now = current_purchase
+    client.get_all_subscription_statuses = lambda _: None
+    with pytest.raises(HTTPException) as error:
+        billing.confirm_current_purchase(client, verifier, evidence, now=now)
+    assert error.value.status_code == 503
+
+
+@pytest.mark.parametrize("response", [None, SimpleNamespace(signedTransactionInfo=None)])
+def test_empty_paid_notification_refresh_never_grants_credits(client, monkeypatch, response):
+    evidence = SimpleNamespace(transaction_id="123", account_token=uuid4())
+    verifier = SimpleNamespace(
+        verify_notification=lambda *a, **k: SimpleNamespace(notificationType=NotificationTypeV2.DID_RENEW),
+        verify_notification_purchase=lambda *a, **k: evidence)
+    monkeypatch.setattr(billing, "configured_verifier", lambda: verifier)
+    monkeypatch.setattr(billing, "configured_status_client", lambda _: SimpleNamespace(
+        get_transaction_info=lambda _: response))
+    monkeypatch.setattr(billing, "record_notification_purchase",
+                        lambda *a, **k: pytest.fail("Incomplete evidence must not grant credits"))
+    result = client.post("/v1/billing/apple/notifications", json={"signedPayload": "signed"})
+    assert result.status_code == 503
+
+
 @pytest.mark.parametrize("status", [Status.EXPIRED, Status.REVOKED, Status.BILLING_RETRY,
                                     Status.BILLING_GRACE_PERIOD, None])
 def test_nonpaid_status_never_authorizes_new_credits(current_purchase, status):

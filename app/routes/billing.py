@@ -52,6 +52,8 @@ def confirm_current_purchase(client, verifier, evidence, *, now):
         response = client.get_all_subscription_statuses(evidence.original_transaction_id)
     except (APIException, requests.RequestException):
         raise HTTPException(503, "Purchase confirmation is pending. Please try again.") from None
+    if response is None:
+        raise HTTPException(503, "Purchase confirmation is pending. Please try again.")
     if (response.environment != verifier.environment or response.bundleId != verifier.bundle_id
             or response.appAppleId != verifier.app_apple_id):
         raise InvalidPurchaseEvidence("Subscription status does not match this app")
@@ -110,7 +112,10 @@ def reconcile_paid_notification(verifier, signed_payload, *, now):
         current = configured_status_client(verifier).get_transaction_info(evidence.transaction_id)
     except (APIException, requests.RequestException):
         raise HTTPException(503, "Purchase confirmation is pending.") from None
-    confirmed = verifier.verify(current.signedTransactionInfo, account_token=evidence.account_token,
+    signed_transaction = getattr(current, "signedTransactionInfo", None)
+    if not signed_transaction:
+        raise HTTPException(503, "Purchase confirmation is pending.")
+    confirmed = verifier.verify(signed_transaction, account_token=evidence.account_token,
                                 now=now, require_active=False)
     if confirmed != evidence:
         raise HTTPException(409, "Purchase evidence has changed.")
