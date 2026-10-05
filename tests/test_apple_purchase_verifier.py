@@ -64,6 +64,39 @@ def test_refund_checks_both_signatures_and_returns_no_entitlement(evidence):
     verifier.verifier.verify_and_decode_signed_transaction.assert_called_once_with("nested-signed-fixture")
 
 
+def test_test_notification_requires_verified_envelope(evidence):
+    verifier, payload, notification, now = notification_fixture(evidence)
+    notification.notificationType = NotificationTypeV2.TEST
+    assert verifier.verify_notification("signed", now=now) is notification
+    verifier.verifier.verify_and_decode_signed_transaction.assert_not_called()
+
+
+def test_delayed_paid_period_is_only_accepted_for_reconciliation(evidence):
+    verifier, payload, account, now, _ = evidence
+    payload.expiresDate = int(now.timestamp() * 1000) - 1
+    with pytest.raises(InvalidPurchaseEvidence):
+        verifier.verify("signed", account_token=account, now=now)
+    result = verifier.verify("signed", account_token=account, now=now, require_active=False)
+    assert result.paid_until < now
+
+
+def test_renewal_is_bound_to_signed_transaction_account(evidence):
+    verifier, payload, event, now = notification_fixture(evidence)
+    payload.revocationDate = None
+    event.notificationType = NotificationTypeV2.DID_RENEW
+    result = verifier.verify_notification_purchase("signed", now=now)
+    assert str(result.account_token) == payload.appAccountToken
+
+
+@pytest.mark.parametrize("field,value", [("notificationUUID", "invalid"),
+    ("signedDate", True), ("signedDate", 9999999999999), ("version", "1.0")])
+def test_invalid_notification_envelope_is_rejected(evidence, field, value):
+    verifier, payload, notification, now = notification_fixture(evidence)
+    setattr(notification, field, value)
+    with pytest.raises(InvalidPurchaseEvidence):
+        verifier.verify_notification("signed", now=now)
+
+
 @pytest.mark.parametrize("field,value", [("bundleId","other.app"), ("appAppleId",456),
                                          ("environment",Environment.SANDBOX)])
 def test_foreign_refund_notification_is_rejected(evidence, field, value):

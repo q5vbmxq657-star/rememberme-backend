@@ -4,7 +4,8 @@ One credit is 60 units: a voice second costs one unit, a video second ten.
 Only trusted server-side payment/usage verification may invoke mutations.
 No client-facing grant or settlement endpoint exists.
 """
-from uuid import uuid4
+from uuid import UUID, uuid4
+from dataclasses import dataclass
 
 from fastapi import HTTPException
 from app.services.pricing_catalog import (
@@ -13,44 +14,88 @@ from app.services.pricing_catalog import (
 )
 
 
+@dataclass(frozen=True)
+class PersonalCreditAccount:
+    account_token: UUID
+
+    def __post_init__(self):
+        if not isinstance(self.account_token, UUID):
+            raise ValueError("A bound billing account is required")
+
+
+def credit_owner(owner):
+    return (None, owner.account_token) if isinstance(owner, PersonalCreditAccount) else (owner, None)
+
+
 class FamilyCreditLedger:
     UNITS_PER_CREDIT = UNITS_PER_CREDIT
     MONTHLY_UNITS = FAMILY_MONTHLY_CREDITS * UNITS_PER_CREDIT
 
     @staticmethod
     def lock(db, family_id):
+        if isinstance(family_id, PersonalCreditAccount):
+            if not db.execute("SELECT account_token FROM billing_accounts WHERE account_token=%s FOR UPDATE",
+                              (family_id.account_token,)).fetchone():
+                raise HTTPException(404, "Billing account not found.")
+            return
         if not db.execute("SELECT family_id FROM family_groups WHERE family_id=%s FOR UPDATE", (family_id,)).fetchone():
             raise HTTPException(404, "Family not found.")
 
     @staticmethod
-    def balance(db, family_id):
+    def balance(db, family_id, *, environment="Production"):
+        if environment not in {"Production", "Sandbox"}:
+            raise ValueError("Unsupported credit environment")
+        fid, token = credit_owner(family_id)
         totals = db.execute("""SELECT
-            COALESCE((SELECT SUM(units) FROM family_credit_entries WHERE family_id=%s),0) AS balance_units,
+            COALESCE((SELECT SUM(units) FROM family_credit_entries
+                WHERE family_id IS NOT DISTINCT FROM %s AND account_token IS NOT DISTINCT FROM %s
+                AND environment=%s),0) AS balance_units,
             COALESCE((SELECT SUM(reserved_units) FROM family_credit_reservations
-                WHERE family_id=%s AND settled_at IS NULL),0) AS reserved_units""", (family_id,family_id)).fetchone()
+                WHERE family_id=%s AND settled_at IS NULL AND %s='Production'),0) AS reserved_units""",
+            (fid,token,environment,fid,environment)).fetchone()
         balance, reserved = int(totals["balance_units"]), int(totals["reserved_units"])
         return {"balance_units": balance, "reserved_units": reserved,
-                "available_units": balance-reserved, "units_per_credit": UNITS_PER_CREDIT,
+                "available_units": max(0, balance-reserved), "units_per_credit": UNITS_PER_CREDIT,
                 "monthly_credits_roll_over": True}
 
     @classmethod
-    def grant(cls, db, family_id, *, evidence_key, units):
+    def grant(cls, db, family_id, *, evidence_key, units, environment="Production"):
+        if environment not in {"Production", "Sandbox"}:
+            raise ValueError("Unsupported credit environment")
         if type(units) is not int or not 0 < units <= 9223372036854775807:
             raise ValueError("A grant requires positive integer units.")
         if not isinstance(evidence_key, str) or not evidence_key.strip() or len(evidence_key) > 200 or evidence_key.startswith("call:"):
             raise ValueError("A grant requires a unique verified payment or period reference.")
         cls.lock(db, family_id)
-        inserted = db.execute("""INSERT INTO family_credit_entries(entry_id,family_id,evidence_key,units,kind)
-            VALUES (%s,%s,%s,%s,'grant') ON CONFLICT(evidence_key) DO NOTHING RETURNING entry_id""",
-            (uuid4(),family_id,evidence_key,units)).fetchone()
+        fid, token = credit_owner(family_id)
+        inserted = db.execute("""INSERT INTO family_credit_entries(entry_id,family_id,account_token,evidence_key,units,kind,environment)
+            VALUES (%s,%s,%s,%s,%s,'grant',%s) ON CONFLICT(evidence_key) DO NOTHING RETURNING entry_id""",
+            (uuid4(),fid,token,evidence_key,units,environment)).fetchone()
         if not inserted:
-            prior = db.execute("SELECT family_id,units,kind FROM family_credit_entries WHERE evidence_key=%s", (evidence_key,)).fetchone()
-            if prior["family_id"] != family_id or prior["units"] != units or prior["kind"] != "grant":
+            prior = db.execute("SELECT family_id,account_token,units,kind,environment FROM family_credit_entries WHERE evidence_key=%s", (evidence_key,)).fetchone()
+            if (prior["family_id"], prior["account_token"]) != (fid, token) or prior["units"] != units or prior["kind"] != "grant" or prior["environment"] != environment:
                 raise HTTPException(409, "The credit receipt has already been used differently.")
-        balance = cls.balance(db, family_id)
+        balance = cls.balance(db, family_id, environment=environment)
         if balance["balance_units"] > 9223372036854775807:
             raise HTTPException(409, "The credit balance exceeds the supported limit.")
         return balance
+
+    @classmethod
+    def refund_grant(cls, db, family_id, entry_id):
+        """Reverse a proven grant once; retain debt when credits were already used."""
+        cls.lock(db, family_id)
+        fid, token = credit_owner(family_id)
+        grant = db.execute("""SELECT units,environment FROM family_credit_entries
+            WHERE entry_id=%s AND family_id IS NOT DISTINCT FROM %s
+                AND account_token IS NOT DISTINCT FROM %s AND kind='grant' FOR UPDATE""",
+            (entry_id, fid, token)).fetchone()
+        if not grant:
+            raise HTTPException(409, "The original credit grant could not be confirmed.")
+        db.execute("""INSERT INTO family_credit_entries
+            (entry_id,family_id,account_token,evidence_key,units,kind,refund_of,environment)
+            VALUES (%s,%s,%s,%s,%s,'refund',%s,%s) ON CONFLICT(refund_of) DO NOTHING""",
+            (uuid4(), fid, token, "refund:" + str(entry_id), -grant["units"], entry_id, grant["environment"]))
+        return cls.balance(db, family_id, environment=grant["environment"])
 
     @classmethod
     def reserve(cls, db, family_id, member_id, call_id, *, mode, seconds):

@@ -65,6 +65,29 @@ class ApplePurchaseVerifier:
         self.verifier = SignedDataVerifier(root_certificates, True, self.environment,
                                            bundle_id, app_apple_id)
 
+    def verify_notification(self, signed_notification: str, *, now: datetime):
+        """Authenticate the envelope before deciding which event handler may run."""
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("A timezone-aware clock is required")
+        if (not isinstance(signed_notification, str) or not signed_notification.isascii()
+                or not 1 <= len(signed_notification) <= 128000):
+            raise InvalidPurchaseEvidence("Invalid notification evidence")
+        try:
+            event = self.verifier.verify_and_decode_notification(signed_notification)
+            data = event.data
+            if (event.version != "2.0" or data is None
+                    or data.bundleId != self.bundle_id or data.environment != self.environment
+                    or data.appAppleId != self.app_apple_id
+                    or type(event.signedDate) is not int or event.signedDate <= 0
+                    or event.signedDate > int(now.timestamp() * 1000)):
+                raise InvalidPurchaseEvidence("Notification does not match this app")
+            UUID(event.notificationUUID)
+            return event
+        except InvalidPurchaseEvidence:
+            raise
+        except (VerificationException, ValueError, TypeError, AttributeError, OverflowError, OSError):
+            raise InvalidPurchaseEvidence("Notification evidence could not be verified") from None
+
     def verify_revocation(self, signed_notification: str, *, now: datetime) -> VerifiedPurchaseRevocation:
         """Verify both the outer notification and nested transaction signature."""
         if now.tzinfo is None or now.utcoffset() is None:
@@ -73,7 +96,7 @@ class ApplePurchaseVerifier:
                 or not 1 <= len(signed_notification) <= 128000):
             raise InvalidPurchaseEvidence("Invalid notification evidence")
         try:
-            notification = self.verifier.verify_and_decode_notification(signed_notification)
+            notification = self.verify_notification(signed_notification, now=now)
             if (notification.version != "2.0" or notification.notificationType not in
                     {NotificationTypeV2.REFUND, NotificationTypeV2.REVOKE}):
                 raise InvalidPurchaseEvidence("This event requires subscription reconciliation")
@@ -104,7 +127,7 @@ class ApplePurchaseVerifier:
             raise InvalidPurchaseEvidence("Notification evidence could not be verified") from None
 
     def verify(self, signed_transaction: str, *, account_token: UUID,
-               now: datetime) -> VerifiedSubscriptionEvidence:
+               now: datetime, require_active: bool = True) -> VerifiedSubscriptionEvidence:
         if not isinstance(account_token, UUID) or now.tzinfo is None or now.utcoffset() is None:
             raise ValueError("A bound account and timezone-aware clock are required")
         if (not isinstance(signed_transaction, str) or not signed_transaction.isascii()
@@ -129,7 +152,8 @@ class ApplePurchaseVerifier:
             current_ms = int(now.timestamp() * 1000)
             if not payload.purchaseDate <= payload.signedDate <= current_ms:
                 raise InvalidPurchaseEvidence("Invalid purchase chronology")
-            if not payload.purchaseDate <= current_ms < payload.expiresDate:
+            if (payload.expiresDate <= payload.purchaseDate
+                    or (require_active and not payload.purchaseDate <= current_ms < payload.expiresDate)):
                 raise InvalidPurchaseEvidence("Purchase is not active")
             return VerifiedSubscriptionEvidence(
                 transaction_id=payload.transactionId, original_transaction_id=payload.originalTransactionId,
@@ -141,3 +165,17 @@ class ApplePurchaseVerifier:
             raise
         except (VerificationException, ValueError, TypeError, AttributeError, OverflowError, OSError):
             raise InvalidPurchaseEvidence("Purchase evidence could not be verified") from None
+
+    def verify_notification_purchase(self, signed_notification: str, *, now: datetime):
+        event = self.verify_notification(signed_notification, now=now)
+        if event.notificationType not in {NotificationTypeV2.SUBSCRIBED, NotificationTypeV2.DID_RENEW}:
+            raise InvalidPurchaseEvidence("Notification does not represent a paid purchase")
+        try:
+            signed = event.data.signedTransactionInfo
+            transaction = self.verifier.verify_and_decode_signed_transaction(signed)
+            token = UUID(transaction.appAccountToken)
+        except (VerificationException, ValueError, TypeError, AttributeError):
+            raise InvalidPurchaseEvidence("Invalid purchase account binding") from None
+        # Delayed notifications can describe a past paid period. Reconciliation
+        # must check its current transaction with Apple before granting credits.
+        return self.verify(signed, account_token=token, now=now, require_active=False)

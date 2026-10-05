@@ -26,8 +26,11 @@ class ApplePurchaseRegistry:
 
     @staticmethod
     def account_token(db, user_id: UUID) -> UUID:
-        # Serializes account creation with account deletion and concurrent requests.
-        if not db.execute("SELECT user_id FROM users WHERE user_id=%s FOR UPDATE", (user_id,)).fetchone():
+        # Account creation is serialized without upgrading the caller's user SHARE lock.
+        # KEY SHARE still prevents account deletion until this transaction commits.
+        db.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                   ("billing-account:" + str(user_id),))
+        if not db.execute("SELECT user_id FROM users WHERE user_id=%s FOR KEY SHARE", (user_id,)).fetchone():
             raise HTTPException(404, "Account not found.")
         row = db.execute("SELECT account_token FROM billing_accounts WHERE user_id=%s", (user_id,)).fetchone()
         if row:
@@ -90,3 +93,5 @@ class ApplePurchaseRegistry:
         db.execute("""UPDATE apple_purchase_transactions SET revoked_at=
             (SELECT revoked_at FROM apple_purchase_revocations WHERE environment=%s AND transaction_id=%s)
             WHERE environment=%s AND transaction_id=%s""", (environment,transaction_id,environment,transaction_id))
+        from app.services.apple_credit_fulfillment import reverse_subscription_purchase
+        reverse_subscription_purchase(db, environment=environment, transaction_id=transaction_id)

@@ -76,6 +76,8 @@ async def lifespan(_app):
             await asyncio.sleep(60)
 
     family_retention = asyncio.create_task(run_family_retention())
+    from app.services.apple_allowance_scheduler import run_annual_allowances
+    annual_allowances = asyncio.create_task(run_annual_allowances())
     try:
         yield
     finally:
@@ -83,6 +85,7 @@ async def lifespan(_app):
         erasure_recovery.cancel()
         openai_recovery.cancel()
         family_retention.cancel()
+        annual_allowances.cancel()
         with suppress(asyncio.CancelledError):
             await recovery
         with suppress(asyncio.CancelledError):
@@ -91,6 +94,8 @@ async def lifespan(_app):
             await openai_recovery
         with suppress(asyncio.CancelledError):
             await family_retention
+        with suppress(asyncio.CancelledError):
+            await annual_allowances
 
 
 app = FastAPI(
@@ -101,6 +106,8 @@ app = FastAPI(
 
 from app.routes.pricing import router as pricing_router
 app.include_router(pricing_router)
+from app.routes.billing import router as billing_router
+app.include_router(billing_router)
 
 
 @app.exception_handler(RequestValidationError)
