@@ -36,7 +36,7 @@ def test_tts_version_is_forwarded_and_confirmed_without_exposing_provider_id(mon
 
 
 @pytest.mark.parametrize("error", [httpx.ConnectError("private"), psycopg.OperationalError("private"),
-    DigitalHumanProfileRepositoryError("private"), TimeoutError("private")])
+    DigitalHumanProfileRepositoryError("private"), routes.ElevenLabsVoiceError("private"), TimeoutError("private")])
 def test_tts_dependency_failures_are_sanitized(monkeypatch, error):
     service = SimpleNamespace(synthesize_for_profile=AsyncMock(side_effect=error))
     monkeypatch.setattr(routes, "require_profile_access", Mock())
@@ -45,6 +45,25 @@ def test_tts_dependency_failures_are_sanitized(monkeypatch, error):
         asyncio.run(routes.synthesize_profile_voice(routes.ProfileVoiceTTSRequest(profile_id=uuid4(), text="Hello"), principal=object()))
     assert caught.value.status_code == 503
     assert "private" not in caught.value.detail
+
+
+@pytest.mark.parametrize("version", ["generic", "trained-version"])
+def test_stalled_synthesis_is_cancelled_instead_of_holding_call_open(monkeypatch, version):
+    cancelled = []
+    async def stalled(**kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(True)
+    monkeypatch.setattr(routes, "VOICE_SYNTHESIS_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(routes, "require_profile_access", Mock())
+    monkeypatch.setattr(routes, "ElevenLabsVoiceService", lambda: SimpleNamespace(
+        synthesize_for_profile=stalled))
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(routes.synthesize_profile_voice(routes.ProfileVoiceTTSRequest(
+            profile_id=uuid4(), text="Hello", voice_version=version), principal=object()))
+    assert caught.value.status_code == 503
+    assert cancelled == [True]
 
 
 def test_tts_late_profile_revocation_blocks_audio_delivery(monkeypatch):

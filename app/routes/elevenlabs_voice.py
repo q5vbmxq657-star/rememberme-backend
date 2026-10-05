@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from typing import List
 from uuid import UUID
+
+VOICE_SYNTHESIS_TIMEOUT_SECONDS = 15
 
 from fastapi import (
     APIRouter,
@@ -241,9 +244,8 @@ async def synthesize_profile_voice(
     try:
         service = await run_in_threadpool(ElevenLabsVoiceService)
 
-        synthesis = (
-            await service
-            .synthesize_for_profile(
+        async with asyncio.timeout(VOICE_SYNTHESIS_TIMEOUT_SECONDS):
+            synthesis = await service.synthesize_for_profile(
                 profile_id=(
                     request.profile_id
                 ),
@@ -252,7 +254,6 @@ async def synthesize_profile_voice(
                 voice_version=request.voice_version,
                 **({"language": request.language} if request.language else {}),
             )
-        )
 
         await run_in_threadpool(require_profile_access, principal=principal, profile_id=request.profile_id)
         return StreamingResponse(
@@ -285,7 +286,7 @@ async def synthesize_profile_voice(
             status_code=503,
             detail="Voice playback is temporarily unavailable. Please try again.",
         ) from error
-    except (httpx.HTTPError, psycopg.Error, DigitalHumanProfileRepositoryError, TimeoutError) as error:
+    except (httpx.HTTPError, psycopg.Error, DigitalHumanProfileRepositoryError, ElevenLabsVoiceError, TimeoutError) as error:
         raise HTTPException(status_code=503,
             detail="Voice playback is temporarily unavailable. Please try again.") from error
 
