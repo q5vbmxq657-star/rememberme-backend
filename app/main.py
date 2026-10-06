@@ -53,6 +53,11 @@ async def lifespan(_app):
                 await RuntimeCleanupService().run()
             except Exception:
                 logging.getLogger(__name__).error("Runtime cleanup initialization will be retried.")
+            try:
+                from app.services.call_credit_lifecycle import CallCreditLifecycle
+                await run_in_threadpool(CallCreditLifecycle.sweep_expired)
+            except Exception:
+                logging.getLogger(__name__).error("Call credit cleanup will be retried.")
             await asyncio.sleep(5)
 
     recovery = asyncio.create_task(run_runtime_recovery())

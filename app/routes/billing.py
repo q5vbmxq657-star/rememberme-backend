@@ -1,11 +1,14 @@
 """Authenticated purchase evidence intake. Fulfillment remains fail-closed."""
 import json
 import os
+from uuid import UUID
+from typing import Literal
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, Field
 import psycopg
 import requests
@@ -26,6 +29,40 @@ from app.services.apple_purchase_verifier import (
 )
 
 router = APIRouter(prefix="/v1/billing")
+
+
+class VoiceCreditStart(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    call_id: UUID
+    profile_id: UUID
+    conversation_id: UUID
+    funding: Literal["personal", "family", "automatic"]
+
+
+@router.post("/voice-calls")
+def start_voice_credit_call(request: VoiceCreditStart, principal=Depends(require_authenticated_principal)):
+    from app.security.profile_authorization import require_profile_access
+    from app.security.purpose_authorization import require_profile_purposes
+    from app.services.call_credit_lifecycle import CallCreditLifecycle
+    require_profile_access(principal=principal, profile_id=request.profile_id)
+    require_profile_purposes(request.profile_id, {"memory_context"})
+    result = CallCreditLifecycle(principal).start(**request.model_dump())
+    return JSONResponse(jsonable_encoder(result),
+                        headers={"Cache-Control": "no-store"})
+
+
+@router.post("/voice-calls/{call_id}/renew")
+def renew_voice_credit_call(call_id: UUID, principal=Depends(require_authenticated_principal)):
+    from app.services.call_credit_lifecycle import CallCreditLifecycle
+    return JSONResponse(jsonable_encoder(CallCreditLifecycle(principal).renew(call_id)),
+                        headers={"Cache-Control": "no-store"})
+
+
+@router.delete("/voice-calls/{call_id}")
+def end_voice_credit_call(call_id: UUID, principal=Depends(require_authenticated_principal)):
+    from app.services.call_credit_lifecycle import CallCreditLifecycle
+    return JSONResponse(jsonable_encoder(CallCreditLifecycle(principal).end(call_id)),
+                        headers={"Cache-Control": "no-store"})
 
 
 def configured_status_client(verifier):

@@ -156,6 +156,7 @@ def test_legacy_migrations_are_exactly_frozen():
         "045_chat_weekly_usage",
         "046_personal_call_reservations",
         "047_call_reservation_binding",
+        "048_call_binding_erasure",
     ]
 
     for migration in migrations[:6]:
@@ -706,6 +707,7 @@ def test_fresh_plan_bootstraps_through_008():
         "045_chat_weekly_usage",
         "046_personal_call_reservations",
         "047_call_reservation_binding",
+        "048_call_binding_erasure",
     ]
 
 

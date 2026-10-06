@@ -37,6 +37,8 @@ def memory_chat(
             require_profile_access(principal=principal, profile_id=profile_id)
             require_profile_purposes(profile_id, {"memory_context"}, expected_revision=consent.revision)
             authorize_context()
+            if request.channel == "voice" and usage is not None:
+                usage.reserve()
         authorize_evidence()
         pending_usage = conversation_usage(principal, request, chat_factory=ChatUsage)
         pending_usage.reserve()

@@ -40,6 +40,7 @@ def stream_memory_chat(
 ):
     profile_id = _authorized_profile_id(request.profile_id, principal)
     consent = require_profile_purposes(profile_id, {"memory_context"})
+    usage = None
 
     try:
         history = MemoryConversationHistoryService()
@@ -49,6 +50,8 @@ def stream_memory_chat(
             require_profile_access(principal=principal, profile_id=profile_id)
             require_profile_purposes(profile_id, {"memory_context"}, expected_revision=consent.revision)
             authorize_context()
+            if request.channel == "voice" and usage is not None:
+                usage.reserve()
         authorize()
         usage = conversation_usage(principal, request, chat_factory=ChatUsage)
         usage.reserve()
