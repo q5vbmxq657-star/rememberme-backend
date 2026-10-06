@@ -5,7 +5,9 @@ from typing import Optional
 from uuid import UUID, uuid4
 
 import psycopg
+from fastapi import HTTPException
 from psycopg.rows import dict_row
+from app.services.plan_access import access_decision, effective_plan
 
 from app.models.profile_membership import (
     ProfileMembership,
@@ -124,6 +126,9 @@ class ProfileMembershipRepository:
             row_factory=dict_row,
         ) as connection:
             with connection.cursor() as cursor:
+                # Serialize the limit check and creation across different profile IDs.
+                cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                               ("plan-profile:" + str(user_id),))
                 cursor.execute(
                     """
                     SELECT pg_advisory_xact_lock(
@@ -148,6 +153,15 @@ class ProfileMembershipRepository:
                 )
 
                 if not profile_existed:
+                    cursor.execute("""SELECT COUNT(*) AS used FROM profile_memberships m
+                        WHERE m.user_id=%s AND m.role='owner' AND m.status='active'
+                        AND NOT EXISTS (SELECT 1 FROM digital_human_profile_erasure_requests e
+                            WHERE e.profile_id=m.profile_id)""", (user_id,))
+                    used = cursor.fetchone()["used"]
+                    decision = access_decision(plan=effective_plan(cursor, user_id),
+                                               action="create_avatar", used=used)
+                    if not decision["allowed"]:
+                        raise HTTPException(402, detail=decision)
                     cursor.execute(
                         """
                         INSERT INTO digital_human_profiles (

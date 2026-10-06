@@ -5,6 +5,7 @@ from uuid import UUID
 
 
 class StreamingMemoryChatRequest(BaseModel):
+    request_id: Optional[UUID] = None
     conversation_id: Optional[UUID] = None
     profile_name: str
     relationship: str

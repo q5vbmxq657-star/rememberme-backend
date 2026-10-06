@@ -11,6 +11,7 @@ from app.services.memory_chat_retrieval_service import MemoryChatRetrievalServic
 from app.services.pgvector_memory_service import PGVectorStaleIndexError
 from app.services.openai_memory_service import OpenAIMemoryService
 from app.services.memory_conversation_history import MemoryConversationHistoryService
+from app.services.chat_usage import ChatUsage
 
 
 router = APIRouter()
@@ -24,6 +25,8 @@ def memory_chat(
 ):
     profile_id = _authorized_profile_id(request.profile_id, principal)
     consent = require_profile_purposes(profile_id, {"memory_context"})
+    usage = None
+    completed = False
 
     try:
         history = MemoryConversationHistoryService()
@@ -34,6 +37,9 @@ def memory_chat(
             require_profile_purposes(profile_id, {"memory_context"}, expected_revision=consent.revision)
             authorize_context()
         authorize_evidence()
+        pending_usage = ChatUsage(principal, request.request_id)
+        pending_usage.reserve()
+        usage = pending_usage
         result = OpenAIMemoryService().generate_response(
             enriched_request,
             authorize=authorize_evidence,
@@ -41,6 +47,8 @@ def memory_chat(
         history.complete(context, request=enriched_request,
                          assistant_message=result.text, authorize=authorize_evidence)
         authorize_evidence()
+        usage.finish(completed=True)
+        completed = True
         return result
     except HTTPException:
         raise
@@ -51,6 +59,9 @@ def memory_chat(
             status_code=502,
             detail="We could not complete that response. Please try again.",
         ) from error
+    finally:
+        if usage is not None and not completed:
+            usage.finish(completed=False)
 
 
 def _authorized_profile_id(

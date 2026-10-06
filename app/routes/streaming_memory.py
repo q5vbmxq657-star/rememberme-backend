@@ -15,6 +15,7 @@ from app.services.memory_chat_retrieval_service import MemoryChatRetrievalServic
 from app.services.pgvector_memory_service import PGVectorStaleIndexError
 from app.services.streaming_memory_service import StreamingMemoryService
 from app.services.memory_conversation_history import MemoryConversationHistoryService
+from app.services.chat_usage import ChatUsage
 
 
 router = APIRouter()
@@ -48,8 +49,10 @@ def stream_memory_chat(
             require_profile_purposes(profile_id, {"memory_context"}, expected_revision=consent.revision)
             authorize_context()
         authorize()
+        usage = ChatUsage(principal, request.request_id)
+        usage.reserve()
         return _ClosingMemoryStreamingResponse(
-            _authorized_events(enriched_request, history=history, context=context, authorize=authorize),
+            _authorized_events(enriched_request, history=history, context=context, authorize=authorize, usage=usage),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache, no-transform",
@@ -68,10 +71,11 @@ def stream_memory_chat(
         ) from error
 
 
-async def _authorized_events(request, *, history, context, authorize):
+async def _authorized_events(request, *, history, context, authorize, usage=None):
     service = StreamingMemoryService()
     events = None
     source = None
+    completed = False
     try:
         source = service.stream_response(request, authorize=authorize)
         events = history.stream_events(source, context=context, request=request, authorize=authorize)
@@ -81,6 +85,9 @@ async def _authorized_events(request, *, history, context, authorize):
             if event is None:
                 break
             await run_in_threadpool(authorize)
+            if event.startswith("event: done\n") and usage is not None:
+                await run_in_threadpool(usage.finish, completed=True)
+                completed = True
             yield event
     except (HTTPException, PGVectorStaleIndexError):
         yield service._event("error", {
@@ -103,7 +110,11 @@ async def _authorized_events(request, *, history, context, authorize):
                     if source is not None:
                         await run_in_threadpool(source.close)
                 finally:
-                    await run_in_threadpool(service.close)
+                    try:
+                        await run_in_threadpool(service.close)
+                    finally:
+                        if usage is not None and not completed:
+                            await run_in_threadpool(usage.finish, completed=False)
 
 
 def _authorized_profile_id(

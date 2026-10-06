@@ -134,7 +134,7 @@ def index_memories(
     if request.expected_revision is None:
         raise HTTPException(status_code=426, detail="Update STAY before syncing memories.")
     try:
-        result = make_service().index(request)
+        result = make_service().index(request, user_id=principal.user.user_id)
         require_profile_access(principal=principal, profile_id=request.profile_id)
         return result
     except HTTPException:

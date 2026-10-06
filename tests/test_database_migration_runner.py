@@ -149,6 +149,11 @@ def test_legacy_migrations_are_exactly_frozen():
         "038_self_hosted_voice_references",
         "039_apple_purchase_registry",
         "040_apple_revocation_notifications",
+        "041_family_subscription_fulfillment",
+        "042_family_billing_binding_retention",
+        "043_personal_credit_accounts",
+        "044_annual_allowance_scheduler",
+        "045_chat_weekly_usage",
     ]
 
     for migration in migrations[:6]:
@@ -692,6 +697,11 @@ def test_fresh_plan_bootstraps_through_008():
         "038_self_hosted_voice_references",
         "039_apple_purchase_registry",
         "040_apple_revocation_notifications",
+        "041_family_subscription_fulfillment",
+        "042_family_billing_binding_retention",
+        "043_personal_credit_accounts",
+        "044_annual_allowance_scheduler",
+        "045_chat_weekly_usage",
     ]
 
 

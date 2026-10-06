@@ -32,6 +32,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def install_history(monkeypatch, route, *, authorize=None, purposes=None):
+    # These tests isolate privacy/history; quota transactions are tested separately.
+    monkeypatch.setattr(route, "ChatUsage", lambda *args: Mock())
     authorize = authorize or Mock()
     purposes = purposes or Mock(return_value=SimpleNamespace(revision=1))
     repository = Mock()

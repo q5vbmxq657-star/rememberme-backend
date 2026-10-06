@@ -30,6 +30,7 @@ class MemoryItem(BaseModel):
 
 
 class MemoryChatRequest(BaseModel):
+    request_id: Optional[UUID] = None
     conversation_id: Optional[UUID] = None
     profile_name: str
     relationship: str

@@ -149,6 +149,7 @@ class PGVectorMemoryService:
     def index(
         self,
         request: IndexMemoryRequest,
+        *, user_id: UUID | None = None,
     ) -> dict[str, object]:
         self._validate_index_request(request)
         if self._reuse_published_snapshot(request):
@@ -158,7 +159,7 @@ class PGVectorMemoryService:
             return {"status": "indexed", "backend": "pgvector", "profile_id": request.profile_id,
                     "count": len(request.memories), "usage_decisions": usage["decisions"],
                     "deleted_memory_ids": usage["deleted_memory_ids"]}
-        generation = self._reserve_index_generation(request)
+        generation = self._reserve_index_generation(request, user_id=user_id) if user_id is not None else self._reserve_index_generation(request)
         prepared_rows = self._prepare_index_rows(request, generation)
 
         with psycopg.connect(
@@ -266,12 +267,14 @@ class PGVectorMemoryService:
                     memory.sync_metadata.model_dump(mode="json", exclude_none=True)) for memory in request.memories)
                 return cursor.fetchall() == expected
 
-    def _reserve_index_generation(self, request: IndexMemoryRequest) -> tuple[int, UUID]:
+    def _reserve_index_generation(self, request: IndexMemoryRequest, *, user_id: UUID | None = None) -> tuple[int, UUID]:
         # Commit the fence before embedding work. Failed jobs leave old evidence hidden.
         with psycopg.connect(self.database_url) as connection:
             with connection.transaction():
                 with connection.cursor() as cursor:
                     self._require_index_write_allowed(cursor, request.profile_id, exclusive=True)
+                    from app.services.journey_access import require_journey_write
+                    require_journey_write(cursor, request, user_id)
                     cursor.execute("SELECT generation FROM memory_index_generations WHERE profile_id=%s::uuid FOR UPDATE",
                                    (request.profile_id,))
                     state = cursor.fetchone()
