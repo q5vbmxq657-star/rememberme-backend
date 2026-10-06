@@ -51,8 +51,9 @@ class FamilyCreditLedger:
                 WHERE family_id IS NOT DISTINCT FROM %s AND account_token IS NOT DISTINCT FROM %s
                 AND environment=%s),0) AS balance_units,
             COALESCE((SELECT SUM(reserved_units) FROM family_credit_reservations
-                WHERE family_id=%s AND settled_at IS NULL AND %s='Production'),0) AS reserved_units""",
-            (fid,token,environment,fid,environment)).fetchone()
+                WHERE family_id IS NOT DISTINCT FROM %s AND account_token IS NOT DISTINCT FROM %s
+                  AND settled_at IS NULL AND %s='Production'),0) AS reserved_units""",
+            (fid,token,environment,fid,token,environment)).fetchone()
         balance, reserved = int(totals["balance_units"]), int(totals["reserved_units"])
         return {"balance_units": balance, "reserved_units": reserved,
                 "available_units": max(0, balance-reserved), "units_per_credit": UNITS_PER_CREDIT,
@@ -103,17 +104,24 @@ class FamilyCreditLedger:
             raise ValueError("A reservation requires a supported mode and bounded whole seconds.")
         units = seconds * (VIDEO_UNITS_PER_SECOND if mode == "video" else VOICE_UNITS_PER_SECOND)
         cls.lock(db, family_id)
-        if not db.execute("SELECT 1 FROM family_members WHERE family_id=%s AND user_id=%s", (family_id,member_id)).fetchone():
-            raise HTTPException(403, "Family membership is required.")
+        fid, token = credit_owner(family_id)
+        if token is not None:
+            permitted = db.execute("SELECT 1 FROM billing_accounts WHERE account_token=%s AND user_id=%s",
+                                   (token, member_id)).fetchone()
+        else:
+            permitted = db.execute("SELECT 1 FROM family_members WHERE family_id=%s AND user_id=%s",
+                                   (fid, member_id)).fetchone()
+        if not permitted:
+            raise HTTPException(403, "Access to this credit account is required.")
         prior = db.execute("SELECT * FROM family_credit_reservations WHERE call_id=%s", (call_id,)).fetchone()
         if prior:
-            if (prior["family_id"],prior["member_id"],prior["mode"],prior["reserved_units"]) != (family_id,member_id,mode,units) or prior["settled_at"] is not None:
+            if (prior["family_id"],prior["account_token"],prior["member_id"],prior["mode"],prior["reserved_units"]) != (fid,token,member_id,mode,units) or prior["settled_at"] is not None:
                 raise HTTPException(409, "This call reservation has already changed.")
             return cls.balance(db, family_id)
         if cls.balance(db, family_id)["available_units"] < units:
-            raise HTTPException(409, "Your family does not have enough available credits.")
-        db.execute("""INSERT INTO family_credit_reservations(call_id,family_id,member_id,mode,reserved_units)
-            VALUES (%s,%s,%s,%s,%s)""", (call_id,family_id,member_id,mode,units))
+            raise HTTPException(409, "There are not enough available credits for this call.")
+        db.execute("""INSERT INTO family_credit_reservations(call_id,family_id,account_token,member_id,mode,reserved_units)
+            VALUES (%s,%s,%s,%s,%s,%s)""", (call_id,fid,token,member_id,mode,units))
         return cls.balance(db, family_id)
 
     @classmethod
@@ -121,7 +129,10 @@ class FamilyCreditLedger:
         if type(verified_seconds) is not int or verified_seconds < 0:
             raise ValueError("Settlement requires verified nonnegative whole seconds.")
         cls.lock(db, family_id)
-        row = db.execute("SELECT * FROM family_credit_reservations WHERE family_id=%s AND call_id=%s FOR UPDATE", (family_id,call_id)).fetchone()
+        fid, token = credit_owner(family_id)
+        row = db.execute("""SELECT * FROM family_credit_reservations
+            WHERE family_id IS NOT DISTINCT FROM %s AND account_token IS NOT DISTINCT FROM %s
+              AND call_id=%s FOR UPDATE""", (fid,token,call_id)).fetchone()
         if not row:
             raise HTTPException(404, "Call reservation not found.")
         units = verified_seconds * (VIDEO_UNITS_PER_SECOND if row["mode"] == "video" else VOICE_UNITS_PER_SECOND)
@@ -132,7 +143,7 @@ class FamilyCreditLedger:
                 raise HTTPException(409, "This call was settled with different usage.")
             return cls.balance(db, family_id)
         if units:
-            db.execute("""INSERT INTO family_credit_entries(entry_id,family_id,evidence_key,units,kind)
-                VALUES (%s,%s,%s,%s,'usage')""", (uuid4(),family_id,"call:"+str(call_id),-units))
+            db.execute("""INSERT INTO family_credit_entries(entry_id,family_id,account_token,evidence_key,units,kind)
+                VALUES (%s,%s,%s,%s,%s,'usage')""", (uuid4(),fid,token,"call:"+str(call_id),-units))
         db.execute("UPDATE family_credit_reservations SET consumed_units=%s,settled_at=NOW() WHERE call_id=%s", (units,call_id))
         return cls.balance(db, family_id)

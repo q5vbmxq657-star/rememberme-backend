@@ -16,6 +16,7 @@ from app.services.pgvector_memory_service import PGVectorStaleIndexError
 from app.services.streaming_memory_service import StreamingMemoryService
 from app.services.memory_conversation_history import MemoryConversationHistoryService
 from app.services.chat_usage import ChatUsage
+from app.services.conversation_usage import conversation_usage
 
 
 router = APIRouter()
@@ -49,7 +50,7 @@ def stream_memory_chat(
             require_profile_purposes(profile_id, {"memory_context"}, expected_revision=consent.revision)
             authorize_context()
         authorize()
-        usage = ChatUsage(principal, request.request_id)
+        usage = conversation_usage(principal, request, chat_factory=ChatUsage)
         usage.reserve()
         return _ClosingMemoryStreamingResponse(
             _authorized_events(enriched_request, history=history, context=context, authorize=authorize, usage=usage),

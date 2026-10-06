@@ -1,5 +1,5 @@
-from pydantic import BaseModel, Field, BeforeValidator
-from typing import Annotated, List, Optional
+from pydantic import BaseModel, Field, BeforeValidator, model_validator
+from typing import Annotated, List, Optional, Literal
 import unicodedata
 from uuid import UUID
 
@@ -29,9 +29,22 @@ class MemoryItem(BaseModel):
     confidence_score: float = 0.0
 
 
-class MemoryChatRequest(BaseModel):
-    request_id: Optional[UUID] = None
+class ConversationAdmission(BaseModel):
+    channel: Literal["chat", "voice"] = "chat"
+    voice_call_id: Optional[UUID] = None
     conversation_id: Optional[UUID] = None
+
+    @model_validator(mode="after")
+    def validate_channel(self):
+        if self.channel == "voice" and (self.voice_call_id is None or self.conversation_id is None):
+            raise ValueError("Voice requires a bound call and conversation.")
+        if self.channel == "chat" and self.voice_call_id is not None:
+            raise ValueError("Chat cannot attach a voice reservation.")
+        return self
+
+
+class MemoryChatRequest(ConversationAdmission):
+    request_id: Optional[UUID] = None
     profile_name: str
     relationship: str
     user_message: str

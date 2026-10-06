@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import psycopg
+from psycopg.conninfo import conninfo_to_dict
 import pytest
 from fastapi import HTTPException
 from app.services.chat_usage import ChatUsage
@@ -18,6 +19,9 @@ def principal(monkeypatch):
     url = os.environ.get("STAY_TEST_DATABASE_URL")
     if not url:
         pytest.skip("An isolated STAY_TEST_DATABASE_URL is required")
+    config = conninfo_to_dict(url)
+    assert config.get("host", "").startswith("/private/tmp/stay-quota-db.")
+    assert config.get("dbname") == "postgres"
     monkeypatch.setenv("DATABASE_URL", url)
     uid, sid = uuid4(), uuid4()
     with psycopg.connect(url) as db:
@@ -67,6 +71,37 @@ def test_failure_releases_slot_but_success_does_not(principal):
     assert error.value.status_code == 402
     requests[1].finish(completed=False)
     ChatUsage(principal).reserve()
+
+
+def test_upgrade_and_revocation_are_observed_without_cached_entitlements(principal):
+    url = os.environ["STAY_TEST_DATABASE_URL"]
+    for _ in range(10):
+        usage = ChatUsage(principal)
+        usage.reserve()
+        usage.finish(completed=True)
+    with pytest.raises(HTTPException) as error:
+        ChatUsage(principal).reserve()
+    assert error.value.status_code == 402
+    token, transaction = uuid4(), str(uuid4().int)
+    with psycopg.connect(url) as db:
+        db.execute("INSERT INTO billing_accounts(account_token,user_id) VALUES (%s,%s)",
+                   (token,principal.user.user_id))
+        db.execute("""INSERT INTO apple_subscription_ownership
+            (environment,original_transaction_id,account_token) VALUES ('Production',%s,%s)""",
+                   (transaction,token))
+        db.execute("""INSERT INTO apple_purchase_transactions
+            (environment,transaction_id,original_transaction_id,product_id,plan,cadence,paid_from,paid_until)
+            VALUES ('Production',%s,%s,'test.plus','plus','monthly',NOW()-INTERVAL '1 day',NOW()+INTERVAL '29 days')""",
+                   (transaction,transaction))
+    usage = ChatUsage(principal)
+    usage.reserve()
+    usage.finish(completed=True)
+    with psycopg.connect(url) as db:
+        db.execute("UPDATE apple_purchase_transactions SET revoked_at=NOW() WHERE transaction_id=%s",
+                   (transaction,))
+    with pytest.raises(HTTPException) as error:
+        ChatUsage(principal).reserve()
+    assert error.value.status_code == 402
 
 
 def test_parallel_profile_creation_preserves_free_limit(principal):

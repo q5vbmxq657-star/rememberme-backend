@@ -1,12 +1,11 @@
 from pydantic import BaseModel, Field
 from typing import List, Optional
-from app.schemas.memory import MemoryItem
+from app.schemas.memory import MemoryItem, ConversationAdmission
 from uuid import UUID
 
 
-class StreamingMemoryChatRequest(BaseModel):
+class StreamingMemoryChatRequest(ConversationAdmission):
     request_id: Optional[UUID] = None
-    conversation_id: Optional[UUID] = None
     profile_name: str
     relationship: str
     user_message: str

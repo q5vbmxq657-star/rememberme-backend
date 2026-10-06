@@ -154,6 +154,8 @@ def test_legacy_migrations_are_exactly_frozen():
         "043_personal_credit_accounts",
         "044_annual_allowance_scheduler",
         "045_chat_weekly_usage",
+        "046_personal_call_reservations",
+        "047_call_reservation_binding",
     ]
 
     for migration in migrations[:6]:
@@ -702,6 +704,8 @@ def test_fresh_plan_bootstraps_through_008():
         "043_personal_credit_accounts",
         "044_annual_allowance_scheduler",
         "045_chat_weekly_usage",
+        "046_personal_call_reservations",
+        "047_call_reservation_binding",
     ]
 
 
