@@ -179,7 +179,7 @@ def test_plus_purchase_uses_personal_ledger_and_refunds_once(purchase):
         with repo.transaction(owner) as db:
             Registry.record(db, owner.user.user_id, evidence)
             result = fulfill_subscription_purchase(db, owner.user.user_id, evidence, now=evidence.paid_from)
-            assert result["balance_units"] == 6000
+            assert result["balance_units"] == 3000
             assert Ledger.balance(db, PersonalCreditAccount(evidence.account_token))["balance_units"] == 0
     for _ in range(2):
         with repo.transaction(owner) as db:
@@ -210,7 +210,7 @@ def test_server_purchase_notification_grants_without_app_session(purchase, monke
         record_notification_purchase(evidence, now=evidence.paid_from)
     with repo.transaction(people[0]) as db:
         assert Ledger.balance(db, PersonalCreditAccount(evidence.account_token),
-                              environment="Sandbox")["balance_units"] == 6000
+                              environment="Sandbox")["balance_units"] == 3000
 
 
 def test_annual_scheduler_catches_up_and_defers_next_check(purchase):
@@ -236,7 +236,7 @@ def test_annual_scheduler_catches_up_and_defers_next_check(purchase):
     assert fetched == [evidence.transaction_id]
     with repo.transaction(people[0]) as db:
         assert Ledger.balance(db, PersonalCreditAccount(evidence.account_token),
-                              environment="Sandbox")["balance_units"] == 18000
+                              environment="Sandbox")["balance_units"] == 9000
 
 
 @pytest.mark.parametrize("failure", ["network", "empty", "missing_signature"])

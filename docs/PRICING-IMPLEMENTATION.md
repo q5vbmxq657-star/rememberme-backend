@@ -34,7 +34,7 @@ This section supersedes the historical implementation checkpoints below.
 
 - Read-only, uncached plan catalog for Free, Plus and Family.
 - Free terms: one avatar, Memory Journey through level five, ten weekly chat messages.
-- Plus allowance: 100 monthly credits. Family allowance: 300 monthly credits.
+- Plus allowance: 50 monthly credits (50 voice minutes), one avatar. Family allowance: 300 monthly credits.
 - Existing Family ledger uses the canonical credit conversion constants.
 - Monthly allowance scheduling supports annual subscriptions without granting future months up front.
 - Month-end scheduling preserves the original calendar anchor, including leap years.
@@ -67,15 +67,15 @@ Required before charging customers:
 8. Run Sandbox purchase, restore, renewal, refund and multi-device acceptance.
 9. Finalize billing-record retention and deletion policy before production activation; detached anti-replay records are not a completed retention contract.
 
-On 2026-10-05 the user approved Plus at EUR 59.99 monthly / EUR 599.99 annually
-and authorized creating all subscriptions in App Store Connect. Family retains
-the same approved prices. The following actual products were created under app
+On 2026-10-08 the user revised Plus to EUR 29.99 monthly / EUR 199.99 annually,
+one avatar and 50 voice minutes per month. Credit top-ups are deferred.
+Family retains EUR 59.99 monthly / EUR 599.99 annually. The existing products are under app
 6780634832, group `STAY Membership` (22441685):
 
 | Product ID | Apple ID | German base price |
 | --- | --- | --- |
-| `stay.plus.monthly` | 6819201355 | EUR 59.99 / month |
-| `stay.plus.annual` | 6819202981 | EUR 599.99 / year |
+| `stay.plus.monthly` | 6819201355 | EUR 29.99 / month |
+| `stay.plus.annual` | 6819202981 | EUR 199.99 / year |
 | `stay.family.monthly` | 6819203610 | EUR 59.99 / month |
 | `stay.family.annual` | 6819204338 | EUR 599.99 / year |
 

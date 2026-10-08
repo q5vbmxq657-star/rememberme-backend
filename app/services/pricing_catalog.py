@@ -8,6 +8,7 @@ UNITS_PER_CREDIT = 60
 VOICE_UNITS_PER_SECOND = 1
 VIDEO_UNITS_PER_SECOND = 10
 FAMILY_MONTHLY_CREDITS = 300
+PLUS_MONTHLY_CREDITS = 50
 
 
 def store_products():
@@ -28,7 +29,7 @@ def store_products():
 
 def pricing_catalog():
     return {
-        "version": 1,
+        "version": 2,
         "purchases_available": False,
         "store_products": store_products(),
         "video_available": False,
@@ -39,9 +40,9 @@ def pricing_catalog():
             {"id": "free", "name": "Free", "monthly_credits": 0,
              "memory_level_limit": 5, "weekly_chat_messages": 10,
              "avatar_limit": 1, "family_member_limit": None},
-            {"id": "plus", "name": "Plus", "monthly_credits": 100,
+            {"id": "plus", "name": "Plus", "monthly_credits": PLUS_MONTHLY_CREDITS,
              "memory_level_limit": None, "weekly_chat_messages": None,
-             "avatar_limit": None, "family_member_limit": None},
+             "avatar_limit": 1, "family_member_limit": None},
             {"id": "family", "name": "Family", "monthly_credits": FAMILY_MONTHLY_CREDITS,
              "memory_level_limit": None, "weekly_chat_messages": None,
              "avatar_limit": None, "family_member_limit": 6},
