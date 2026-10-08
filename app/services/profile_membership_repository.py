@@ -29,6 +29,17 @@ class ProfileProvisioningConflictError(
 
 
 class ProfileMembershipRepository:
+    def check_creation_access(self, *, user_id: UUID) -> dict:
+        with psycopg.connect(self.database_url, connect_timeout=10, row_factory=dict_row) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("""SELECT COUNT(*) AS used FROM profile_memberships m
+                    WHERE m.user_id=%s AND m.role='owner' AND m.status='active'
+                    AND NOT EXISTS (SELECT 1 FROM digital_human_profile_erasure_requests e
+                        WHERE e.profile_id=m.profile_id)""", (user_id,))
+                used = cursor.fetchone()["used"]
+                return access_decision(plan=effective_plan(cursor, user_id),
+                                       action="create_avatar", used=used)
+
     def __init__(
         self,
         database_url: Optional[str] = None,
