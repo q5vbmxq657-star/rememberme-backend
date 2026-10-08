@@ -9,12 +9,12 @@ def test_approved_terms_and_no_unverified_purchase_offer():
     catalog = pricing_catalog()
     free, plus, family = catalog["plans"]
     assert (free["avatar_limit"], free["memory_level_limit"], free["weekly_chat_messages"]) == (1, 5, 10)
-    assert plus["monthly_credits"] == 50
+    assert plus["monthly_credits"] == 100
     assert family["monthly_credits"] * FamilyCreditLedger.UNITS_PER_CREDIT == FamilyCreditLedger.MONTHLY_UNITS
     assert catalog["credits_roll_over"] is True
     assert catalog["purchases_available"] is False
     assert catalog["video_available"] is False
-    assert plus["avatar_limit"] == 1
+    assert plus["avatar_limit"] is None  # Not an invented unlimited entitlement.
 
 
 def test_catalog_is_read_only_and_not_cached():

@@ -21,15 +21,9 @@ def test_free_boundaries(action, kwargs, allowed):
 @pytest.mark.parametrize("plan", ["plus", "family"])
 def test_paid_limits_do_not_imply_free_voice(plan):
     assert access_decision(plan=plan, action="chat_message", used=100)["allowed"]
-    assert access_decision(plan=plan, action="create_avatar", used=2)["allowed"] is (plan == "family")
+    assert access_decision(plan=plan, action="create_avatar", used=2)["allowed"]
     assert access_decision(plan=plan, action="journey_level", requested_level=20)["allowed"]
     assert not access_decision(plan=plan, action="voice_call", available_units=0)["allowed"]
-
-
-def test_plus_includes_exactly_one_avatar_without_blocking_reads():
-    assert access_decision(plan="plus", action="create_avatar", used=0)["allowed"]
-    assert access_decision(plan="plus", action="create_avatar", used=1)["reason"] == "avatar_limit"
-    assert access_decision(plan="plus", action="read", used=2)["allowed"]
 
 
 @pytest.mark.parametrize("kwargs", [

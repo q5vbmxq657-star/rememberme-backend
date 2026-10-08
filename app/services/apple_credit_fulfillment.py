@@ -3,7 +3,6 @@ from fastapi import HTTPException
 
 from app.services.family_credit_ledger import FamilyCreditLedger, PersonalCreditAccount
 from app.services.subscription_credit_period import monthly_credit_periods
-from app.services.pricing_catalog import PLUS_MONTHLY_CREDITS
 
 
 def fulfill_subscription_purchase(db, user_id, evidence, *, now):
@@ -17,7 +16,7 @@ def fulfill_subscription_purchase(db, user_id, evidence, *, now):
         raise HTTPException(403, "This purchase belongs to another account.")
     if evidence.product.plan == "plus":
         owner = PersonalCreditAccount(evidence.account_token)
-        units = PLUS_MONTHLY_CREDITS * FamilyCreditLedger.UNITS_PER_CREDIT
+        units = 100 * FamilyCreditLedger.UNITS_PER_CREDIT
     else:
         owner = bind_family(db, user_id, evidence)
         units = FamilyCreditLedger.MONTHLY_UNITS

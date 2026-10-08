@@ -28,25 +28,6 @@ from app.services.profile_membership_repository import (
 router = APIRouter()
 
 
-@router.get("")
-def recover_profiles(principal: AuthenticatedSessionPrincipal = Depends(require_authenticated_principal)):
-    try:
-        profiles = ProfileMembershipRepository().recovery_directory(user_id=principal.user.user_id)
-    except (psycopg.Error, ProfileMembershipRepositoryError) as error:
-        raise HTTPException(503, "Your spaces could not be restored. Please try again.") from error
-    return JSONResponse({"profiles": profiles}, headers={"Cache-Control": "no-store"})
-
-
-@router.get("/creation-access")
-def profile_creation_access(principal: AuthenticatedSessionPrincipal = Depends(require_authenticated_principal)):
-    try:
-        decision = ProfileMembershipRepository().check_creation_access(user_id=principal.user.user_id)
-    except (psycopg.Error, ProfileMembershipRepositoryError) as error:
-        raise HTTPException(503, "Profile availability could not be checked.") from error
-    return JSONResponse({"detail": decision}, status_code=200 if decision["allowed"] else 402,
-                        headers={"Cache-Control": "no-store"})
-
-
 @router.get("/{profile_id}/consent", response_model=PurposeConsentSnapshot)
 def read_profile_consent(profile_id: UUID, principal: AuthenticatedSessionPrincipal = Depends(require_authenticated_principal)):
     require_profile_access(principal=principal, profile_id=profile_id)
@@ -87,15 +68,11 @@ async def provision_profile(
     ),
 ) -> ProfileProvisionResponse:
     try:
-        identity = {key: value for key, value in
-                    (("display_name", payload.display_name), ("relationship", payload.relationship))
-                    if value is not None}
         membership, created = await run_in_threadpool(
             ProfileMembershipRepository().provision_owned_profile,
             user_id=principal.user.user_id,
             profile_id=payload.profile_id,
             consent_verified=payload.consent_verified,
-            **identity,
         )
 
     except ProfileProvisioningConflictError as error:

@@ -5,7 +5,6 @@ from typing import Optional
 from uuid import UUID, uuid4
 
 import psycopg
-from psycopg.types.json import Jsonb
 from fastapi import HTTPException
 from psycopg.rows import dict_row
 from app.services.plan_access import access_decision, effective_plan
@@ -30,41 +29,6 @@ class ProfileProvisioningConflictError(
 
 
 class ProfileMembershipRepository:
-    def recovery_directory(self, *, user_id: UUID) -> list[dict]:
-        with psycopg.connect(self.database_url, connect_timeout=10, row_factory=dict_row) as connection:
-            with connection.cursor() as cursor:
-                # Only dangling memberships are deactivated. Existing profiles,
-                # including incomplete ones, and all their content are preserved.
-                cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-                               ("plan-profile:" + str(user_id),))
-                cursor.execute("""UPDATE profile_memberships m SET status='revoked', updated_at=NOW()
-                    WHERE m.user_id=%s AND m.role='owner' AND m.status='active'
-                    AND NOT EXISTS (SELECT 1 FROM digital_human_profiles p WHERE p.profile_id=m.profile_id)""",
-                               (user_id,))
-                cursor.execute("""SELECT p.profile_id, p.metadata, p.consent_verified
-                    FROM profile_memberships m
-                    JOIN digital_human_profiles p ON p.profile_id=m.profile_id
-                    WHERE m.user_id=%s AND m.role='owner' AND m.status='active'
-                    AND NOT EXISTS (SELECT 1 FROM digital_human_profile_erasure_requests e
-                        WHERE e.profile_id=m.profile_id)
-                    ORDER BY m.created_at ASC""", (user_id,))
-                return [{"profile_id": str(row["profile_id"]),
-                         "display_name": (row["metadata"] or {}).get("display_name"),
-                         "relationship": (row["metadata"] or {}).get("relationship"),
-                         "consent_verified": row["consent_verified"]}
-                        for row in cursor.fetchall()]
-
-    def check_creation_access(self, *, user_id: UUID) -> dict:
-        with psycopg.connect(self.database_url, connect_timeout=10, row_factory=dict_row) as connection:
-            with connection.cursor() as cursor:
-                cursor.execute("""SELECT COUNT(*) AS used FROM profile_memberships m
-                    WHERE m.user_id=%s AND m.role='owner' AND m.status='active'
-                    AND NOT EXISTS (SELECT 1 FROM digital_human_profile_erasure_requests e
-                        WHERE e.profile_id=m.profile_id)""", (user_id,))
-                used = cursor.fetchone()["used"]
-                return access_decision(plan=effective_plan(cursor, user_id),
-                                       action="create_avatar", used=used)
-
     def __init__(
         self,
         database_url: Optional[str] = None,
@@ -150,8 +114,6 @@ class ProfileMembershipRepository:
         user_id: UUID,
         profile_id: UUID,
         consent_verified: bool,
-        display_name: str | None = None,
-        relationship: str | None = None,
     ) -> tuple[ProfileMembership, bool]:
         """Create a new profile and its owner membership atomically.
 
@@ -249,8 +211,6 @@ class ProfileMembershipRepository:
                             "Profile cannot be claimed."
                         )
 
-                    self._save_identity(cursor, profile_id, display_name, relationship)
-
                     return (
                         self._membership_from_row(current),
                         False,
@@ -260,8 +220,6 @@ class ProfileMembershipRepository:
                     raise ProfileProvisioningConflictError(
                         "Profile ownership is inconsistent."
                     )
-
-                self._save_identity(cursor, profile_id, display_name, relationship)
 
                 membership_id = uuid4()
 
@@ -307,16 +265,6 @@ class ProfileMembershipRepository:
             connection.commit()
 
         return self._membership_from_row(row), True
-
-    @staticmethod
-    def _save_identity(cursor, profile_id, display_name, relationship):
-        identity = {key: value for key, value in
-                    (("display_name", display_name), ("relationship", relationship))
-                    if value is not None}
-        if identity:
-            cursor.execute("""UPDATE digital_human_profiles
-                SET metadata=COALESCE(metadata, '{}'::jsonb) || %s WHERE profile_id=%s""",
-                           (Jsonb(identity), profile_id))
 
     def list_active_for_user(
         self,
