@@ -23,6 +23,31 @@ from app.services.profile_membership_repository import (
 NOW = datetime.now(timezone.utc)
 
 
+def test_recovery_directory_is_account_scoped_and_not_cached(monkeypatch):
+    import json
+    authenticated = principal()
+    profile_id = str(uuid4())
+    class Repository:
+        def recovery_directory(self, *, user_id):
+            assert user_id == authenticated.user.user_id
+            return [{"profile_id": profile_id, "display_name": "Anna",
+                     "relationship": "Mother", "consent_verified": True}]
+    monkeypatch.setattr(profile_routes, "ProfileMembershipRepository", Repository)
+    response = profile_routes.recover_profiles(authenticated)
+    assert response.headers["cache-control"] == "no-store"
+    assert json.loads(response.body)["profiles"][0]["profile_id"] == profile_id
+
+
+def test_recovery_outage_does_not_report_empty_account(monkeypatch):
+    class Repository:
+        def recovery_directory(self, **kwargs):
+            raise ProfileMembershipRepositoryError("offline")
+    monkeypatch.setattr(profile_routes, "ProfileMembershipRepository", Repository)
+    with pytest.raises(HTTPException) as error:
+        profile_routes.recover_profiles(principal())
+    assert error.value.status_code == 503
+
+
 @pytest.mark.parametrize("allowed,status_code", [(True, 200), (False, 402)])
 def test_creation_preflight_uses_authenticated_account_and_is_not_cached(monkeypatch, allowed, status_code):
     import json
