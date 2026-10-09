@@ -732,6 +732,10 @@ class ElevenLabsVoiceService:
                 },
             )
 
+        # ElevenLabs also reports already-absent voices as HTTP 400.
+        # Only this explicit resource-absence code is an idempotent success.
+        if response.status_code == 400 and self._provider_error_code(response) == "voice_not_found":
+            return
         if response.status_code not in {
             200,
             204,
