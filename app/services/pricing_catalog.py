@@ -1,8 +1,5 @@
 """Approved plan terms, not purchase evidence or an entitlement grant."""
-import json
-import os
-
-from app.services.apple_purchase_verifier import SubscriptionProduct
+from app.services.apple_store_configuration import configured_products
 
 UNITS_PER_CREDIT = 60
 VOICE_UNITS_PER_SECOND = 1
@@ -13,16 +10,8 @@ PLUS_MONTHLY_CREDITS = 50
 
 def store_products():
     try:
-        values = json.loads(os.environ.get("STAY_APPLE_PRODUCTS", "{}"))
-        if not isinstance(values, dict):
-            return []
-        result = []
-        for identity, terms in values.items():
-            if not isinstance(identity, str) or not identity.strip():
-                return []
-            product = SubscriptionProduct(**terms)
-            result.append({"id": identity, "plan": product.plan, "cadence": product.cadence})
-        return result
+        return [{"id": identity, "plan": product.plan, "cadence": product.cadence}
+                for identity, product in configured_products().items()]
     except (TypeError, ValueError):
         return []
 

@@ -1,5 +1,4 @@
 """Authenticated purchase evidence intake. Fulfillment remains fail-closed."""
-import json
 import os
 from uuid import UUID
 from typing import Literal
@@ -25,7 +24,7 @@ from app.services.apple_purchase_registry import ApplePurchaseRegistry
 from app.services.apple_credit_fulfillment import fulfill_subscription_purchase
 from app.services.family_credit_ledger import FamilyCreditLedger, PersonalCreditAccount
 from app.services.apple_purchase_verifier import (
-    ApplePurchaseVerifier, InvalidPurchaseEvidence, SubscriptionProduct,
+    ApplePurchaseVerifier, InvalidPurchaseEvidence,
 )
 
 router = APIRouter(prefix="/v1/billing")
@@ -184,17 +183,14 @@ def apple_notification(body: AppleNotification):
 
 
 def configured_verifier():
+    from app.services.apple_store_configuration import configured_products, configured_roots
     try:
-        products = json.loads(os.environ.get("STAY_APPLE_PRODUCTS", "{}"))
-        roots = json.loads(os.environ.get("STAY_APPLE_ROOT_CERTIFICATES", "[]"))
-        if not isinstance(products, dict) or not isinstance(roots, list):
-            raise ValueError("Invalid configuration")
         return ApplePurchaseVerifier(
-            root_certificates=[Path(path).read_bytes() for path in roots],
+            root_certificates=configured_roots(),
             bundle_id=os.environ.get("STAY_APPLE_BUNDLE_ID", ""),
             app_apple_id=int(os.environ.get("STAY_APPLE_APP_ID", "0")),
             environment=os.environ.get("STAY_APPLE_ENVIRONMENT", "Production"),
-            products={key: SubscriptionProduct(**value) for key, value in products.items()},
+            products=configured_products(),
         )
     except (ValueError, TypeError, OSError):
         raise HTTPException(503, "Purchases are not available yet.") from None
