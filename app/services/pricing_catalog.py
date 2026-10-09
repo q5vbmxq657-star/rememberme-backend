@@ -27,6 +27,7 @@ def pricing_catalog():
         "video_credits_per_minute": 10,
         "plans": [
             {"id": "free", "name": "Free", "monthly_credits": 0,
+             "one_time_voice_seconds": 300, "voice_mode": "generic",
              "memory_level_limit": 5, "weekly_chat_messages": 10,
              "avatar_limit": 1, "family_member_limit": None},
             {"id": "plus", "name": "Plus", "monthly_credits": PLUS_MONTHLY_CREDITS,

@@ -244,6 +244,10 @@ async def synthesize_profile_voice(
     try:
         service = await run_in_threadpool(ElevenLabsVoiceService)
 
+        from app.services.free_voice_trial import voice_version_for_account
+        selected_voice_version = await run_in_threadpool(
+            voice_version_for_account, principal, request.voice_version)
+
         async with asyncio.timeout(VOICE_SYNTHESIS_TIMEOUT_SECONDS):
             synthesis = await service.synthesize_for_profile(
                 profile_id=(
@@ -251,7 +255,7 @@ async def synthesize_profile_voice(
                 ),
                 text=request.text,
                 delivery=request.delivery,
-                voice_version=request.voice_version,
+                voice_version=selected_voice_version,
                 **({"language": request.language} if request.language else {}),
             )
 
@@ -269,7 +273,7 @@ async def synthesize_profile_voice(
                 "X-STAY-Voice-Mode": (
                     synthesis.voice_mode
                 ),
-                **({"X-STAY-Voice-Version": request.voice_version} if request.voice_version else {}),
+                **({"X-STAY-Voice-Version": selected_voice_version} if selected_voice_version else {}),
             },
         )
 

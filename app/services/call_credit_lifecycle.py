@@ -54,6 +54,8 @@ class CallCreditLifecycle:
                 owner = self.repository.group(db, uid)["family_id"]
             elif funding == "personal":
                 owner = PersonalCreditAccount(ApplePurchaseRegistry.account_token(db, uid))
+                from app.services.free_voice_trial import grant_free_voice_trial
+                grant_free_voice_trial(db, uid)
             else:
                 raise HTTPException(422, "Choose a credit account.")
             Ledger.lock(db, owner)

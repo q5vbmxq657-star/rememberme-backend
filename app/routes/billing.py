@@ -210,6 +210,8 @@ def account(principal=Depends(require_authenticated_principal)):
 def personal_credits(principal=Depends(require_authenticated_principal)):
     try:
         with FamilyRepository().transaction(principal) as db:
+            from app.services.free_voice_trial import grant_free_voice_trial
+            grant_free_voice_trial(db, principal.user.user_id)
             token = ApplePurchaseRegistry.account_token(db, principal.user.user_id)
             credits = FamilyCreditLedger.balance(db, PersonalCreditAccount(token))
         return JSONResponse(credits, headers={"Cache-Control": "no-store"})

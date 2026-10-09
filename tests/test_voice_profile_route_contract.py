@@ -17,6 +17,12 @@ from app.services.digital_human_profile_repository import DigitalHumanProfileRep
 from test_voice_clone_upload_limits import configure, submit, upload
 
 
+@pytest.fixture(autouse=True)
+def paid_voice_account(monkeypatch):
+    monkeypatch.setattr("app.services.free_voice_trial.voice_version_for_account",
+                        lambda principal, version: version)
+
+
 def test_tts_version_is_forwarded_and_confirmed_without_exposing_provider_id(monkeypatch):
     profile = uuid4()
     version = str(uuid4())
