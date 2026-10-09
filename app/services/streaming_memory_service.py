@@ -1,4 +1,5 @@
 import json
+import logging
 from time import perf_counter
 from collections.abc import Callable, Generator
 
@@ -8,6 +9,8 @@ from app.services.ai_orchestration_service import AIOrchestrationService, AITask
 from app.services.emotional_reasoning_service import EmotionalReasoningService
 from app.services.memory_chat_openai_client import make_memory_chat_openai_client
 from app.services.memory_conversation_prompt_builder import MemoryConversationPromptBuilder
+
+logger = logging.getLogger(__name__)
 
 
 class StreamingMemoryService:
@@ -125,7 +128,9 @@ class StreamingMemoryService:
                     raise RuntimeError("The model did not complete its response.")
 
             raise RuntimeError("The model stream ended without completion.")
-        except Exception:
+        except Exception as error:
+            logger.error("memory_generation_failed error_type=%s elapsed_ms=%.0f",
+                         type(error).__name__, (perf_counter() - started_at) * 1000)
             yield self._event(
                 "error",
                 {
