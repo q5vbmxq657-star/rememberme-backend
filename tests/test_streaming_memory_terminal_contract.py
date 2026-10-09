@@ -77,6 +77,31 @@ def test_first_delta_is_immediate_and_terminal_stops_further_frames(setup):
     assert stream.consumed == 2
 
 
+def test_voice_batches_tokens_without_losing_text_or_terminal(setup):
+    service, request = setup
+    request = request.model_copy(update={"channel": "voice"})
+    chunks = ["Hello", " there", ".", " How", " are", " you", "?"]
+    install_stream(service, [*(event('response.output_text.delta', delta=text) for text in chunks),
+                             event('response.completed')])
+    result = list(service.stream_response(request, authorize=lambda: None))
+    deltas = [json.loads(frame.split('data: ', 1)[1])['text']
+              for frame in result if frame.startswith('event: delta\n')]
+    assert deltas == ["Hello", " there. How are you?"]
+    assert ''.join(deltas) == ''.join(chunks)
+    assert result[-1].startswith('event: done\n')
+
+
+def test_voice_does_not_flush_buffered_text_after_provider_failure(setup):
+    service, request = setup
+    request = request.model_copy(update={"channel": "voice"})
+    install_stream(service, [event('response.output_text.delta', delta='Hello'),
+                            event('response.output_text.delta', delta=' unfinished'),
+                            event('response.failed')])
+    result = list(service.stream_response(request, authorize=lambda: None))
+    assert not any('unfinished' in frame for frame in result)
+    assert result[-1].startswith('event: error\n')
+
+
 def test_route_revocation_during_blocked_provider_read_drops_frame(setup, monkeypatch):
     service, request = setup
     entered = Event()

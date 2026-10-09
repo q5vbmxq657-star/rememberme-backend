@@ -83,6 +83,7 @@ class StreamingMemoryService:
 
         emitted_text = False
         first_delta_ms = None
+        pending_text = ""
 
         stream = None
         try:
@@ -110,13 +111,23 @@ class StreamingMemoryService:
                         # returns and before disclosing each emitted SSE frame.
                         if first_delta_ms is None and delta.strip():
                             first_delta_ms = round((perf_counter() - started_at) * 1000, 3)
+                        first_text = not emitted_text
                         emitted_text = emitted_text or bool(delta.strip())
-                        yield self._event("delta", {"text": delta})
+                        pending_text += delta
+                        # Voice consumes a completed response. Avoid a database
+                        # authorization round-trip for every model token while
+                        # retaining immediate first-text feedback.
+                        if request.channel != "voice" or first_text or len(pending_text) >= 80:
+                            yield self._event("delta", {"text": pending_text})
+                            pending_text = ""
                 elif event_type == "response.completed":
                     if not emitted_text:
                         raise RuntimeError("The model returned an empty streaming response.")
                     stream.close()
                     stream = None
+                    if pending_text:
+                        yield self._event("delta", {"text": pending_text})
+                        pending_text = ""
                     yield self._event(
                         "done",
                         {"status": "completed", "mode": emotional_mode,
