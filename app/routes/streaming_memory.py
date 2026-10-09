@@ -48,9 +48,11 @@ def stream_memory_chat(
         history = MemoryConversationHistoryService()
         enriched_request, context, authorize_context = history.prepare(
             request, principal=principal, retrieval_service=retrieval_service)
+        if context.consent_revision != consent.revision:
+            raise HTTPException(status_code=409, detail="Memory settings changed. Please try again.")
         def authorize():
-            require_profile_access(principal=principal, profile_id=profile_id)
-            require_profile_purposes(profile_id, {"memory_context"}, expected_revision=consent.revision)
+            # The canonical context already verifies membership, consent revision,
+            # and current evidence. Do not repeat its database reads per frame.
             authorize_context()
             if request.channel == "voice" and usage is not None:
                 usage.reserve()

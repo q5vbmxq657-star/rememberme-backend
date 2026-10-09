@@ -102,6 +102,41 @@ def test_voice_does_not_flush_buffered_text_after_provider_failure(setup):
     assert result[-1].startswith('event: error\n')
 
 
+def test_route_uses_canonical_authorizer_without_duplicate_profile_reads(setup, monkeypatch):
+    service, request = setup
+    install_stream(service, [event('response.output_text.delta', delta='Hello'), event('response.completed')])
+    access = Mock()
+    purposes = Mock(return_value=SimpleNamespace(revision=3))
+    canonical = Mock()
+    history = SimpleNamespace(
+        prepare=lambda *args, **kwargs: (request, SimpleNamespace(consent_revision=3), canonical),
+        stream_events=lambda source, **kwargs: source)
+    monkeypatch.setattr(route, 'require_profile_access', access)
+    monkeypatch.setattr(route, 'require_profile_purposes', purposes)
+    monkeypatch.setattr(route, 'MemoryConversationHistoryService', lambda: history)
+    monkeypatch.setattr(route, 'StreamingMemoryService', lambda: service)
+    monkeypatch.setattr(route, 'conversation_usage', lambda *args, **kwargs: Mock())
+    response = route.stream_memory_chat(request, principal=object())
+    async def consume():
+        return [frame async for frame in response.body_iterator]
+    frames = asyncio.run(consume())
+    assert frames[-1].startswith('event: done\n')
+    assert canonical.call_count >= len(frames)
+    access.assert_called_once()
+    purposes.assert_called_once()
+
+
+def test_route_rejects_consent_change_during_preparation(setup, monkeypatch):
+    _, request = setup
+    monkeypatch.setattr(route, 'require_profile_access', Mock())
+    monkeypatch.setattr(route, 'require_profile_purposes', Mock(return_value=SimpleNamespace(revision=3)))
+    monkeypatch.setattr(route, 'MemoryConversationHistoryService', lambda: SimpleNamespace(
+        prepare=lambda *args, **kwargs: (request, SimpleNamespace(consent_revision=4), Mock())))
+    with pytest.raises(HTTPException) as error:
+        route.stream_memory_chat(request, principal=object())
+    assert error.value.status_code == 409
+
+
 def test_route_revocation_during_blocked_provider_read_drops_frame(setup, monkeypatch):
     service, request = setup
     entered = Event()
