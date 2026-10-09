@@ -48,8 +48,10 @@ class FakeRepository:
         user_id,
         profile_id,
         consent_verified,
+        **identity,
     ):
         self.arguments = (user_id, profile_id, consent_verified)
+        self.identity = identity
 
         if self.error is not None:
             raise self.error
@@ -129,3 +131,50 @@ def test_profile_provisioning_failures_are_truthful(
         )
 
     assert captured.value.status_code == expected_status
+
+
+def test_directory_is_scoped_to_authenticated_session_and_not_cached(monkeypatch):
+    import json
+    authenticated = principal()
+    class Directory:
+        def account_directory(self, *, user_id, session_id):
+            assert user_id == authenticated.user.user_id
+            assert session_id == authenticated.session_id
+            return []
+    monkeypatch.setattr(profile_routes, "ProfileMembershipRepository", Directory)
+    response = asyncio.run(profile_routes.account_profiles(authenticated))
+    assert json.loads(response.body) == {"profiles": []}
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_directory_failure_is_not_reported_as_a_new_account(monkeypatch):
+    class Directory:
+        def account_directory(self, **kwargs):
+            raise ProfileMembershipRepositoryError("offline")
+    monkeypatch.setattr(profile_routes, "ProfileMembershipRepository", Directory)
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(profile_routes.account_profiles(principal()))
+    assert error.value.status_code == 503
+
+
+def test_identity_replay_does_not_write_placeholder_names():
+    from app.services.profile_membership_repository import ProfileMembershipRepository
+    class Cursor:
+        def execute(self, *args):
+            pytest.fail("An unknown or fallback identity must never be persisted")
+    for name in (None, "", "  ", "Recovered memory space"):
+        ProfileMembershipRepository._save_missing_identity(Cursor(), uuid4(), name, "")
+
+
+def test_identity_replay_only_fills_missing_metadata():
+    from app.services.profile_membership_repository import ProfileMembershipRepository
+    statements = []
+    class Cursor:
+        def execute(self, query, params):
+            statements.append((query, params))
+    identifier = uuid4()
+    ProfileMembershipRepository._save_missing_identity(Cursor(), identifier, " Anna ", "Mother")
+    query, params = statements[0]
+    assert "NULLIF(BTRIM(metadata->>'display_name'), '') IS NULL" in query
+    assert params[1] == identifier
+    assert '"display_name": "Anna"' in params[0]

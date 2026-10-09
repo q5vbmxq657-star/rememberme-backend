@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from typing import Optional
 from uuid import UUID, uuid4
 
@@ -114,6 +115,8 @@ class ProfileMembershipRepository:
         user_id: UUID,
         profile_id: UUID,
         consent_verified: bool,
+        display_name: str | None = None,
+        relationship: str | None = None,
     ) -> tuple[ProfileMembership, bool]:
         """Create a new profile and its owner membership atomically.
 
@@ -211,6 +214,8 @@ class ProfileMembershipRepository:
                             "Profile cannot be claimed."
                         )
 
+                    self._save_missing_identity(cursor, profile_id, display_name, relationship)
+
                     return (
                         self._membership_from_row(current),
                         False,
@@ -262,9 +267,44 @@ class ProfileMembershipRepository:
                         "Profile ownership could not be created."
                     )
 
+                self._save_missing_identity(cursor, profile_id, display_name, relationship)
+
             connection.commit()
 
         return self._membership_from_row(row), True
+
+    @staticmethod
+    def _save_missing_identity(cursor, profile_id, display_name, relationship):
+        # Never replace a known identity during a provisioning replay.
+        if not display_name or not display_name.strip() or display_name.strip() == "Recovered memory space":
+            return
+        cursor.execute("""UPDATE digital_human_profiles
+            SET metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb
+            WHERE profile_id = %s AND (
+                NULLIF(BTRIM(metadata->>'display_name'), '') IS NULL
+                OR metadata->>'display_name' = 'Recovered memory space')""",
+            (json.dumps({"display_name": display_name.strip(),
+                         "relationship": (relationship or "").strip()}), profile_id))
+
+    def account_directory(self, *, user_id: UUID, session_id: UUID) -> list[dict]:
+        with psycopg.connect(self.database_url, connect_timeout=10, row_factory=dict_row) as connection:
+            rows = connection.execute("""
+                SELECT p.profile_id, p.created_at,
+                    NULLIF(NULLIF(BTRIM(p.metadata->>'display_name'), ''), 'Recovered memory space') AS display_name,
+                    p.metadata->>'relationship' AS relationship
+                FROM digital_human_profiles p
+                JOIN profile_memberships m ON m.profile_id = p.profile_id
+                JOIN users u ON u.user_id = m.user_id AND u.status = 'active'
+                JOIN user_sessions s ON s.user_id = u.user_id AND s.session_id = %s
+                WHERE m.user_id = %s AND m.role = 'owner' AND m.status = 'active'
+                    AND s.revoked_at IS NULL AND s.access_expires_at > NOW()
+                    AND s.refresh_expires_at > NOW()
+                    AND NOT EXISTS (SELECT 1 FROM digital_human_profile_erasure_requests e
+                                    WHERE e.profile_id = p.profile_id)
+                ORDER BY p.created_at DESC, p.profile_id
+                """, (session_id, user_id)).fetchall()
+        return [{**row, "profile_id": str(row["profile_id"]),
+                 "created_at": row["created_at"].isoformat()} for row in rows]
 
     def list_active_for_user(
         self,

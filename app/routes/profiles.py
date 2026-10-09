@@ -28,6 +28,16 @@ from app.services.profile_membership_repository import (
 router = APIRouter()
 
 
+@router.get("")
+async def account_profiles(principal: AuthenticatedSessionPrincipal = Depends(require_authenticated_principal)):
+    try:
+        profiles = await run_in_threadpool(ProfileMembershipRepository().account_directory,
+            user_id=principal.user.user_id, session_id=principal.session_id)
+        return JSONResponse({"profiles": profiles}, headers={"Cache-Control": "no-store"})
+    except (psycopg.Error, ProfileMembershipRepositoryError) as error:
+        raise HTTPException(503, "Your memory spaces could not be loaded. Please try again.") from error
+
+
 @router.get("/{profile_id}/consent", response_model=PurposeConsentSnapshot)
 def read_profile_consent(profile_id: UUID, principal: AuthenticatedSessionPrincipal = Depends(require_authenticated_principal)):
     require_profile_access(principal=principal, profile_id=profile_id)
@@ -68,11 +78,15 @@ async def provision_profile(
     ),
 ) -> ProfileProvisionResponse:
     try:
+        identity = {}
+        if payload.display_name is not None:
+            identity = {"display_name": payload.display_name, "relationship": payload.relationship}
         membership, created = await run_in_threadpool(
             ProfileMembershipRepository().provision_owned_profile,
             user_id=principal.user.user_id,
             profile_id=payload.profile_id,
             consent_verified=payload.consent_verified,
+            **identity,
         )
 
     except ProfileProvisioningConflictError as error:
@@ -81,7 +95,7 @@ async def provision_profile(
             detail="Profile identity is already in use.",
         ) from error
 
-    except ProfileMembershipRepositoryError as error:
+    except (ProfileMembershipRepositoryError, psycopg.Error) as error:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Profile provisioning is unavailable.",
