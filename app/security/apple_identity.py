@@ -554,7 +554,25 @@ class AppleIdentityVerifier:
                 "Apple identity provider is unavailable."
             ) from error
 
+        if response.status_code == 429 or response.status_code >= 500:
+            raise AppleIdentityProviderUnavailableError(
+                "Apple identity provider is unavailable."
+            )
+
         if response.status_code != 200:
+            try:
+                error_payload = response.json()
+            except ValueError:
+                error_payload = None
+            error_code = error_payload.get("error") if isinstance(error_payload, dict) else None
+            if error_code in ("temporarily_unavailable", "server_error"):
+                raise AppleIdentityProviderUnavailableError(
+                    "Apple identity provider is unavailable."
+                )
+            if error_code in ("invalid_client", "unauthorized_client", "unsupported_grant_type", "invalid_scope"):
+                raise AppleIdentityConfigurationError(
+                    "Apple identity provider configuration is invalid."
+                )
             raise AppleIdentityVerificationError(
                 "Apple identity credential is invalid."
             )
@@ -684,16 +702,16 @@ class AppleIdentityVerifier:
         try:
             document = await self._jwks_loader()
 
-        except AppleIdentityVerificationError:
+        except (AppleIdentityVerificationError, AppleIdentityProviderUnavailableError):
             raise
 
         except Exception as error:
-            raise AppleIdentityVerificationError(
+            raise AppleIdentityProviderUnavailableError(
                 "Apple identity credential could not be verified."
             ) from error
 
         if not isinstance(document, dict):
-            raise AppleIdentityVerificationError(
+            raise AppleIdentityProviderUnavailableError(
                 "Apple identity credential could not be verified."
             )
 
@@ -721,12 +739,12 @@ class AppleIdentityVerifier:
             httpx.HTTPError,
             ValueError,
         ) as error:
-            raise AppleIdentityVerificationError(
+            raise AppleIdentityProviderUnavailableError(
                 "Apple identity credential could not be verified."
             ) from error
 
         if not isinstance(payload, dict):
-            raise AppleIdentityVerificationError(
+            raise AppleIdentityProviderUnavailableError(
                 "Apple identity credential could not be verified."
             )
 
@@ -739,7 +757,7 @@ class AppleIdentityVerifier:
         keys = payload.get("keys")
 
         if not isinstance(keys, list):
-            raise AppleIdentityVerificationError(
+            raise AppleIdentityProviderUnavailableError(
                 "Apple identity credential could not be verified."
             )
 
@@ -774,7 +792,7 @@ class AppleIdentityVerifier:
             parsed[key_id.strip()] = key
 
         if not parsed:
-            raise AppleIdentityVerificationError(
+            raise AppleIdentityProviderUnavailableError(
                 "Apple identity credential could not be verified."
             )
 

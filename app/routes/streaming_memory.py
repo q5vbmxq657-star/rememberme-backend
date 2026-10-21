@@ -1,5 +1,4 @@
 from fastapi import APIRouter, Depends, HTTPException
-import logging
 from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.types import Send
@@ -22,7 +21,6 @@ from app.services.conversation_usage import conversation_usage
 
 router = APIRouter()
 retrieval_service = MemoryChatRetrievalService()
-logger = logging.getLogger(__name__)
 
 
 class _ClosingMemoryStreamingResponse(StreamingResponse):
@@ -95,16 +93,12 @@ async def _authorized_events(request, *, history, context, authorize, usage=None
                 await run_in_threadpool(usage.finish, completed=True)
                 completed = True
             yield event
-    except (HTTPException, PGVectorStaleIndexError) as error:
-        logger.warning("memory_stream_interrupted channel=%s error_type=%s status=%s",
-                       request.channel, type(error).__name__, getattr(error, "status_code", None))
+    except (HTTPException, PGVectorStaleIndexError):
         yield service._event("error", {
             "status": "failed",
             "message": "This conversation is no longer available.",
         })
-    except Exception as error:
-        logger.error("memory_stream_failed channel=%s error_type=%s",
-                     request.channel, type(error).__name__)
+    except Exception:
         yield service._event("error", {
             "status": "failed",
             "message": "We could not complete that response. Please try again.",

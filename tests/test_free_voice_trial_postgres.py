@@ -18,7 +18,14 @@ def test_parallel_redemption_and_exhaustion():
     if not url:
         pytest.skip("An isolated test database is required")
     from psycopg.conninfo import conninfo_to_dict
-    assert conninfo_to_dict(url).get("host", "").startswith("/private/tmp/stay-quota-db.")
+    config = conninfo_to_dict(url)
+    assert (
+        config.get("host", "").startswith("/private/tmp/stay-quota-db.")
+        and config.get("dbname") == "postgres"
+    ) or (
+        config.get("host", "").startswith("/private/tmp/STAY-AP1-PG-")
+        and config.get("dbname") == "stay_ap1"
+    ), "Only an isolated local test database is allowed"
     schema = "trial_" + uuid4().hex
     uid = uuid4()
     with psycopg.connect(url) as db:

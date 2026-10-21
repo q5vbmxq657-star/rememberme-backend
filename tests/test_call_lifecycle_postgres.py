@@ -86,6 +86,8 @@ def test_cross_conversation_reservation_reuse_is_rejected(call, principal):
 def test_expired_reservation_is_recovered_exactly_once(call, principal):
     service, args, owner = call
     service.start(**args)
+    with FamilyRepository().transaction(principal) as db:
+        starting_balance = Ledger.balance(db, owner)["balance_units"]
     with psycopg.connect(os.environ["STAY_TEST_DATABASE_URL"]) as db:
         db.execute("""UPDATE family_credit_reservations SET created_at=NOW()-INTERVAL '70 seconds',
             expires_at=NOW()-INTERVAL '10 seconds' WHERE call_id=%s""", (args["call_id"],))
@@ -94,7 +96,11 @@ def test_expired_reservation_is_recovered_exactly_once(call, principal):
     with FamilyRepository().transaction(principal) as db:
         balance = Ledger.balance(db, owner)
         assert balance["reserved_units"] == 0
-        assert balance["balance_units"] == 120
+        assert balance["balance_units"] == starting_balance - 60
+        assert db.execute(
+            "SELECT count(*) AS n FROM family_credit_entries WHERE evidence_key=%s",
+            ("call:" + str(args["call_id"]),),
+        ).fetchone()["n"] == 1
 
 
 def test_renewal_extends_same_reservation_and_rechecks_consent(call, principal):
@@ -119,7 +125,8 @@ def test_depleted_credit_returns_confirmed_limit_on_renewal(call, principal):
     service.start(**args)
     with FamilyRepository().transaction(principal) as db:
         # Reserve the rest on another active call, without mutating the grant.
-        Ledger.reserve(db, owner, principal.user.user_id, uuid4(), mode="voice", seconds=120)
+        available = Ledger.balance(db, owner)["available_units"]
+        Ledger.reserve(db, owner, principal.user.user_id, uuid4(), mode="voice", seconds=available)
         db.execute("""UPDATE family_credit_reservations SET created_at=created_at-INTERVAL '40 seconds',
             expires_at=expires_at-INTERVAL '40 seconds' WHERE call_id=%s""", (args["call_id"],))
     with pytest.raises(HTTPException) as error:

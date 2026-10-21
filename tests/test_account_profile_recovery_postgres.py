@@ -17,7 +17,11 @@ def database(monkeypatch):
     url = os.environ.get("STAY_RECOVERY_TEST_DATABASE_URL")
     if not url:
         pytest.skip("Disposable STAY_RECOVERY_TEST_DATABASE_URL required")
-    assert conninfo_to_dict(url).get("host", "").startswith("/private/tmp/stay-recovery-db.")
+    config = conninfo_to_dict(url)
+    assert config.get("host", "").startswith("/private/tmp/stay-recovery-db.") or (
+        config.get("host", "").startswith("/private/tmp/STAY-AP1-PG-")
+        and config.get("dbname") == "stay_ap1"
+    ), "Only an isolated local test database is allowed"
     schema = "recovery_" + uuid4().hex
     with psycopg.connect(url, autocommit=True) as db:
         db.execute(f'CREATE SCHEMA "{schema}"')

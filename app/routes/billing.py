@@ -22,6 +22,7 @@ from app.security.user_auth import require_authenticated_principal
 from app.services.family_repository import FamilyRepository
 from app.services.apple_purchase_registry import ApplePurchaseRegistry
 from app.services.apple_credit_fulfillment import fulfill_subscription_purchase
+from app.services.plan_access import effective_plan
 from app.services.family_credit_ledger import FamilyCreditLedger, PersonalCreditAccount
 from app.services.apple_purchase_verifier import (
     ApplePurchaseVerifier, InvalidPurchaseEvidence,
@@ -233,9 +234,13 @@ def submit(body: PurchaseSubmission, principal=Depends(require_authenticated_pri
         with repository.transaction(principal) as db:
             ApplePurchaseRegistry.record(db, principal.user.user_id, evidence)
             fulfill_subscription_purchase(db, principal.user.user_id, evidence, now=datetime.now(timezone.utc))
-        # Receipt storage is not delivery. The client must not finish StoreKit
-        # transactions until entitlement reconciliation and credit fulfillment exist.
-        return JSONResponse({"transaction_id": evidence.transaction_id, "fulfilled": False},
+            # Sandbox credits are isolated from production access. Do not finish
+            # a sandbox purchase until that environment has an entitlement path.
+            fulfilled = evidence.environment == "Production" and effective_plan(
+                db, principal.user.user_id) in (
+                    {"plus", "family"} if evidence.product.plan == "plus" else {"family"})
+        # Respond only after the transaction context has committed successfully.
+        return JSONResponse({"transaction_id": evidence.transaction_id, "fulfilled": fulfilled},
                             headers={"Cache-Control": "no-store"})
     except InvalidPurchaseEvidence:
         raise HTTPException(422, "The purchase could not be verified for this account.") from None

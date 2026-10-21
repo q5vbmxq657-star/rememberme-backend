@@ -149,9 +149,14 @@ def test_missing_configuration_fails_closed(client, monkeypatch):
     assert response.status_code == 503
 
 
-def test_evidence_storage_is_not_fulfillment(client, monkeypatch):
+@pytest.mark.parametrize("environment,plan,fulfilled", [
+    ("Production", "plus", True), ("Production", "family", True),
+    ("Production", "free", False), ("Sandbox", "plus", False),
+])
+def test_fulfillment_requires_committed_credits_and_matching_access(client, monkeypatch, environment, plan, fulfilled):
     token = uuid4()
-    evidence = SimpleNamespace(transaction_id="123", product=SubscriptionProduct("plus", "monthly"))
+    evidence = SimpleNamespace(transaction_id="123", environment=environment,
+                               product=SubscriptionProduct("plus", "monthly"))
     monkeypatch.setattr(billing.ApplePurchaseRegistry, "account_token", lambda db, uid: token)
     recorded = []
     monkeypatch.setattr(billing.ApplePurchaseRegistry, "record", lambda db, uid, value: recorded.append(value))
@@ -159,9 +164,10 @@ def test_evidence_storage_is_not_fulfillment(client, monkeypatch):
     monkeypatch.setattr(billing, "configured_status_client", lambda verifier: object())
     monkeypatch.setattr(billing, "confirm_current_purchase", lambda client, verifier, value, **kw: value)
     monkeypatch.setattr(billing, "fulfill_subscription_purchase", lambda *a, **k: None)
+    monkeypatch.setattr(billing, "effective_plan", lambda *a: plan)
     response = client.post("/v1/billing/transactions", json={"signed_transaction": "test-evidence"})
     assert response.status_code == 200
-    assert response.json() == {"transaction_id": "123", "fulfilled": False}
+    assert response.json() == {"transaction_id": "123", "fulfilled": fulfilled}
     assert recorded == [evidence]
 
 
@@ -169,6 +175,36 @@ def test_client_cannot_supply_fulfillment_or_account(client):
     response = client.post("/v1/billing/transactions", json={
         "signed_transaction": "test", "fulfilled": True, "account_token": str(uuid4())})
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize("failure_stage", ["fulfillment", "commit"])
+def test_purchase_is_not_acknowledged_when_delivery_transaction_fails(client, monkeypatch, failure_stage):
+    token = uuid4()
+    evidence = SimpleNamespace(transaction_id="123", environment="Production",
+                               product=SubscriptionProduct("plus", "monthly"))
+    monkeypatch.setattr(billing.ApplePurchaseRegistry, "account_token", lambda *a: token)
+    monkeypatch.setattr(billing.ApplePurchaseRegistry, "record", lambda *a: None)
+    monkeypatch.setattr(billing, "configured_verifier", lambda: SimpleNamespace(verify=lambda *a, **k: evidence))
+    monkeypatch.setattr(billing, "configured_status_client", lambda *a: object())
+    monkeypatch.setattr(billing, "confirm_current_purchase", lambda *a, **k: evidence)
+    monkeypatch.setattr(billing, "effective_plan", lambda *a: "plus")
+    def fulfill(*args, **kwargs):
+        if failure_stage == "fulfillment":
+            raise billing.psycopg.OperationalError("private failure")
+    monkeypatch.setattr(billing, "fulfill_subscription_purchase", fulfill)
+    transactions = 0
+    @contextmanager
+    def transaction(self, principal):
+        nonlocal transactions
+        transactions += 1
+        yield object()
+        if transactions == 2 and failure_stage == "commit":
+            raise billing.psycopg.OperationalError("private commit failure")
+    monkeypatch.setattr(billing.FamilyRepository, "transaction", transaction)
+    response = client.post("/v1/billing/transactions", json={"signed_transaction": "test"})
+    assert response.status_code == 503
+    assert "fulfilled" not in response.json()
+    assert "private" not in response.text
 
 
 def test_invalid_signature_never_reaches_registry(client, monkeypatch):

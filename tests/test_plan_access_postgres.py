@@ -20,8 +20,13 @@ def principal(monkeypatch):
     if not url:
         pytest.skip("An isolated STAY_TEST_DATABASE_URL is required")
     config = conninfo_to_dict(url)
-    assert config.get("host", "").startswith("/private/tmp/stay-quota-db.")
-    assert config.get("dbname") == "postgres"
+    assert (
+        config.get("host", "").startswith("/private/tmp/stay-quota-db.")
+        and config.get("dbname") == "postgres"
+    ) or (
+        config.get("host", "").startswith("/private/tmp/STAY-AP1-PG-")
+        and config.get("dbname") == "stay_ap1"
+    ), "Only an isolated local test database is allowed"
     monkeypatch.setenv("DATABASE_URL", url)
     uid, sid = uuid4(), uuid4()
     with psycopg.connect(url) as db:
