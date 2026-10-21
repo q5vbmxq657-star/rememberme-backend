@@ -92,13 +92,15 @@ def test_annual_family_allowance_replay_and_catchup_use_existing_ledger(family_d
     first = monthly_credit_periods(**arguments, now=datetime(2028, 1, 31, tzinfo=timezone.utc))
     for _ in range(2):
         with repo.transaction(owner) as db:
-            grant_family_periods(db, fid, first)
-    assert repo.credits(owner)["balance_units"] == FamilyCreditLedger.MONTHLY_UNITS
+            result = grant_family_periods(db, fid, first, environment="Sandbox")
+    assert result["balance_units"] == FamilyCreditLedger.MONTHLY_UNITS
+    assert repo.credits(owner)["balance_units"] == 0
     catchup = monthly_credit_periods(**arguments, now=datetime(2028, 3, 31, tzinfo=timezone.utc))
     for _ in range(2):
         with repo.transaction(owner) as db:
-            grant_family_periods(db, fid, catchup)
-    assert repo.credits(owner)["balance_units"] == 3 * FamilyCreditLedger.MONTHLY_UNITS
+            result = grant_family_periods(db, fid, catchup, environment="Sandbox")
+    assert result["balance_units"] == 3 * FamilyCreditLedger.MONTHLY_UNITS
+    assert repo.credits(owner)["balance_units"] == 0
 
 
 def test_family_credit_concurrent_reservations_cannot_overspend(family_data):

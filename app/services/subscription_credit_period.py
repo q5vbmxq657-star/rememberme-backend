@@ -30,6 +30,7 @@ class SubscriptionCreditPeriod:
     starts_at: datetime
     ends_at: datetime
     evidence_key: str
+    environment: str
 
 
 def monthly_credit_periods(*, original_transaction_id: str, environment: str,
@@ -52,13 +53,19 @@ def monthly_credit_periods(*, original_transaction_id: str, environment: str,
         identity = f"apple:{environment}:{original_transaction_id}:{boundary.isoformat()}"
         periods.append(SubscriptionCreditPeriod(
             starts_at=boundary, ends_at=min(_anniversary(start, index + 1), end),
-            evidence_key="subscription-period:" + sha256(identity.encode()).hexdigest()))
+            evidence_key="subscription-period:" + sha256(identity.encode()).hexdigest(),
+            environment=environment))
     return tuple(periods)
 
 
-def grant_family_periods(db, family_id, periods: tuple[SubscriptionCreditPeriod, ...]):
+def grant_family_periods(db, family_id, periods: tuple[SubscriptionCreditPeriod, ...],
+                         *, environment: str):
     """Invoke within the verified subscription owner's existing transaction."""
+    if environment not in {"Production", "Sandbox"} or any(
+            period.environment != environment for period in periods):
+        raise ValueError("Credit periods must match the verified billing environment.")
     for period in periods:
         FamilyCreditLedger.grant(db, family_id, evidence_key=period.evidence_key,
-                                units=FamilyCreditLedger.MONTHLY_UNITS)
-    return FamilyCreditLedger.balance(db, family_id)
+                                units=FamilyCreditLedger.MONTHLY_UNITS,
+                                environment=environment)
+    return FamilyCreditLedger.balance(db, family_id, environment=environment)

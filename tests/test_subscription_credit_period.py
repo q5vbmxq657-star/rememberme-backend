@@ -2,6 +2,8 @@ from datetime import datetime, timezone
 import pytest
 
 from app.services.subscription_credit_period import monthly_credit_periods
+from app.services.subscription_credit_period import grant_family_periods, FamilyCreditLedger
+from unittest.mock import Mock
 
 
 def utc(year, month, day):
@@ -47,3 +49,31 @@ def test_monthly_receipt_grants_one_allowance_only():
 def test_unusable_verified_period_data_is_rejected(change):
     with pytest.raises(ValueError):
         periods(**change)
+
+
+@pytest.mark.parametrize("environment", ["Production", "Sandbox"])
+def test_grants_and_balance_preserve_verified_environment(monkeypatch, environment):
+    grant, balance = Mock(), Mock(return_value={"balance_units": 18000})
+    monkeypatch.setattr(FamilyCreditLedger, "grant", grant)
+    monkeypatch.setattr(FamilyCreditLedger, "balance", balance)
+    result = grant_family_periods("db", "family", periods(environment=environment),
+                                  environment=environment)
+    assert grant.call_args.kwargs["environment"] == environment
+    balance.assert_called_once_with("db", "family", environment=environment)
+    assert result == {"balance_units": 18000}
+
+
+def test_mixed_environments_are_rejected_before_any_grant(monkeypatch):
+    grant = Mock()
+    monkeypatch.setattr(FamilyCreditLedger, "grant", grant)
+    with pytest.raises(ValueError):
+        grant_family_periods("db", "family", periods() + periods(environment="Sandbox"),
+                             environment="Production")
+    grant.assert_not_called()
+
+
+def test_empty_periods_still_query_only_requested_environment(monkeypatch):
+    balance = Mock()
+    monkeypatch.setattr(FamilyCreditLedger, "balance", balance)
+    grant_family_periods("db", "family", (), environment="Sandbox")
+    balance.assert_called_once_with("db", "family", environment="Sandbox")
